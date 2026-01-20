@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+
+# Exclude large files (over 100MB)
+Customer_Package/Supermarket POS.exe
+Supermarket_POS_v1.0_FRESH_INSTALL.zip

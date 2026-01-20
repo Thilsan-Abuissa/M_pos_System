@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Supermarket POS System</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Login Screen -->
+  <div id="loginScreen" class="screen active">
+    <div class="login-container">
+      <div class="login-logo-container">
+        <div id="loginLogo" class="login-logo">🛒</div>
+        <h1 id="loginTitle">Supermarket POS</h1>
+      </div>
+      <div class="login-form">
+        <input type="text" id="username" placeholder="Username" value="admin">
+        <input type="password" id="password" placeholder="Password" value="admin123">
+        <button id="loginBtn" class="btn-primary">Login</button>
+        <div class="login-roles">
+          <h3>Test Accounts:</h3>
+          <div class="role-item"><strong>Admin:</strong> admin / admin123</div>
+          <div class="role-item"><strong>Manager:</strong> manager / manager123</div>
+          <div class="role-item"><strong>Cashier:</strong> cashier / cashier123</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main POS Screen -->
+  <div id="posScreen" class="screen">
+    <!-- Top Navigation Bar - Hidden for checkout only -->
+    <div class="top-navbar" id="topNavbar">
+      <div class="navbar-left">
+        <div class="logo">
+          <span class="logo-icon" id="navbarLogo">🛒</span>
+          <span class="logo-text" id="navbarTitle">Supermarket POS</span>
+        </div>
+      </div>
+      
+      <div class="navbar-center">
+        <div class="nav-tabs" id="navTabs">
+          <button class="tab-btn active" data-view="checkout">
+            <span class="tab-icon">🛒</span>
+            <span class="tab-text">Checkout</span>
+          </button>
+          <button class="tab-btn" data-view="products">
+            <span class="tab-icon">📦</span>
+            <span class="tab-text">Products</span>
+          </button>
+          <button class="tab-btn" data-view="sales">
+            <span class="tab-icon">💰</span>
+            <span class="tab-text">Sales</span>
+          </button>
+          <button class="tab-btn" data-view="reports">
+            <span class="tab-icon">📊</span>
+            <span class="tab-text">Reports</span>
+          </button>
+          <button class="tab-btn" data-view="returns" id="returnsNavBtn">
+            <span class="tab-icon">↩️</span>
+            <span class="tab-text">Returns</span>
+          </button>
+          <button class="tab-btn" data-view="inventory">
+            <span class="tab-icon">📋</span>
+            <span class="tab-text">Inventory</span>
+          </button>
+          <button class="tab-btn" data-view="users" id="usersNavBtn">
+            <span class="tab-icon">👥</span>
+            <span class="tab-text">Users</span>
+          </button>
+        </div>
+      </div>
+      
+      <div class="navbar-right">
+        <div class="user-display" id="currentUser"></div>
+        <div class="datetime-display" id="currentDateTime"></div>
+        <button id="logoutBtn" class="logout-btn">
+          <span class="logout-icon">🚪</span>
+          <span class="logout-text">Logout</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Main Content Container -->
+    <div class="main-content-wrapper">
+      <!-- Checkout View -->
+      <div id="checkoutView" class="view active">
+          <div class="checkout-container">
+            <!-- Left Side: Cart Items & Summary -->
+            <div class="checkout-left">
+              <div class="cart-section">
+                <h2 class="section-title" style="display: none;">Shopping Cart</h2>
+                
+                <!-- Cart Items Table -->
+                <div class="cart-items-table">
+                  <table class="cart-table">
+                    <thead>
+                      <tr>
+                        <th>ITEM DESCRIPTION</th>
+                        <th>PRICE</th>
+                        <th>QTY</th>
+                        <th>DISCOUNT</th>
+                        <th>TOTAL</th>
+                      </tr>
+                    </thead>
+                    <tbody id="cartTableBody">
+                      <!-- Cart items will be inserted here -->
+                    </tbody>
+                  </table>
+                </div>
+
+                <!-- Summary Section -->
+                <div class="cart-summary-panel">
+                  <div class="summary-left">
+                    <div class="summary-item">
+                      <span class="summary-label">Subtotal</span>
+                      <span class="summary-value" id="cartSubtotal">$0.00</span>
+                    </div>
+                    <div class="summary-item">
+                      <span class="summary-label">Discount</span>
+                      <span class="summary-value" id="cartDiscount">$0.00</span>
+                    </div>
+                    <div class="summary-item">
+                      <span class="summary-label">Tax</span>
+                      <span class="summary-value" id="cartTax">$0.00</span>
+                    </div>
+                  </div>
+                  <div class="summary-right">
+                    <div class="total-section">
+                      <div class="total-label">Total</div>
+                      <div class="total-amount" id="cartTotal">$0.00</div>
+                    </div>
+                    <div class="payment-section">
+                      <div class="payment-label">Payment</div>
+                      <div class="payment-amount" id="paymentAmount">$0.00</div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Numpad & Payment Section -->
+                <div class="numpad-payment-section">
+                  <div class="numpad-grid">
+                    <button class="numpad-btn" data-value="1">1</button>
+                    <button class="numpad-btn" data-value="2">2</button>
+                    <button class="numpad-btn" data-value="3">3</button>
+                    <button id="checkoutBtn" class="btn-complete-sale numpad-btn" disabled>COMPLETE SALE</button>
+                    <button class="numpad-btn" data-value="4">4</button>
+                    <button class="numpad-btn" data-value="5">5</button>
+                    <button class="numpad-btn" data-value="6">6</button>
+                    <button class="numpad-btn numpad-cash" data-value="cash">CASH</button>
+                    <button class="numpad-btn" data-value="7">7</button>
+                    <button class="numpad-btn" data-value="8">8</button>
+                    <button class="numpad-btn" data-value="9">9</button>
+                    <button class="numpad-btn numpad-card" data-value="card">CARD</button>
+                    <button class="numpad-btn numpad-dot" data-value=".">.</button>
+                    <button class="numpad-btn" data-value="0">0</button>
+                    <button class="numpad-btn" data-value="00">00</button>
+                    <button class="numpad-btn numpad-loan" data-value="loan">LOAN</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right Side: Products Only -->
+            <div class="checkout-right">
+              <!-- Right Panel Header -->
+              <div class="right-panel-header">
+                <div class="header-actions">
+                  <!-- Search Bar -->
+                  <div class="search-section">
+                    <input type="text" id="barcodeInput" placeholder="SEARCH" autocomplete="off">
+                  </div>
+                  
+                  <div class="settings-dropdown">
+                    <button class="settings-btn" id="settingsBtn">
+                      <span class="settings-icon">⚙️</span>
+                      <span class="settings-text">Settings</span>
+                    </button>
+                    <div class="settings-menu" id="settingsMenu">
+                      <button class="settings-menu-item" data-view="checkout">
+                        <span class="menu-icon">🛒</span>
+                        <span class="menu-text">Checkout</span>
+                      </button>
+                      <button class="settings-menu-item" data-view="products">
+                        <span class="menu-icon">📦</span>
+                        <span class="menu-text">Products</span>
+                      </button>
+                      <button class="settings-menu-item" data-view="sales">
+                        <span class="menu-icon">💰</span>
+                        <span class="menu-text">Sales</span>
+                      </button>
+                      <button class="settings-menu-item" data-view="reports">
+                        <span class="menu-icon">📊</span>
+                        <span class="menu-text">Reports</span>
+                      </button>
+                      <button class="settings-menu-item" data-view="inventory">
+                        <span class="menu-icon">📋</span>
+                        <span class="menu-text">Inventory</span>
+                      </button>
+                      <button class="settings-menu-item" data-view="users" id="usersMenuBtn">
+                        <span class="menu-icon">👥</span>
+                        <span class="menu-text">Users</span>
+                      </button>
+                    </div>
+                  </div>
+                  <button id="logoutBtnRight" class="logout-btn-right">
+                    <span class="logout-icon">🚪</span>
+                    <span class="logout-text">Logout</span>
+                  </button>
+                </div>
+              </div>
+
+              <!-- Category Tabs -->
+              <div class="category-tabs">
+                <button class="category-tab active" data-category="all">ALL</button>
+                <button class="category-tab" data-category="Produce">PRODUCE</button>
+                <button class="category-tab" data-category="Dairy">DAIRY</button>
+                <button class="category-tab" data-category="Bakery">BAKERY</button>
+                <button class="category-tab" data-category="Meat">MEAT</button>
+                <button class="category-tab" data-category="Beverages">BEVERAGES</button>
+                <button class="category-tab" data-category="Grains">GRAINS</button>
+              </div>
+
+              <!-- Quick Products Grid -->
+              <div class="quick-products-grid-wrapper">
+                <div id="quickProductsList" class="quick-products-grid-images"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Settings View -->
+        <div id="settingsView" class="view">
+          <div class="settings-page">
+            <h2 class="settings-page-title">Settings & Navigation</h2>
+            <div class="settings-grid">
+              <button class="settings-card" data-view="checkout">
+                <span class="settings-card-icon">🛒</span>
+                <span class="settings-card-title">Checkout</span>
+                <span class="settings-card-desc">Process sales and transactions</span>
+              </button>
+              <button class="settings-card" data-view="products">
+                <span class="settings-card-icon">📦</span>
+                <span class="settings-card-title">Products</span>
+                <span class="settings-card-desc">Manage product inventory</span>
+              </button>
+              <button class="settings-card" data-view="sales">
+                <span class="settings-card-icon">💰</span>
+                <span class="settings-card-title">Sales</span>
+                <span class="settings-card-desc">View sales history</span>
+              </button>
+              <button class="settings-card" data-view="reports">
+                <span class="settings-card-icon">📊</span>
+                <span class="settings-card-title">Reports</span>
+                <span class="settings-card-desc">Generate business reports</span>
+              </button>
+              <button class="settings-card" data-view="returns">
+                <span class="settings-card-icon">↩️</span>
+                <span class="settings-card-title">Returns</span>
+                <span class="settings-card-desc">Process refunds & returns</span>
+              </button>
+              <button class="settings-card" data-view="inventory">
+                <span class="settings-card-icon">📋</span>
+                <span class="settings-card-title">Inventory</span>
+                <span class="settings-card-desc">Manage stock levels</span>
+              </button>
+              <button class="settings-card" data-view="loans">
+                <span class="settings-card-icon">💳</span>
+                <span class="settings-card-title">Loans</span>
+                <span class="settings-card-desc">Manage customer loans</span>
+              </button>
+              <button class="settings-card" data-view="system" id="systemSettingsCard">
+                <span class="settings-card-icon">⚙️</span>
+                <span class="settings-card-title">System Settings</span>
+                <span class="settings-card-desc">Configure store & currency</span>
+              </button>
+              <button class="settings-card" data-view="users" id="usersSettingsCard">
+                <span class="settings-card-icon">👥</span>
+                <span class="settings-card-title">Users</span>
+                <span class="settings-card-desc">Manage user accounts</span>
+              </button>
+              <button class="settings-card" onclick="toggleCustomerDisplay()">
+                <span class="settings-card-icon">🖥️</span>
+                <span class="settings-card-title">Customer Display</span>
+                <span class="settings-card-desc">Open second screen for customers</span>
+              </button>
+              <button class="settings-card" onclick="openCashDrawer()">
+                <span class="settings-card-icon">💵</span>
+                <span class="settings-card-title">Cash Drawer</span>
+                <span class="settings-card-desc">Open cash drawer manually</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Products View -->
+        <div id="productsView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Product Management</h2>
+                <button id="addProductBtn" class="btn-primary">+ Add Product</button>
+              </div>
+
+              <div class="search-bar">
+                <input type="text" id="productSearch" placeholder="Search products...">
+              </div>
+
+              <div class="table-container">
+                <table id="productsTable">
+                  <thead>
+                    <tr>
+                      <th>Barcode</th>
+                      <th>Name</th>
+                      <th>Category</th>
+                      <th>Price</th>
+                      <th>Tax</th>
+                      <th>Stock</th>
+                      <th>Status</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sales History View -->
+        <div id="salesView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Sales History</h2>
+                <div class="today-summary" id="todaySummary"></div>
+              </div>
+
+              <div class="table-container">
+                <table id="salesTable">
+                  <thead>
+                    <tr>
+                      <th>Date/Time</th>
+                      <th>Items</th>
+                      <th>Subtotal</th>
+                      <th>Tax</th>
+                      <th>Total</th>
+                      <th>Payment</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Reports View -->
+        <div id="reportsView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Reports & Analytics</h2>
+                <button id="generateZReportBtn" class="btn-primary">📊 Generate Z-Report</button>
+              </div>
+
+              <div class="report-tabs">
+                <button class="report-tab active" data-tab="z-reports">Z-Reports</button>
+                <button class="report-tab" data-tab="sales-reports">Sales Reports</button>
+              </div>
+
+              <!-- Z-Reports Tab -->
+              <div id="z-reports" class="report-tab-content active">
+                <div class="table-container">
+                  <table id="zReportsTable">
+                    <thead>
+                      <tr>
+                        <th>Report #</th>
+                        <th>Date</th>
+                        <th>Cashier</th>
+                        <th>Sales</th>
+                        <th>Returns</th>
+                        <th>Net Sales</th>
+                        <th>Cash</th>
+                        <th>Card</th>
+                        <th>Loan</th>
+                        <th>Total Tax</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="zReportsTableBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- Sales Reports Tab -->
+              <div id="sales-reports" class="report-tab-content">
+                <div class="report-filters">
+                  <input type="date" id="reportStartDate">
+                  <input type="date" id="reportEndDate">
+                  <button id="generateSalesReportBtn" class="btn-primary">Generate Report</button>
+                </div>
+                <div id="reportResults" class="report-results"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Inventory View -->
+        <div id="inventoryView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Inventory Management</h2>
+              </div>
+
+              <div class="table-container">
+                <table id="inventoryTable">
+                  <thead>
+                    <tr>
+                      <th>Product</th>
+                      <th>Category</th>
+                      <th>Stock</th>
+                      <th>Min Stock</th>
+                      <th>Status</th>
+                      <th>Value</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Returns View -->
+        <div id="returnsView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Returns & Refunds</h2>
+                <button class="btn-primary" id="processReturnBtn">Process Return</button>
+              </div>
+
+              <div class="table-container">
+                <table id="returnsTable">
+                  <thead>
+                    <tr>
+                      <th>Return Date</th>
+                      <th>Original Sale</th>
+                      <th>Items</th>
+                      <th>Total</th>
+                      <th>Refund Method</th>
+                      <th>Reason</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Loans View -->
+        <div id="loansView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Loan Management</h2>
+                <div class="loan-search-container">
+                  <input type="text" id="loanReceiptSearch" placeholder="Search by receipt number...">
+                  <button id="searchLoanBtn" class="btn-primary">Search Loan</button>
+                </div>
+              </div>
+
+              <div class="loan-filter-tabs">
+                <button class="loan-filter-tab active" data-status="all">All Loans</button>
+                <button class="loan-filter-tab" data-status="pending">Pending</button>
+                <button class="loan-filter-tab" data-status="partial">Partial</button>
+                <button class="loan-filter-tab" data-status="paid">Paid</button>
+              </div>
+
+              <div class="table-container">
+                <table id="loansTable">
+                  <thead>
+                    <tr>
+                      <th>Receipt #</th>
+                      <th>Customer Name</th>
+                      <th>Phone</th>
+                      <th>Loan Amount</th>
+                      <th>Paid Amount</th>
+                      <th>Remaining</th>
+                      <th>Status</th>
+                      <th>Loan Date</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- System Settings View (Admin Only) -->
+        <div id="systemView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>System Settings</h2>
+              </div>
+
+              <form id="systemSettingsForm">
+                <div class="settings-section">
+                  <h3>Store Information</h3>
+                  <div class="form-group">
+                    <label>Store Name *</label>
+                    <input type="text" id="storeName" required>
+                  </div>
+                  <div class="form-group">
+                  <label>Store Logo</label>
+                  <input type="file" id="storeLogoFile" accept="image/*" style="display: none;">
+                  <div class="logo-upload-container">
+                    <div class="logo-preview" id="logoPreview">
+                      <span id="logoPreviewText">🛒</span>
+                    </div>
+                    <div class="logo-upload-buttons">
+                      <button type="button" class="btn-secondary" id="uploadLogoBtn">📁 Upload Image</button>
+                      <button type="button" class="btn-secondary" id="useEmojiBtn">😀 Use Emoji</button>
+                      <button type="button" class="btn-secondary" id="clearLogoBtn">✕ Clear</button>
+                    </div>
+                  </div>
+                  <input type="text" id="storeLogo" placeholder="🛒" maxlength="10" style="display: none;">
+                  <small>Upload an image or use emoji/text for your store logo</small>
+                  </div>
+                </div>
+
+                <div class="settings-section">
+                  <h3>Currency Settings</h3>
+                  <div class="form-row">
+                    <div class="form-group">
+                      <label>Currency Symbol *</label>
+                      <input type="text" id="currencySymbol" required maxlength="5">
+                    </div>
+                    <div class="form-group">
+                      <label>Currency Code *</label>
+                      <input type="text" id="currencyCode" required maxlength="3" placeholder="USD">
+                    </div>
+                  </div>
+                </div>
+
+                <div class="settings-section">
+                  <h3>Tax Settings</h3>
+                  <div class="form-group">
+                    <label>Tax Rate (%) *</label>
+                    <input type="number" id="taxRate" step="0.01" min="0" max="100" required>
+                    <small>Enter percentage (e.g., 10 for 10%)</small>
+                  </div>
+                </div>
+
+                <div class="settings-section">
+                  <h3>Receipt Settings</h3>
+                  <div class="form-group">
+                    <label>Receipt Footer</label>
+                    <textarea id="receiptFooter" rows="2" placeholder="Thank you for shopping with us!"></textarea>
+                  </div>
+                </div>
+
+                <div class="modal-footer">
+                  <button type="submit" class="btn-primary">💾 Save Settings</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+        <!-- Users View (Admin Only) -->
+        <div id="usersView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>User Management</h2>
+                <button id="addUserBtn" class="btn-primary">+ Add User</button>
+              </div>
+
+              <div class="table-container">
+                <table id="usersTable">
+                  <thead>
+                    <tr>
+                      <th>Username</th>
+                      <th>Full Name</th>
+                      <th>Role</th>
+                      <th>Created</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Product Modal -->
+  <div id="productModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="productModalTitle">Add Product</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="productForm">
+        <input type="hidden" id="productId">
+        <div class="form-group">
+          <label>Barcode *</label>
+          <input type="text" id="productBarcode" required oninput="generateBarcodeDisplay(this.value)">
+        </div>
+        <div id="barcodeDisplay" class="barcode-display"></div>
+        <div class="form-group">
+          <label>Product Name *</label>
+          <input type="text" id="productName" required>
+        </div>
+        <div class="form-group">
+          <label>Description</label>
+          <input type="text" id="productDescription">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Category *</label>
+            <select id="productCategory" required>
+              <option value="General">General</option>
+              <option value="Food">Food (7% Tax)</option>
+              <option value="Beverages">Beverages (19% Tax)</option>
+              <option value="Household">Household</option>
+              <option value="Personal Care">Personal Care</option>
+              <option value="Snacks">Snacks</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Tax Rate *</label>
+            <select id="productTaxRate" required>
+              <option value="0.07">7% (Food)</option>
+              <option value="0.19" selected>19% (Standard)</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Regular Price *</label>
+            <input type="number" id="productRegularPrice" step="0.01" required>
+          </div>
+          <div class="form-group">
+            <label>Sale Price</label>
+            <input type="number" id="productSalePrice" step="0.01" placeholder="Leave empty if not on sale">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Discount %</label>
+            <input type="number" id="productDiscountPercent" step="0.01" min="0" max="100" value="0">
+          </div>
+          <div class="form-group">
+            <label>Final Price *</label>
+            <input type="number" id="productPrice" step="0.01" required readonly style="background: #f7fafc;">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Cost</label>
+            <input type="number" id="productCost" step="0.01">
+          </div>
+          <div class="form-group">
+            <label>Stock *</label>
+            <input type="number" id="productStock" required>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Minimum Stock</label>
+          <input type="number" id="productMinStock" value="5">
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="button" class="btn-secondary" onclick="printProductBarcode()" id="printBarcodeBtn" style="display: none;">🏷️ Print Barcode</button>
+          <button type="submit" class="btn-primary">Save Product</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Receipt Modal -->
+  <div id="receiptModal" class="modal">
+    <div class="modal-content receipt-modal">
+      <div class="modal-header">
+        <h2>Receipt</h2>
+        <span class="close">&times;</span>
+      </div>
+      <div id="receiptContent" class="receipt-content"></div>
+      <div class="modal-footer">
+        <button id="printReceiptBtn" class="btn-primary">Print Receipt</button>
+        <button class="btn-secondary cancel-btn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- User Modal -->
+  <div id="userModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="userModalTitle">Add User</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="userForm">
+        <input type="hidden" id="userId">
+        <div class="form-group">
+          <label>Username *</label>
+          <input type="text" id="userUsername" required>
+        </div>
+        <div class="form-group">
+          <label>Full Name *</label>
+          <input type="text" id="userFullName" required>
+        </div>
+        <div class="form-group" id="passwordGroup">
+          <label>Password *</label>
+          <input type="password" id="userPassword" required>
+        </div>
+        <div class="form-group">
+          <label>Role *</label>
+          <select id="userRole" required>
+            <option value="cashier">Cashier</option>
+            <option value="manager">Manager</option>
+            <option value="admin">Administrator</option>
+          </select>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary">Save User</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Change Password Modal -->
+  <div id="passwordModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Change Password</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="passwordForm">
+        <input type="hidden" id="passwordUserId">
+        <div class="form-group">
+          <label>New Password *</label>
+          <input type="password" id="newPassword" required minlength="6">
+        </div>
+        <div class="form-group">
+          <label>Confirm Password *</label>
+          <input type="password" id="confirmPassword" required minlength="6">
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary">Update Password</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Loan Customer Info Modal -->
+  <div id="loanModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Loan Customer Information</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="loanForm">
+        <div class="form-group">
+          <label>Customer Name *</label>
+          <input type="text" id="loanCustomerName" required>
+        </div>
+        <div class="form-group">
+          <label>Customer Phone *</label>
+          <input type="tel" id="loanCustomerPhone" required>
+        </div>
+        <div class="form-group">
+          <label>Notes (Optional)</label>
+          <textarea id="loanNotes" rows="3"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary">Complete Loan</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Loan Payment Modal -->
+  <div id="loanPaymentModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Pay Loan</h2>
+        <span class="close">&times;</span>
+      </div>
+      <div id="loanPaymentContent">
+        <!-- Dynamic content will be inserted here -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Return Processing Modal -->
+  <div id="returnModal" class="modal">
+    <div class="modal-content" style="max-width: 800px;">
+      <div class="modal-header">
+        <h2>Process Return</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="returnForm">
+        <div class="form-group">
+          <label>Receipt Number *</label>
+          <div style="display: flex; gap: 10px;">
+            <input type="text" id="returnReceiptNumber" required placeholder="Enter receipt number" style="flex: 1;">
+            <button type="button" class="btn-secondary" id="lookupReceiptBtn">Lookup</button>
+          </div>
+        </div>
+        
+        <div id="returnSaleDetails" style="display: none;">
+          <div class="form-group">
+            <label>Original Sale Items</label>
+            <div id="returnItemsList" class="return-items-list"></div>
+          </div>
+          
+          <div class="form-row">
+            <div class="form-group">
+              <label>Refund Method *</label>
+              <select id="returnRefundMethod" required>
+                <option value="cash">Cash</option>
+                <option value="card">Card</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Refund Amount</label>
+              <input type="text" id="returnTotalDisplay" readonly style="background: #f7fafc; font-weight: 700; font-size: 18px;">
+            </div>
+          </div>
+          
+          <div class="form-group">
+            <label>Reason for Return *</label>
+            <select id="returnReason" required>
+              <option value="">Select reason...</option>
+              <option value="defective">Defective/Damaged</option>
+              <option value="wrong_item">Wrong Item</option>
+              <option value="customer_request">Customer Request</option>
+              <option value="expired">Expired Product</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+          
+          <div class="form-group">
+            <label>Notes (Optional)</label>
+            <textarea id="returnNotes" rows="2"></textarea>
+          </div>
+        </div>
+        
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary" id="completeReturnBtn" disabled>Complete Return</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Z-Report Modal -->
+  <div id="zReportModal" class="modal">
+    <div class="modal-content modal-large">
+      <div class="modal-header">
+        <h3>Generate Z-Report (End of Day)</h3>
+        <button class="modal-close">&times;</button>
+      </div>
+      
+      <form id="zReportForm">
+        <div class="modal-body">
+          <div class="z-report-summary">
+            <h4>Report Summary</h4>
+            <div class="summary-grid">
+              <div class="summary-item">
+                <span class="summary-label">Period:</span>
+                <span class="summary-value" id="zReportPeriod">-</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Total Sales:</span>
+                <span class="summary-value" id="zReportTotalSales">0</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Total Returns:</span>
+                <span class="summary-value" id="zReportTotalReturns">0</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Net Sales Count:</span>
+                <span class="summary-value" id="zReportNetCount">0</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="z-report-section">
+            <h4>Sales Breakdown</h4>
+            <div class="summary-grid">
+              <div class="summary-item">
+                <span class="summary-label">Gross Sales:</span>
+                <span class="summary-value" id="zReportGrossSales">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Returns Amount:</span>
+                <span class="summary-value" id="zReportReturnsAmount">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Net Sales:</span>
+                <span class="summary-value" id="zReportNetSales">€0.00</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="z-report-section">
+            <h4>Payment Methods</h4>
+            <div class="summary-grid">
+              <div class="summary-item">
+                <span class="summary-label">Cash:</span>
+                <span class="summary-value" id="zReportCash">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Card:</span>
+                <span class="summary-value" id="zReportCard">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Loan:</span>
+                <span class="summary-value" id="zReportLoan">€0.00</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="z-report-section">
+            <h4>Tax Breakdown (German VAT)</h4>
+            <div class="summary-grid">
+              <div class="summary-item">
+                <span class="summary-label">7% Tax Base:</span>
+                <span class="summary-value" id="zReportTax7Base">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">7% Tax Amount:</span>
+                <span class="summary-value" id="zReportTax7Amount">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">19% Tax Base:</span>
+                <span class="summary-value" id="zReportTax19Base">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">19% Tax Amount:</span>
+                <span class="summary-value" id="zReportTax19Amount">€0.00</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">Total Tax:</span>
+                <span class="summary-value" id="zReportTotalTax">€0.00</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="z-report-section">
+            <h4>Cash Reconciliation</h4>
+            <div class="form-group">
+              <label>Expected Cash in Register:</label>
+              <input type="text" id="zReportExpectedCash" readonly>
+            </div>
+            <div class="form-group">
+              <label>Actual Cash Count:</label>
+              <input type="number" step="0.01" id="zReportActualCash" required>
+            </div>
+            <div class="form-group">
+              <label>Difference:</label>
+              <input type="text" id="zReportDifference" readonly>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Notes (Optional)</label>
+            <textarea id="zReportNotes" rows="3" placeholder="Any notes about this report..."></textarea>
+          </div>
+        </div>
+        
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary" id="submitZReportBtn">Complete Z-Report</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Z-Report Details Modal -->
+  <div id="zReportDetailsModal" class="modal">
+    <div class="modal-content modal-large">
+      <div class="modal-header">
+        <h3>Z-Report Details</h3>
+        <button class="modal-close">&times;</button>
+      </div>
+      
+      <div class="modal-body" id="zReportDetailsContent">
+        <!-- Content will be populated dynamically -->
+      </div>
+      
+      <div class="modal-footer">
+        <button type="button" class="btn-secondary cancel-btn">Close</button>
+        <button type="button" class="btn-primary" id="printZReportBtn">Print Report</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Virtual Keyboard -->
+  <div id="virtualKeyboard" class="virtual-keyboard">
+    <div class="keyboard-header">
+      <span class="keyboard-title">Keyboard</span>
+      <button class="keyboard-close" id="closeKeyboard">&times;</button>
+    </div>
+    <div class="keyboard-display">
+      <input type="text" id="keyboardDisplay" readonly>
+    </div>
+    <div class="keyboard-buttons">
+      <div class="keyboard-row">
+        <button class="key-btn" data-key="1">1</button>
+        <button class="key-btn" data-key="2">2</button>
+        <button class="key-btn" data-key="3">3</button>
+        <button class="key-btn" data-key="4">4</button>
+        <button class="key-btn" data-key="5">5</button>
+        <button class="key-btn" data-key="6">6</button>
+        <button class="key-btn" data-key="7">7</button>
+        <button class="key-btn" data-key="8">8</button>
+        <button class="key-btn" data-key="9">9</button>
+        <button class="key-btn" data-key="0">0</button>
+      </div>
+      <div class="keyboard-row">
+        <button class="key-btn" data-key="Q">Q</button>
+        <button class="key-btn" data-key="W">W</button>
+        <button class="key-btn" data-key="E">E</button>
+        <button class="key-btn" data-key="R">R</button>
+        <button class="key-btn" data-key="T">T</button>
+        <button class="key-btn" data-key="Y">Y</button>
+        <button class="key-btn" data-key="U">U</button>
+        <button class="key-btn" data-key="I">I</button>
+        <button class="key-btn" data-key="O">O</button>
+        <button class="key-btn" data-key="P">P</button>
+      </div>
+      <div class="keyboard-row">
+        <button class="key-btn" data-key="A">A</button>
+        <button class="key-btn" data-key="S">S</button>
+        <button class="key-btn" data-key="D">D</button>
+        <button class="key-btn" data-key="F">F</button>
+        <button class="key-btn" data-key="G">G</button>
+        <button class="key-btn" data-key="H">H</button>
+        <button class="key-btn" data-key="J">J</button>
+        <button class="key-btn" data-key="K">K</button>
+        <button class="key-btn" data-key="L">L</button>
+      </div>
+      <div class="keyboard-row">
+        <button class="key-btn" data-key="Z">Z</button>
+        <button class="key-btn" data-key="X">X</button>
+        <button class="key-btn" data-key="C">C</button>
+        <button class="key-btn" data-key="V">V</button>
+        <button class="key-btn" data-key="B">B</button>
+        <button class="key-btn" data-key="N">N</button>
+        <button class="key-btn" data-key="M">M</button>
+        <button class="key-btn key-btn-wide" data-key="Backspace">⌫</button>
+      </div>
+      <div class="keyboard-row">
+        <button class="key-btn" data-key="-">-</button>
+        <button class="key-btn" data-key="@">@</button>
+        <button class="key-btn key-btn-space" data-key=" ">Space</button>
+        <button class="key-btn" data-key=".">.</button>
+        <button class="key-btn key-btn-wide" data-key="Done">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom Alert Modal -->
+  <div id="customAlert" class="custom-alert-overlay">
+    <div class="custom-alert-modal">
+      <div class="custom-alert-icon" id="customAlertIcon">
+        <span id="customAlertIconText">✓</span>
+      </div>
+      <h2 id="customAlertTitle">Success</h2>
+      <p id="customAlertMessage">Operation completed successfully!</p>
+      <button id="customAlertBtn" class="custom-alert-btn">OK</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
