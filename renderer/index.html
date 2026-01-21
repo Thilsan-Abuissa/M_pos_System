@@ -7,22 +7,38 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <!-- Login Screen -->
-  <div id="loginScreen" class="screen active">
+  <!-- Loading Screen -->
+  <div id="loadingScreen" class="screen active">
+    <div class="loading-container">
+      <div class="loading-logo-container">
+        <div id="loadingLogo" class="loading-logo">🛒</div>
+        <h1 id="loadingTitle" class="loading-title">Supermarket POS</h1>
+      </div>
+      
+      <div class="loading-spinner">
+        <div class="spinner"></div>
+      </div>
+      
+      <p class="loading-text">Loading...</p>
+      
+      <div class="loading-version">
+        <p>Version 1.0.0</p>
+        <p class="loading-copyright">© All Rights Reserved</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Role Selection Screen -->
+  <div id="loginScreen" class="screen">
     <div class="login-container">
       <div class="login-logo-container">
         <div id="loginLogo" class="login-logo">🛒</div>
         <h1 id="loginTitle">Supermarket POS</h1>
       </div>
-      <div class="login-form">
-        <input type="text" id="username" placeholder="Username" value="admin">
-        <input type="password" id="password" placeholder="Password" value="admin123">
-        <button id="loginBtn" class="btn-primary">Login</button>
-        <div class="login-roles">
-          <h3>Test Accounts:</h3>
-          <div class="role-item"><strong>Admin:</strong> admin / admin123</div>
-          <div class="role-item"><strong>Manager:</strong> manager / manager123</div>
-          <div class="role-item"><strong>Cashier:</strong> cashier / cashier123</div>
+      <div class="role-selection">
+        <h2 style="color: white; margin-bottom: 30px; font-size: 24px;">Select User</h2>
+        <div id="userRolesContainer" class="user-roles-container">
+          <!-- User buttons will be dynamically loaded here -->
         </div>
       </div>
     </div>
@@ -41,6 +57,10 @@
       
       <div class="navbar-center">
         <div class="nav-tabs" id="navTabs">
+          <button class="tab-btn" data-view="settings">
+            <span class="tab-icon">🏠</span>
+            <span class="tab-text">Home</span>
+          </button>
           <button class="tab-btn active" data-view="checkout">
             <span class="tab-icon">🛒</span>
             <span class="tab-text">Checkout</span>
@@ -49,25 +69,13 @@
             <span class="tab-icon">📦</span>
             <span class="tab-text">Products</span>
           </button>
+          <button class="tab-btn" data-view="categories">
+            <span class="tab-icon">🏷️</span>
+            <span class="tab-text">Categories</span>
+          </button>
           <button class="tab-btn" data-view="sales">
             <span class="tab-icon">💰</span>
             <span class="tab-text">Sales</span>
-          </button>
-          <button class="tab-btn" data-view="reports">
-            <span class="tab-icon">📊</span>
-            <span class="tab-text">Reports</span>
-          </button>
-          <button class="tab-btn" data-view="returns" id="returnsNavBtn">
-            <span class="tab-icon">↩️</span>
-            <span class="tab-text">Returns</span>
-          </button>
-          <button class="tab-btn" data-view="inventory">
-            <span class="tab-icon">📋</span>
-            <span class="tab-text">Inventory</span>
-          </button>
-          <button class="tab-btn" data-view="users" id="usersNavBtn">
-            <span class="tab-icon">👥</span>
-            <span class="tab-text">Users</span>
           </button>
         </div>
       </div>
@@ -97,9 +105,9 @@
                   <table class="cart-table">
                     <thead>
                       <tr>
-                        <th>ITEM DESCRIPTION</th>
+                        <th>ITEM</th>
                         <th>PRICE</th>
-                        <th>QTY</th>
+                        <th>WEIGHT</th>
                         <th>DISCOUNT</th>
                         <th>TOTAL</th>
                       </tr>
@@ -134,6 +142,11 @@
                     <div class="payment-section">
                       <div class="payment-label">Payment</div>
                       <div class="payment-amount" id="paymentAmount">$0.00</div>
+                      <input type="hidden" id="paymentInput" value="">
+                    </div>
+                    <div class="change-section">
+                      <div class="change-label">Change</div>
+                      <div class="change-amount" id="changeAmount">$0.00</div>
                     </div>
                   </div>
                 </div>
@@ -144,7 +157,7 @@
                     <button class="numpad-btn" data-value="1">1</button>
                     <button class="numpad-btn" data-value="2">2</button>
                     <button class="numpad-btn" data-value="3">3</button>
-                    <button id="checkoutBtn" class="btn-complete-sale numpad-btn" disabled>COMPLETE SALE</button>
+                    <button class="numpad-btn numpad-clear" data-value="clear">CLEAR</button>
                     <button class="numpad-btn" data-value="4">4</button>
                     <button class="numpad-btn" data-value="5">5</button>
                     <button class="numpad-btn" data-value="6">6</button>
@@ -156,7 +169,8 @@
                     <button class="numpad-btn numpad-dot" data-value=".">.</button>
                     <button class="numpad-btn" data-value="0">0</button>
                     <button class="numpad-btn" data-value="00">00</button>
-                    <button class="numpad-btn numpad-loan" data-value="loan">LOAN</button>
+                    <button class="numpad-btn numpad-loan" data-value="loan">PACKING</button>
+                    <button id="checkoutBtn" class="btn-complete-sale numpad-btn" disabled style="grid-column: span 4;">COMPLETE SALE</button>
                   </div>
                 </div>
               </div>
@@ -169,8 +183,12 @@
                 <div class="header-actions">
                   <!-- Search Bar -->
                   <div class="search-section">
-                    <input type="text" id="barcodeInput" placeholder="SEARCH" autocomplete="off">
+                    <input type="text" id="productSearch" placeholder="Search Product..." autocomplete="off">
                   </div>
+                  
+                  <button class="drawer-btn-small" onclick="openCashDrawer()" title="Open Cash Drawer">
+                    <span class="drawer-icon">💵</span>
+                  </button>
                   
                   <div class="settings-dropdown">
                     <button class="settings-btn" id="settingsBtn">
@@ -198,6 +216,10 @@
                         <span class="menu-icon">📋</span>
                         <span class="menu-text">Inventory</span>
                       </button>
+                      <button class="settings-menu-item" data-view="categories" id="categoriesMenuBtn">
+                        <span class="menu-icon">🏷️</span>
+                        <span class="menu-text">Categories</span>
+                      </button>
                       <button class="settings-menu-item" data-view="users" id="usersMenuBtn">
                         <span class="menu-icon">👥</span>
                         <span class="menu-text">Users</span>
@@ -212,14 +234,14 @@
               </div>
 
               <!-- Category Tabs -->
-              <div class="category-tabs">
+              <div class="category-tabs" id="categoryTabs">
                 <button class="category-tab active" data-category="all">ALL</button>
-                <button class="category-tab" data-category="Produce">PRODUCE</button>
-                <button class="category-tab" data-category="Dairy">DAIRY</button>
-                <button class="category-tab" data-category="Bakery">BAKERY</button>
-                <button class="category-tab" data-category="Meat">MEAT</button>
-                <button class="category-tab" data-category="Beverages">BEVERAGES</button>
-                <button class="category-tab" data-category="Grains">GRAINS</button>
+                <!-- Dynamic categories will be loaded here -->
+              </div>
+
+              <!-- Subcategory Filters -->
+              <div class="subcategory-filters" id="subcategoryFilters" style="display: none;">
+                <!-- Subcategories will be loaded here when a category is selected -->
               </div>
 
               <!-- Quick Products Grid -->
@@ -267,8 +289,13 @@
               </button>
               <button class="settings-card" data-view="loans">
                 <span class="settings-card-icon">💳</span>
-                <span class="settings-card-title">Loans</span>
-                <span class="settings-card-desc">Manage customer loans</span>
+                <span class="settings-card-title">PACKING</span>
+                <span class="settings-card-desc">Manage customer packing</span>
+              </button>
+              <button class="settings-card" data-view="categories">
+                <span class="settings-card-icon">🏷️</span>
+                <span class="settings-card-title">Categories</span>
+                <span class="settings-card-desc">Manage product categories</span>
               </button>
               <button class="settings-card" data-view="system" id="systemSettingsCard">
                 <span class="settings-card-icon">⚙️</span>
@@ -300,7 +327,10 @@
             <div class="view-content">
               <div class="view-header">
                 <h2>Product Management</h2>
-                <button id="addProductBtn" class="btn-primary">+ Add Product</button>
+                <div class="header-buttons">
+                  <button id="addProductBtn" class="btn-primary">+ Add Product</button>
+                  <button id="addCategoryBtnHeader" class="btn-secondary">+ Add Category</button>
+                </div>
               </div>
 
               <div class="search-bar">
@@ -311,7 +341,7 @@
                 <table id="productsTable">
                   <thead>
                     <tr>
-                      <th>Barcode</th>
+                      <th>Product ID</th>
                       <th>Name</th>
                       <th>Category</th>
                       <th>Price</th>
@@ -369,6 +399,7 @@
               <div class="report-tabs">
                 <button class="report-tab active" data-tab="z-reports">Z-Reports</button>
                 <button class="report-tab" data-tab="sales-reports">Sales Reports</button>
+                <button class="report-tab" data-tab="restaurant-reports">Restaurant Reports</button>
               </div>
 
               <!-- Z-Reports Tab -->
@@ -385,7 +416,7 @@
                         <th>Net Sales</th>
                         <th>Cash</th>
                         <th>Card</th>
-                        <th>Loan</th>
+                        <th>PACKING</th>
                         <th>Total Tax</th>
                         <th>Actions</th>
                       </tr>
@@ -403,6 +434,30 @@
                   <button id="generateSalesReportBtn" class="btn-primary">Generate Report</button>
                 </div>
                 <div id="reportResults" class="report-results"></div>
+              </div>
+
+              <!-- Restaurant Reports Tab -->
+              <div id="restaurant-reports" class="report-tab-content">
+                <div class="report-filters">
+                  <label>Select Month:</label>
+                  <select id="restaurantReportMonth">
+                    <option value="1">January</option>
+                    <option value="2">February</option>
+                    <option value="3">March</option>
+                    <option value="4">April</option>
+                    <option value="5">May</option>
+                    <option value="6">June</option>
+                    <option value="7">July</option>
+                    <option value="8">August</option>
+                    <option value="9">September</option>
+                    <option value="10">October</option>
+                    <option value="11">November</option>
+                    <option value="12">December</option>
+                  </select>
+                  <select id="restaurantReportYear"></select>
+                  <button id="generateRestaurantReportBtn" class="btn-primary">🍽️ Generate Restaurant Report</button>
+                </div>
+                <div id="restaurantReportResults" class="report-results"></div>
               </div>
             </div>
           </div>
@@ -469,15 +524,15 @@
           <div class="view-wrapper">
             <div class="view-content">
               <div class="view-header">
-                <h2>Loan Management</h2>
+                <h2>PACKING Management</h2>
                 <div class="loan-search-container">
                   <input type="text" id="loanReceiptSearch" placeholder="Search by receipt number...">
-                  <button id="searchLoanBtn" class="btn-primary">Search Loan</button>
+                  <button id="searchLoanBtn" class="btn-primary">Search PACKING</button>
                 </div>
               </div>
 
               <div class="loan-filter-tabs">
-                <button class="loan-filter-tab active" data-status="all">All Loans</button>
+                <button class="loan-filter-tab active" data-status="all">All PACKING</button>
                 <button class="loan-filter-tab" data-status="pending">Pending</button>
                 <button class="loan-filter-tab" data-status="partial">Partial</button>
                 <button class="loan-filter-tab" data-status="paid">Paid</button>
@@ -488,13 +543,14 @@
                   <thead>
                     <tr>
                       <th>Receipt #</th>
-                      <th>Customer Name</th>
+                      <th>Type</th>
+                      <th>Customer/Restaurant</th>
                       <th>Phone</th>
-                      <th>Loan Amount</th>
+                      <th>Parking Amount</th>
                       <th>Paid Amount</th>
                       <th>Remaining</th>
                       <th>Status</th>
-                      <th>Loan Date</th>
+                      <th>Date</th>
                       <th>Actions</th>
                     </tr>
                   </thead>
@@ -601,6 +657,40 @@
             </div>
           </div>
         </div>
+
+        <!-- Categories View (Admin Only) -->
+        <div id="categoriesView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Category Management</h2>
+                <button id="addCategoryBtn" class="btn-primary">+ Add Category</button>
+              </div>
+              
+              <div style="background: #e3f2fd; padding: 12px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3;">
+                <p style="margin: 0; color: #1976d2;">
+                  ⭐ <strong>Front Screen Categories:</strong> Click the star (☆) to select up to 10 categories to display on the POS front screen. 
+                  Starred categories will appear as quick access buttons during checkout.
+                </p>
+              </div>
+
+              <div class="table-container">
+                <table id="categoriesTable">
+                  <thead>
+                    <tr>
+                      <th>Favorite</th>
+                      <th>Category Name</th>
+                      <th>Tax Rate (%)</th>
+                      <th>Created</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -615,37 +705,37 @@
       <form id="productForm">
         <input type="hidden" id="productId">
         <div class="form-group">
-          <label>Barcode *</label>
-          <input type="text" id="productBarcode" required oninput="generateBarcodeDisplay(this.value)">
+          <label>Product ID *</label>
+          <input type="text" id="productBarcode" required>
         </div>
-        <div id="barcodeDisplay" class="barcode-display"></div>
         <div class="form-group">
           <label>Product Name *</label>
           <input type="text" id="productName" required>
         </div>
         <div class="form-group">
-          <label>Description</label>
-          <input type="text" id="productDescription">
+          <label>Product Image</label>
+          <input type="file" id="productImage" accept="image/*" style="display: none;">
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <button type="button" class="btn-secondary" onclick="document.getElementById('productImage').click()">Choose Image</button>
+            <span id="productImageName" style="font-size: 12px; color: #666;">No image selected</span>
+          </div>
+          <div id="productImagePreview" style="margin-top: 10px; display: none;">
+            <img id="productImagePreviewImg" src="" alt="Product preview" style="max-width: 150px; max-height: 150px; border-radius: 8px; border: 2px solid #e2e8f0;">
+            <button type="button" class="btn-secondary" onclick="clearProductImage()" style="margin-top: 5px; font-size: 12px; padding: 5px 10px;">Remove Image</button>
+          </div>
         </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>Category *</label>
-            <select id="productCategory" required>
-              <option value="General">General</option>
-              <option value="Food">Food (7% Tax)</option>
-              <option value="Beverages">Beverages (19% Tax)</option>
-              <option value="Household">Household</option>
-              <option value="Personal Care">Personal Care</option>
-              <option value="Snacks">Snacks</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>Tax Rate *</label>
-            <select id="productTaxRate" required>
-              <option value="0.07">7% (Food)</option>
-              <option value="0.19" selected>19% (Standard)</option>
-            </select>
-          </div>
+        <div class="form-group">
+          <label>Category *</label>
+          <select id="productCategory" required>
+            <!-- Categories will be loaded dynamically -->
+          </select>
+        </div>
+        <div class="form-group" id="productSubcategoryGroup" style="display: none;">
+          <label>Subcategory</label>
+          <select id="productSubcategory">
+            <option value="">-- No Subcategory --</option>
+            <!-- Subcategories will be loaded dynamically -->
+          </select>
         </div>
         <div class="form-row">
           <div class="form-group">
@@ -667,15 +757,9 @@
             <input type="number" id="productPrice" step="0.01" required readonly style="background: #f7fafc;">
           </div>
         </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>Cost</label>
-            <input type="number" id="productCost" step="0.01">
-          </div>
-          <div class="form-group">
-            <label>Stock *</label>
-            <input type="number" id="productStock" required>
-          </div>
+        <div class="form-group">
+          <label>Stock *</label>
+          <input type="number" id="productStock" required>
         </div>
         <div class="form-group">
           <label>Minimum Stock</label>
@@ -683,7 +767,6 @@
         </div>
         <div class="modal-footer">
           <button type="button" class="btn-secondary cancel-btn">Cancel</button>
-          <button type="button" class="btn-secondary" onclick="printProductBarcode()" id="printBarcodeBtn" style="display: none;">🏷️ Print Barcode</button>
           <button type="submit" class="btn-primary">Save Product</button>
         </div>
       </form>
@@ -742,6 +825,58 @@
     </div>
   </div>
 
+  <!-- Category Modal -->
+  <div id="categoryModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="categoryModalTitle">Add Category</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="categoryForm">
+        <input type="hidden" id="categoryId">
+        <div class="form-group">
+          <label>Category Name *</label>
+          <input type="text" id="categoryName" required>
+        </div>
+        <div class="form-group">
+          <label>Tax Rate (%) *</label>
+          <input type="number" id="categoryTaxRate" step="0.01" min="0" max="100" required>
+        </div>
+        <div class="form-group" id="subcategoriesSection" style="display: none;">
+          <label>Subcategories</label>
+          <div id="subcategoriesList" class="subcategories-list"></div>
+          <button type="button" class="btn-secondary" id="addSubcategoryBtn" style="margin-top: 10px;">+ Add Subcategory</button>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary">Save Category</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Subcategory Modal -->
+  <div id="subcategoryModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="subcategoryModalTitle">Add Subcategory</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="subcategoryForm">
+        <input type="hidden" id="subcategoryId">
+        <input type="hidden" id="subcategoryCategoryId">
+        <div class="form-group">
+          <label>Subcategory Name *</label>
+          <input type="text" id="subcategoryName" required>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary">Save Subcategory</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Change Password Modal -->
   <div id="passwordModal" class="modal">
     <div class="modal-content">
@@ -771,25 +906,41 @@
   <div id="loanModal" class="modal">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Loan Customer Information</h2>
+        <h2>Parking - Pay Later</h2>
         <span class="close">&times;</span>
       </div>
       <form id="loanForm">
         <div class="form-group">
-          <label>Customer Name *</label>
-          <input type="text" id="loanCustomerName" required>
+          <label>Customer Type *</label>
+          <select id="loanCustomerType" required>
+            <option value="">Select Customer Type</option>
+            <option value="regular">Regular Customer</option>
+            <option value="restaurant">Restaurant</option>
+          </select>
+        </div>
+        <div class="form-group" id="restaurantFields" style="display: none;">
+          <label>Restaurant Name *</label>
+          <input type="text" id="loanRestaurantName" placeholder="Enter restaurant name">
+        </div>
+        <div class="form-group" id="restaurantNieField" style="display: none;">
+          <label>Restaurant NIE Number</label>
+          <input type="text" id="loanRestaurantNie" placeholder="Enter NIE number (optional)">
         </div>
         <div class="form-group">
-          <label>Customer Phone *</label>
-          <input type="tel" id="loanCustomerPhone" required>
+          <label>Customer Name *</label>
+          <input type="text" id="loanCustomerName" required placeholder="Enter customer name">
+        </div>
+        <div class="form-group">
+          <label>Customer Phone (Optional)</label>
+          <input type="tel" id="loanCustomerPhone" placeholder="Enter phone number">
         </div>
         <div class="form-group">
           <label>Notes (Optional)</label>
-          <textarea id="loanNotes" rows="3"></textarea>
+          <textarea id="loanNotes" rows="3" placeholder="Additional notes"></textarea>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn-secondary cancel-btn">Cancel</button>
-          <button type="submit" class="btn-primary">Complete Loan</button>
+          <button type="submit" class="btn-primary">Save to Parking</button>
         </div>
       </form>
     </div>
@@ -799,7 +950,7 @@
   <div id="loanPaymentModal" class="modal">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Pay Loan</h2>
+        <h2>Pay PACKING</h2>
         <span class="close">&times;</span>
       </div>
       <div id="loanPaymentContent">
@@ -932,7 +1083,7 @@
                 <span class="summary-value" id="zReportCard">€0.00</span>
               </div>
               <div class="summary-item">
-                <span class="summary-label">Loan:</span>
+                <span class="summary-label">PACKING:</span>
                 <span class="summary-value" id="zReportLoan">€0.00</span>
               </div>
             </div>
@@ -1016,24 +1167,21 @@
   <!-- Virtual Keyboard -->
   <div id="virtualKeyboard" class="virtual-keyboard">
     <div class="keyboard-header">
-      <span class="keyboard-title">Keyboard</span>
+      <span class="keyboard-title">Touch Keyboard</span>
       <button class="keyboard-close" id="closeKeyboard">&times;</button>
-    </div>
-    <div class="keyboard-display">
-      <input type="text" id="keyboardDisplay" readonly>
     </div>
     <div class="keyboard-buttons">
       <div class="keyboard-row">
-        <button class="key-btn" data-key="1">1</button>
-        <button class="key-btn" data-key="2">2</button>
-        <button class="key-btn" data-key="3">3</button>
-        <button class="key-btn" data-key="4">4</button>
-        <button class="key-btn" data-key="5">5</button>
-        <button class="key-btn" data-key="6">6</button>
-        <button class="key-btn" data-key="7">7</button>
-        <button class="key-btn" data-key="8">8</button>
-        <button class="key-btn" data-key="9">9</button>
-        <button class="key-btn" data-key="0">0</button>
+        <button class="key-btn key-number" data-key="1">1</button>
+        <button class="key-btn key-number" data-key="2">2</button>
+        <button class="key-btn key-number" data-key="3">3</button>
+        <button class="key-btn key-number" data-key="4">4</button>
+        <button class="key-btn key-number" data-key="5">5</button>
+        <button class="key-btn key-number" data-key="6">6</button>
+        <button class="key-btn key-number" data-key="7">7</button>
+        <button class="key-btn key-number" data-key="8">8</button>
+        <button class="key-btn key-number" data-key="9">9</button>
+        <button class="key-btn key-number" data-key="0">0</button>
       </div>
       <div class="keyboard-row">
         <button class="key-btn" data-key="Q">Q</button>
@@ -1066,14 +1214,42 @@
         <button class="key-btn" data-key="B">B</button>
         <button class="key-btn" data-key="N">N</button>
         <button class="key-btn" data-key="M">M</button>
-        <button class="key-btn key-btn-wide" data-key="Backspace">⌫</button>
+        <button class="key-btn key-special" data-key="-">-</button>
+        <button class="key-btn key-special" data-key=".">.</button>
+        <button class="key-btn key-backspace" data-key="Backspace">⌫</button>
       </div>
       <div class="keyboard-row">
-        <button class="key-btn" data-key="-">-</button>
-        <button class="key-btn" data-key="@">@</button>
-        <button class="key-btn key-btn-space" data-key=" ">Space</button>
-        <button class="key-btn" data-key=".">.</button>
-        <button class="key-btn key-btn-wide" data-key="Done">Done</button>
+        <button class="key-btn key-special" data-key="@">@</button>
+        <button class="key-btn key-space" data-key=" ">SPACE</button>
+        <button class="key-btn key-done" data-key="Done">✓ DONE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Weight Input Modal -->
+  <div id="weightModal" class="custom-alert-overlay" style="display: none;">
+    <div class="custom-alert-modal">
+      <div class="custom-alert-icon" style="background: linear-gradient(135deg, #6E8FAF 0%, #6EAFAF 100%);">
+        <span style="font-size: 32px;">⚖️</span>
+      </div>
+      <h2 id="weightModalTitle">Enter Weight</h2>
+      <p id="weightModalMessage">Product: <span id="weightProductName"></span><br>Price: <span id="weightProductPrice"></span></p>
+      <div style="margin: 20px 0;">
+        <input type="number" id="weightInput" 
+               style="width: 100%; padding: 15px; font-size: 24px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;" 
+               placeholder="Enter weight (kg)" 
+               step="0.01" 
+               min="0.01"
+               autofocus>
+      </div>
+      <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+        <button id="readScaleBtn" class="custom-alert-btn" style="background: #10b981; flex: 1;">
+          📡 Read Again
+        </button>
+      </div>
+      <div style="display: flex; gap: 12px;">
+        <button id="weightCancelBtn" class="custom-alert-btn" style="background: #94a3b8; flex: 1;">Cancel</button>
+        <button id="weightOkBtn" class="custom-alert-btn" style="flex: 1;">Add to Cart</button>
       </div>
     </div>
   </div>

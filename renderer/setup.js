@@ -1,80 +1,23 @@
 const form = document.getElementById('setupForm');
-const passwordInput = document.getElementById('password');
-const confirmPasswordInput = document.getElementById('confirmPassword');
 const setupButton = document.getElementById('setupButton');
 const errorMessage = document.getElementById('errorMessage');
 const successMessage = document.getElementById('successMessage');
 const usernameInput = document.getElementById('username');
-
-// Password validation
-passwordInput.addEventListener('input', () => {
-  const password = passwordInput.value;
-  const lengthReq = document.getElementById('req-length');
-  const letterReq = document.getElementById('req-letter');
-  const numberReq = document.getElementById('req-number');
-
-  // Check length
-  if (password.length >= 6) {
-    lengthReq.classList.add('valid');
-  } else {
-    lengthReq.classList.remove('valid');
-  }
-
-  // Check for letter
-  if (/[a-zA-Z]/.test(password)) {
-    letterReq.classList.add('valid');
-  } else {
-    letterReq.classList.remove('valid');
-  }
-
-  // Check for number
-  if (/[0-9]/.test(password)) {
-    numberReq.classList.add('valid');
-  } else {
-    numberReq.classList.remove('valid');
-  }
-
-  validateForm();
-});
-
-confirmPasswordInput.addEventListener('input', validateForm);
-
-function validateForm() {
-  const password = passwordInput.value;
-  const confirmPassword = confirmPasswordInput.value;
-  const fullName = document.getElementById('fullName').value;
-  const username = document.getElementById('username').value;
-
-  const hasLength = password.length >= 6;
-  const hasLetter = /[a-zA-Z]/.test(password);
-  const hasNumber = /[0-9]/.test(password);
-  const passwordsMatch = password === confirmPassword && confirmPassword !== '';
-  const allFilled = fullName && username && password && confirmPassword;
-
-  setupButton.disabled = !(hasLength && hasLetter && hasNumber && passwordsMatch && allFilled);
-}
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   
   const fullName = document.getElementById('fullName').value.trim();
   const username = document.getElementById('username').value.trim();
-  const password = document.getElementById('password').value;
-  const confirmPassword = document.getElementById('confirmPassword').value;
 
   // Validate
-  if (password !== confirmPassword) {
-    showError('Passwords do not match');
+  if (!fullName || !username) {
+    showError('Please fill in all fields');
     return;
   }
 
-  if (password.length < 6) {
-    showError('Password must be at least 6 characters');
-    return;
-  }
-
-  if (!/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
-    showError('Password must contain both letters and numbers');
+  if (username.length < 3) {
+    showError('Username must be at least 3 characters');
     return;
   }
 
@@ -83,11 +26,11 @@ form.addEventListener('submit', async (e) => {
   setupButton.textContent = 'Creating Account...';
 
   try {
-    // Create admin user
+    // Create admin user with no password
     const result = await window.api.createFirstAdmin({
       fullName,
       username,
-      password
+      password: username // Use username as default password
     });
 
     if (result.success) {
@@ -119,3 +62,74 @@ function showError(message) {
     errorMessage.style.display = 'none';
   }, 5000);
 }
+
+// Virtual Keyboard Setup
+let currentKeyboardInput = null;
+
+function setupVirtualKeyboard() {
+  const keyboard = document.getElementById('virtualKeyboard');
+  const closeKeyboardBtn = document.getElementById('closeKeyboard');
+  const keyButtons = document.querySelectorAll('.key-btn');
+  
+  // Initialize keyboard in lowercase mode
+  keyButtons.forEach(btn => {
+    const key = btn.dataset.key;
+    if (key && key.length === 1 && /[A-Z]/.test(key)) {
+      btn.textContent = key.toLowerCase();
+    }
+  });
+  
+  // Show keyboard when text inputs are focused
+  document.addEventListener('focusin', (e) => {
+    if (e.target.tagName === 'INPUT' && 
+        (e.target.type === 'text' || e.target.type === 'tel' || e.target.type === 'number')) {
+      currentKeyboardInput = e.target;
+      keyboard.classList.add('active');
+    }
+  });
+  
+  // Handle key presses
+  keyButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      
+      if (key === 'Backspace') {
+        if (currentKeyboardInput) {
+          currentKeyboardInput.value = currentKeyboardInput.value.slice(0, -1);
+          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      } else if (key === 'Done') {
+        if (currentKeyboardInput) {
+          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        keyboard.classList.remove('active');
+        currentKeyboardInput = null;
+      } else {
+        if (currentKeyboardInput) {
+          const actualKey = btn.textContent === 'SPACE' ? ' ' : btn.textContent;
+          currentKeyboardInput.value += actualKey;
+          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+    });
+  });
+  
+  // Close button
+  closeKeyboardBtn.addEventListener('click', () => {
+    keyboard.classList.remove('active');
+    currentKeyboardInput = null;
+  });
+  
+  // Close on outside click
+  document.addEventListener('click', (e) => {
+    if (!keyboard.contains(e.target) && 
+        e.target.tagName !== 'INPUT' && 
+        keyboard.classList.contains('active')) {
+      keyboard.classList.remove('active');
+      currentKeyboardInput = null;
+    }
+  });
+}
+
+// Initialize keyboard when DOM is ready
+setupVirtualKeyboard();

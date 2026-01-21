@@ -24,7 +24,9 @@
     "electron-rebuild": "^3.2.9"
   },
   "dependencies": {
-    "better-sqlite3": "^11.10.0"
+    "@serialport/parser-readline": "^13.0.0",
+    "better-sqlite3": "^11.10.0",
+    "serialport": "^13.0.0"
   },
   "build": {
     "appId": "com.supermarket.pos",

@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('api', {
   getLoanByReceipt: (receiptNumber) => ipcRenderer.invoke('loans:getByReceipt', receiptNumber),
   payLoan: (loanId, paymentData) => ipcRenderer.invoke('loans:pay', loanId, paymentData),
   getLoanById: (id) => ipcRenderer.invoke('loans:getById', id),
+  getMonthlyRestaurantReport: (month, year) => ipcRenderer.invoke('loans:getMonthlyRestaurantReport', month, year),
   
   // Returns
   createReturn: (returnData) => ipcRenderer.invoke('returns:create', returnData),
@@ -56,6 +57,23 @@ contextBridge.exposeInMainWorld('api', {
   getSystemSettings: () => ipcRenderer.invoke('settings:get'),
   updateSystemSettings: (settings) => ipcRenderer.invoke('settings:update', settings),
   
+  // Categories
+  getAllCategories: () => ipcRenderer.invoke('categories:getAll'),
+  getCategoryById: (id) => ipcRenderer.invoke('categories:getById', id),
+  addCategory: (category) => ipcRenderer.invoke('categories:add', category),
+  updateCategory: (id, category) => ipcRenderer.invoke('categories:update', id, category),
+  deleteCategory: (id) => ipcRenderer.invoke('categories:delete', id),
+  toggleCategoryFavorite: (id, isFavorite) => ipcRenderer.invoke('categories:toggleFavorite', id, isFavorite),
+  getFavoriteCategories: () => ipcRenderer.invoke('categories:getFavorites'),
+  
+  // Subcategories
+  getAllSubcategories: () => ipcRenderer.invoke('subcategories:getAll'),
+  getSubcategoriesByCategoryId: (categoryId) => ipcRenderer.invoke('subcategories:getByCategoryId', categoryId),
+  getSubcategoryById: (id) => ipcRenderer.invoke('subcategories:getById', id),
+  addSubcategory: (subcategory) => ipcRenderer.invoke('subcategories:add', subcategory),
+  updateSubcategory: (id, subcategory) => ipcRenderer.invoke('subcategories:update', id, subcategory),
+  deleteSubcategory: (id) => ipcRenderer.invoke('subcategories:delete', id),
+  
   // Customer Display
   openCustomerDisplay: () => ipcRenderer.invoke('customerDisplay:open'),
   updateCustomerDisplay: (data) => ipcRenderer.invoke('customerDisplay:update', data),
@@ -63,5 +81,11 @@ contextBridge.exposeInMainWorld('api', {
   
   // Printer
   openCashDrawer: () => ipcRenderer.invoke('printer:openDrawer'),
-  printBarcodeLabel: (barcodeData) => ipcRenderer.invoke('printer:printBarcode', barcodeData)
+  printBarcodeLabel: (barcodeData) => ipcRenderer.invoke('printer:printBarcode', barcodeData),
+  
+  // Scale
+  listScalePorts: () => ipcRenderer.invoke('scale:listPorts'),
+  connectScale: (portPath) => ipcRenderer.invoke('scale:connect', portPath),
+  readScaleWeight: () => ipcRenderer.invoke('scale:readWeight'),
+  disconnectScale: () => ipcRenderer.invoke('scale:disconnect')
 });

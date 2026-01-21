@@ -2,28 +2,81 @@
 let currentUser = null;
 let cart = [];
 let allProducts = [];
+let allCategories = [];
 let selectedPaymentMethod = null; // No default - must select payment method
 let systemSettings = null; // System settings
 let currentLogoData = ''; // Current logo data
+let scaleConnected = false; // Scale connection status
+let scalePort = null; // Currently connected scale port
 
-// Role-based permissions
+// Role-based permissions - Only admin can manage users and system settings
 const PERMISSIONS = {
-  cashier: ['checkout', 'sales', 'returns', 'loans'],
-  manager: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans'],
-  admin: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans', 'users', 'system']
+  cashier: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  manager: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  admin: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans', 'users', 'system', 'categories', 'settings']
 };
 
 // Initialize app
 document.addEventListener('DOMContentLoaded', () => {
-  initializeApp();
+  showLoadingScreen();
 });
 
+function showLoadingScreen() {
+  // Update loading screen with branding
+  updateLoadingBranding();
+  
+  // Show loading screen for 3 seconds
+  setTimeout(() => {
+    // Hide loading screen and show login screen
+    document.getElementById('loadingScreen').classList.remove('active');
+    document.getElementById('loginScreen').classList.add('active');
+    
+    // Initialize app after loading screen
+    initializeApp();
+  }, 3000); // 3 seconds
+}
+
+async function updateLoadingBranding() {
+  try {
+    const systemSettings = await window.api.getSystemSettings();
+    const storeName = systemSettings?.store_name || 'Supermarket POS';
+    const storeLogo = systemSettings?.store_logo || '';
+    
+    const hasLogo = storeLogo && storeLogo.trim() !== '';
+    const isImage = hasLogo && storeLogo.startsWith('data:image');
+    
+    const loadingLogo = document.getElementById('loadingLogo');
+    const loadingTitle = document.getElementById('loadingTitle');
+    
+    if (loadingLogo && loadingTitle) {
+      if (hasLogo) {
+        loadingLogo.style.display = 'flex';
+        loadingTitle.style.display = 'none';
+        if (isImage) {
+          loadingLogo.innerHTML = `<img src="${storeLogo}" alt="Logo">`;
+        } else {
+          loadingLogo.textContent = storeLogo;
+        }
+      } else {
+        loadingLogo.style.display = 'none';
+        loadingTitle.style.display = 'block';
+        loadingTitle.textContent = storeName;
+      }
+    }
+  } catch (error) {
+    console.error('Error updating loading branding:', error);
+  }
+}
+
 function initializeApp() {
+  loadUserRoles(); // Load users dynamically for role selection
   setupLoginHandlers();
   setupNavigationHandlers();
   setupCheckoutHandlers();
   setupProductHandlers();
   setupUserHandlers();
+  setupCategoryHandlers();
+  setupSubcategoryHandlers();
   setupSystemSettingsHandlers();
   setupLoanHandlers();
   setupReturnsHandlers();
@@ -95,53 +148,100 @@ async function updateBrandingUI() {
   } catch (error) {
     console.error('Error updating branding:', error);
   }
+}
+
+// ============== DYNAMIC USER ROLE LOADING ==============
+async function loadUserRoles() {
+  try {
+    const users = await window.api.getAllUsers();
+    const container = document.getElementById('userRolesContainer');
+    
+    if (!container) return;
+    
+    // Clear existing buttons
+    container.innerHTML = '';
+    
+    if (users.length === 0) {
+      container.innerHTML = '<p style="color: white; text-align: center;">No users found. Please set up users first.</p>';
+      return;
+    }
+    
+    // Create a button for each user
+    users.forEach(user => {
+      const button = document.createElement('button');
+      button.className = `role-select-btn ${user.role}-role`;
+      button.dataset.userId = user.id;
+      button.dataset.username = user.username;
+      button.dataset.fullName = user.full_name;
+      button.dataset.role = user.role;
+      
+      // Select icon based on role
+      let icon = '👤';
+      if (user.role === 'admin') icon = '👨‍💼';
+      else if (user.role === 'manager') icon = '👔';
+      else if (user.role === 'cashier') icon = '💰';
+      
+      button.innerHTML = `
+        <span class="role-icon">${icon}</span>
+        <div class="role-info">
+          <span class="role-name">${user.full_name}</span>
+          <span class="role-badge">${user.role.toUpperCase()}</span>
+        </div>
+      `;
+      
+      // Add click handler
+      button.addEventListener('click', () => selectUser(user));
+      
+      container.appendChild(button);
+    });
+  } catch (error) {
+    console.error('Error loading user roles:', error);
+    showAlert('Failed to load users', 'error');
+  }
+}
+
+// ============== USER SELECTION ==============
+function selectUser(user) {
+  // Set current user
+  currentUser = {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    name: user.full_name
+  };
   
-  // Load and display branding (logo/name)
-  updateBrandingUI();
+  showScreen('posScreen');
+  
+  // Display user info with role badge
+  const roleBadgeClass = user.role;
+  document.getElementById('currentUser').innerHTML = `
+    <span>${user.full_name}</span>
+    <span class="user-role-badge ${roleBadgeClass}">${user.role.toUpperCase()}</span>
+  `;
+  
+  // Setup UI based on role
+  setupRoleBasedUI();
+  
+  // Hide navbar initially for checkout view
+  toggleNavbarForView('checkout');
+  
+  // Load initial view
+  loadAllProducts();
+  loadCheckoutView();
 }
 
 // ============== LOGIN ==============
 function setupLoginHandlers() {
-  const loginBtn = document.getElementById('loginBtn');
-  const username = document.getElementById('username');
-  const password = document.getElementById('password');
-
-  loginBtn.addEventListener('click', async () => {
-    const user = await window.api.authenticateUser(username.value, password.value);
-    if (user) {
-      currentUser = user;
-      showScreen('posScreen');
-      
-      // Display user info with role badge
-      const roleBadgeClass = user.role;
-      document.getElementById('currentUser').innerHTML = ``;
-      
-      // Setup UI based on role
-      setupRoleBasedUI();
-      
-      // Hide navbar initially for checkout view
-      toggleNavbarForView('checkout');
-      
-      // Load initial view
-      loadAllProducts();
-      loadCheckoutView();
-    } else {
-      showAlert('Invalid username or password.\nPlease try again.', 'error', 'Login Failed');
-    }
-  });
-
-  // Allow Enter key to login
-  password.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') loginBtn.click();
-  });
+  // Login handlers are now handled by dynamic user buttons in loadUserRoles()
+  // This function is kept for compatibility
 }
 
 document.getElementById('logoutBtn')?.addEventListener('click', () => {
   currentUser = null;
   cart = [];
   showScreen('loginScreen');
-  document.getElementById('username').value = '';
-  document.getElementById('password').value = '';
+  // Reload user roles when returning to login screen
+  loadUserRoles();
 });
 
 // ============== ROLE-BASED UI ==============
@@ -228,6 +328,9 @@ function loadViewData(view) {
       break;
     case 'users':
       if (hasPermission('users')) loadUsersView();
+      break;
+    case 'categories':
+      if (hasPermission('categories')) loadCategoriesView();
       break;
   }
 }
@@ -368,8 +471,8 @@ function setupNavigationHandlers() {
       currentUser = null;
       cart = [];
       showScreen('loginScreen');
-      document.getElementById('username').value = '';
-      document.getElementById('password').value = '';
+      // Reload user roles when returning to login screen
+      loadUserRoles();
     });
   }
 }
@@ -400,7 +503,7 @@ function showScreen(screenId) {
 
 // ============== CHECKOUT VIEW ==============
 function setupCheckoutHandlers() {
-  const barcodeInput = document.getElementById('barcodeInput');
+  const productSearch = document.getElementById('productSearch');
   const checkoutBtn = document.getElementById('checkoutBtn');
 
   // Virtual Numpad handlers
@@ -413,10 +516,11 @@ function setupCheckoutHandlers() {
       if (!value) return;
       
       if (value === 'clear') {
-        barcodeInput.value = '';
+        const paymentInput = document.getElementById('paymentInput');
+        if (paymentInput) paymentInput.value = '';
+        updateCartSummary();
       } else if (value === 'enter') {
-        searchAndAddProduct(barcodeInput.value.trim());
-        barcodeInput.value = '';
+        // Enter does nothing for payment numpad
       } else if (['cash', 'card', 'loan'].includes(value)) {
         // Payment method selected
         selectedPaymentMethod = value;
@@ -435,21 +539,25 @@ function setupCheckoutHandlers() {
           }
         });
       } else {
-        // Number or decimal
-        barcodeInput.value += value;
+        // Number or decimal - add to payment input
+        const paymentInput = document.getElementById('paymentInput');
+        if (paymentInput) {
+          paymentInput.value += value;
+          updateCartSummary();
+        }
       }
     });
   });
 
-  barcodeInput.addEventListener('input', (e) => {
+  productSearch.addEventListener('input', (e) => {
     const searchQuery = e.target.value.trim();
     displayQuickProducts(searchQuery);
   });
 
-  barcodeInput.addEventListener('keypress', async (e) => {
+  productSearch.addEventListener('keypress', async (e) => {
     if (e.key === 'Enter') {
-      await searchAndAddProduct(barcodeInput.value.trim());
-      barcodeInput.value = '';
+      await searchAndAddProduct(productSearch.value.trim());
+      productSearch.value = '';
     }
   });
 
@@ -478,17 +586,96 @@ async function loadCheckoutView() {
     systemSettings = await window.api.getSystemSettings();
   }
   await loadAllProducts();
+  await loadCategoryTabs();
   displayQuickProducts();
   updateCartDisplay();
 }
 
+async function loadCategoryTabs() {
+  const categoryTabsContainer = document.getElementById('categoryTabs');
+  const favoriteCategories = await window.api.getFavoriteCategories();
+  
+  // Keep the ALL button
+  const allButton = categoryTabsContainer.querySelector('[data-category="all"]');
+  categoryTabsContainer.innerHTML = '';
+  categoryTabsContainer.appendChild(allButton);
+  
+  // Add click handler for ALL button
+  allButton.addEventListener('click', async () => {
+    document.querySelectorAll('.category-tab').forEach(t => t.classList.remove('active'));
+    allButton.classList.add('active');
+    hideSubcategoryFilters();
+    displayQuickProducts('', 'all');
+  });
+  
+  // Add favorite categories (max 10)
+  favoriteCategories.slice(0, 10).forEach(category => {
+    const button = document.createElement('button');
+    button.className = 'category-tab';
+    button.setAttribute('data-category', category.name);
+    button.setAttribute('data-category-id', category.id);
+    button.textContent = category.name.toUpperCase();
+    button.addEventListener('click', async () => {
+      document.querySelectorAll('.category-tab').forEach(t => t.classList.remove('active'));
+      button.classList.add('active');
+      await loadSubcategoryFilters(category.id, category.name);
+      displayQuickProducts('', category.name);
+    });
+    categoryTabsContainer.appendChild(button);
+  });
+}
+
+async function loadSubcategoryFilters(categoryId, categoryName) {
+  const subcategoryFilters = document.getElementById('subcategoryFilters');
+  const subcategories = await window.api.getSubcategoriesByCategoryId(categoryId);
+  
+  if (subcategories.length === 0) {
+    subcategoryFilters.style.display = 'none';
+    return;
+  }
+  
+  subcategoryFilters.style.display = 'flex';
+  subcategoryFilters.innerHTML = '';
+  
+  // Add "All" button for subcategories
+  const allBtn = document.createElement('button');
+  allBtn.className = 'subcategory-btn active';
+  allBtn.textContent = 'All';
+  allBtn.addEventListener('click', () => {
+    document.querySelectorAll('.subcategory-btn').forEach(b => b.classList.remove('active'));
+    allBtn.classList.add('active');
+    displayQuickProducts('', categoryName);
+  });
+  subcategoryFilters.appendChild(allBtn);
+  
+  // Add subcategory buttons
+  subcategories.forEach(subcategory => {
+    const btn = document.createElement('button');
+    btn.className = 'subcategory-btn';
+    btn.textContent = subcategory.name;
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.subcategory-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      displayQuickProducts('', categoryName, subcategory.name);
+    });
+    subcategoryFilters.appendChild(btn);
+  });
+}
+
+function hideSubcategoryFilters() {
+  const subcategoryFilters = document.getElementById('subcategoryFilters');
+  subcategoryFilters.style.display = 'none';
+  subcategoryFilters.innerHTML = '';
+}
+
 async function loadAllProducts() {
   allProducts = await window.api.getAllProducts();
+  allCategories = await window.api.getAllCategories();
 }
 
 let selectedCategory = 'all';
 
-function displayQuickProducts(searchQuery = '', category = null) {
+function displayQuickProducts(searchQuery = '', category = null, subcategory = null) {
   const container = document.getElementById('quickProductsList');
   
   // Update selected category if provided
@@ -515,6 +702,11 @@ function displayQuickProducts(searchQuery = '', category = null) {
     filteredProducts = filteredProducts.filter(p => p.category === selectedCategory);
   }
   
+  // Filter by subcategory if provided
+  if (subcategory) {
+    filteredProducts = filteredProducts.filter(p => p.subcategory === subcategory);
+  }
+  
   // Product icons mapping
   const productIcons = {
     'Apple': '🍎',
@@ -537,109 +729,366 @@ function displayQuickProducts(searchQuery = '', category = null) {
   const currencySymbol = systemSettings?.currency_symbol || '$';
   
   container.innerHTML = filteredProducts.map(product => `
-    <div class="quick-product-card" onclick="addToCart(${product.id})">
+    <div class="quick-product-card" onclick="promptForWeight(${product.id})">
       <div class="product-image">${productIcons[product.name] || '📦'}</div>
       <div class="name">${product.name}</div>
-      <div class="price">${currencySymbol}${product.price.toFixed(2)} - 1kg</div>
+      <div class="price">${currencySymbol}${product.price.toFixed(2)}/kg</div>
     </div>
   `).join('');
+}
+
+// ============== WEIGHT PROMPT ==============
+function promptForWeight(productId) {
+  console.log('promptForWeight called with productId:', productId);
+  const product = allProducts.find(p => p.id === productId);
+  console.log('Product found:', product);
+  if (!product) {
+    console.log('Product not found!');
+    return;
+  }
+  
+  const currencySymbol = systemSettings?.currency_symbol || '$';
+  
+  // Show custom modal
+  const modal = document.getElementById('weightModal');
+  const productNameEl = document.getElementById('weightProductName');
+  const productPriceEl = document.getElementById('weightProductPrice');
+  const weightInput = document.getElementById('weightInput');
+  const okBtn = document.getElementById('weightOkBtn');
+  const cancelBtn = document.getElementById('weightCancelBtn');
+  const scaleBtn = document.getElementById('readScaleBtn');
+  
+  productNameEl.textContent = product.name;
+  productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/kg`;
+  weightInput.value = '';
+  weightInput.placeholder = 'Reading from scale...';
+  modal.style.display = 'flex';
+  
+  // Automatically read from scale when modal opens
+  readWeightFromScale();
+  
+  // Function to read weight from scale
+  async function readWeightFromScale() {
+    scaleBtn.disabled = true;
+    scaleBtn.textContent = '⌛ Reading...';
+    weightInput.placeholder = 'Reading from scale...';
+    
+    try {
+      // Auto-connect to first available scale if not connected
+      if (!scaleConnected) {
+        console.log('Scale not connected, searching for ports...');
+        const ports = await window.api.listScalePorts();
+        console.log('Available ports:', ports);
+        
+        if (ports && ports.length > 0) {
+          console.log('Attempting to connect to:', ports[0].path);
+          const result = await window.api.connectScale(ports[0].path);
+          console.log('Connection result:', result);
+          
+          if (result.success) {
+            scaleConnected = true;
+            scalePort = ports[0].path;
+            console.log('Scale connected successfully to:', scalePort);
+            
+            // Small delay after connection
+            await new Promise(resolve => setTimeout(resolve, 500));
+          } else {
+            console.error('Failed to connect to scale:', result.message);
+            weightInput.placeholder = 'Enter weight manually or click button to retry';
+            showAlert('Could not connect to scale. Please check cable connection and try again.', 'warning', 'Scale Connection');
+            scaleBtn.disabled = false;
+            scaleBtn.textContent = '🔄 Try Again';
+            weightInput.focus();
+            return;
+          }
+        } else {
+          console.warn('No serial ports found');
+          weightInput.placeholder = 'No scale found - Enter weight manually';
+          showAlert('No scale detected. Please connect your GRAM ZFOC scale.', 'warning', 'Scale Not Found');
+          scaleBtn.disabled = false;
+          scaleBtn.textContent = '🔄 Try Again';
+          weightInput.focus();
+          return;
+        }
+      }
+      
+      // Read weight from scale
+      console.log('Reading weight from scale...');
+      const weightResult = await window.api.readScaleWeight();
+      console.log('Weight result:', weightResult);
+      
+      if (weightResult.success) {
+        const weight = weightResult.weight.toFixed(3); // 3 decimals for precision
+        const totalPrice = (product.price * weightResult.weight).toFixed(2);
+        weightInput.value = weight;
+        weightInput.placeholder = `${weight} kg`;
+        productPriceEl.innerHTML = `${currencySymbol}${product.price.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}${totalPrice}</strong>`;
+        console.log('Weight read successfully:', weight, 'kg, Total:', totalPrice);
+        okBtn.focus(); // Focus on Add to Cart button
+      } else {
+        console.error('Failed to read weight:', weightResult.message);
+        weightInput.placeholder = 'Enter weight manually';
+        
+        // Show specific error message only for zero weight
+        if (weightResult.message.includes('0')) {
+          showAlert('Scale shows 0 kg. Please place the product on the scale.', 'info', 'No Weight');
+        }
+        // Timeout and other errors - no popup, just set placeholder
+        
+        weightInput.focus();
+      }
+    } catch (error) {
+      console.error('Scale reading error:', error);
+      weightInput.placeholder = 'Error - Enter weight manually';
+      showAlert('Error reading from scale: ' + error.message + '. Please enter weight manually.', 'error', 'Scale Error');
+      weightInput.focus();
+    }
+    
+    scaleBtn.disabled = false;
+    scaleBtn.textContent = '🔄 Read Again';
+  }
+  
+  // Handle OK button
+  const handleOk = () => {
+    const weight = weightInput.value;
+    console.log('Weight entered:', weight);
+    
+    if (!weight) {
+      console.log('No weight entered');
+      showAlert('Please enter a weight or read from scale', 'error', 'Invalid Weight');
+      return;
+    }
+    
+    const weightNum = parseFloat(weight);
+    console.log('Weight parsed:', weightNum);
+    if (isNaN(weightNum) || weightNum <= 0) {
+      console.log('Invalid weight');
+      showAlert('Please enter a valid weight', 'error', 'Invalid Weight');
+      return;
+    }
+    
+    if (weightNum > product.stock) {
+      console.log('Not enough stock');
+      showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
+      return;
+    }
+    
+    console.log('Calling addToCart with productId:', productId, 'weight:', weightNum);
+    modal.style.display = 'none';
+    cleanup();
+    addToCart(productId, weightNum);
+  };
+  
+  // Handle Cancel button
+  const handleCancel = () => {
+    console.log('User cancelled');
+    modal.style.display = 'none';
+    cleanup();
+  };
+  
+  // Cleanup function to remove event listeners
+  const cleanup = () => {
+    okBtn.removeEventListener('click', handleOk);
+    cancelBtn.removeEventListener('click', handleCancel);
+    weightInput.removeEventListener('keypress', handleEnter);
+    scaleBtn.removeEventListener('click', handleScaleRead);
+  };
+  
+  // Handle Enter key
+  const handleEnter = (e) => {
+    if (e.key === 'Enter') {
+      handleOk();
+    }
+  };
+  
+  // Handle scale button click (for manual re-read)
+  const handleScaleRead = () => {
+    readWeightFromScale();
+  };
+  
+  okBtn.addEventListener('click', handleOk);
+  cancelBtn.addEventListener('click', handleCancel);
+  weightInput.addEventListener('keypress', handleEnter);
+  scaleBtn.addEventListener('click', handleScaleRead);
+}
+
+// ============== EDIT CART WEIGHT ==============
+function editCartWeight(productId) {
+  const cartItem = cart.find(item => item.productId === productId);
+  if (!cartItem) return;
+  
+  const product = allProducts.find(p => p.id === productId);
+  if (!product) return;
+  
+  const currencySymbol = systemSettings?.currency_symbol || '$';
+  
+  // Show custom modal
+  const modal = document.getElementById('weightModal');
+  const productNameEl = document.getElementById('weightProductName');
+  const productPriceEl = document.getElementById('weightProductPrice');
+  const weightInput = document.getElementById('weightInput');
+  const okBtn = document.getElementById('weightOkBtn');
+  const cancelBtn = document.getElementById('weightCancelBtn');
+  const modalTitle = document.getElementById('weightModalTitle');
+  
+  modalTitle.textContent = 'Edit Weight';
+  productNameEl.textContent = product.name;
+  productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/kg (Current: ${cartItem.quantity.toFixed(2)} kg)`;
+  weightInput.value = cartItem.quantity.toFixed(2);
+  modal.style.display = 'flex';
+  
+  // Focus and select all text
+  setTimeout(() => {
+    weightInput.focus();
+    weightInput.select();
+  }, 100);
+  
+  // Handle OK button
+  const handleOk = () => {
+    const newWeight = weightInput.value;
+    
+    if (!newWeight) {
+      modal.style.display = 'none';
+      cleanup();
+      return;
+    }
+    
+    const weightNum = parseFloat(newWeight);
+    if (isNaN(weightNum) || weightNum <= 0) {
+      showAlert('Please enter a valid weight', 'error', 'Invalid Weight');
+      return;
+    }
+    
+    if (weightNum > product.stock + cartItem.quantity) {
+      showAlert(`Only ${(product.stock + cartItem.quantity).toFixed(2)} kg available in stock`, 'warning', 'Stock Limit');
+      return;
+    }
+    
+    // Update the cart item weight
+    cartItem.quantity = weightNum;
+    cartItem.subtotal = weightNum * cartItem.unitPrice;
+    modal.style.display = 'none';
+    modalTitle.textContent = 'Enter Weight'; // Reset title
+    cleanup();
+    updateCartDisplay();
+    updateCartSummary();
+  };
+  
+  // Handle Cancel button
+  const handleCancel = () => {
+    modal.style.display = 'none';
+    modalTitle.textContent = 'Enter Weight'; // Reset title
+    cleanup();
+  };
+  
+  // Cleanup function
+  const cleanup = () => {
+    okBtn.removeEventListener('click', handleOk);
+    cancelBtn.removeEventListener('click', handleCancel);
+    weightInput.removeEventListener('keypress', handleEnter);
+  };
+  
+  // Handle Enter key
+  const handleEnter = (e) => {
+    if (e.key === 'Enter') {
+      handleOk();
+    }
+  };
+  
+  okBtn.addEventListener('click', handleOk);
+  cancelBtn.addEventListener('click', handleCancel);
+  weightInput.addEventListener('keypress', handleEnter);
 }
 
 async function searchAndAddProduct(query) {
   if (!query) return;
   
-  // Check if barcode is a weighable product barcode (starts with 20-29 for EAN-13)
-  let weight = null;
-  let productBarcode = query;
+  // Search by product name
+  const results = await window.api.searchProducts(query);
   
-  if (query.length === 13 && query.startsWith('2')) {
-    // EAN-13 weighable product format:
-    // 2 + 5 digits (product code) + 5 digits (weight in grams) + 1 checksum
-    const productCode = query.substring(1, 6);
-    const weightCode = query.substring(6, 11);
-    
-    // Weight is encoded as grams (e.g., 00500 = 500g = 0.5kg)
-    weight = parseInt(weightCode) / 1000; // Convert grams to kg
-    
-    // Look up product by the embedded product code
-    productBarcode = '2' + productCode; // Store the base product code
+  if (results.length === 0) {
+    showAlert('Product not found', 'error', 'Not Found');
+    return;
   }
   
-  // Try barcode first
-  let product = await window.api.getProductByBarcode(productBarcode);
-  
-  // If weighable barcode not found, try the full barcode
-  if (!product && weight !== null) {
-    product = await window.api.getProductByBarcode(query);
-  }
-  
-  // If not found, search by name
-  if (!product) {
-    const results = await window.api.searchProducts(query);
-    if (results.length === 1) {
-      product = results[0];
-    } else if (results.length > 1) {
-      // Show selection if multiple results
-      alert(`Multiple products found. Please select from Quick Products or refine search.`);
-      return;
-    }
-  }
-  
-  if (product) {
-    addToCart(product.id, weight);
+  if (results.length === 1) {
+    promptForWeight(results[0].id);
   } else {
-    alert('Product not found');
+    // Multiple results - show alert to select from products grid
+    showAlert('Multiple products found. Please select from the product grid below.', 'info', 'Multiple Results');
   }
 }
 
 function addToCart(productId, weight = null) {
+  console.log('addToCart called with productId:', productId, 'weight:', weight);
   const product = allProducts.find(p => p.id === productId);
-  if (!product) return;
+  console.log('Product in addToCart:', product);
+  if (!product) {
+    console.log('Product not found in addToCart');
+    return;
+  }
   
   if (product.stock <= 0) {
     showAlert('Product out of stock', 'warning', 'Out of Stock');
     return;
   }
   
-  // If weight is provided, add as a weighted item
-  if (weight !== null && weight > 0) {
-    // Calculate price based on weight
-    const weightedPrice = product.price * weight;
-    
-    cart.push({
-      productId: product.id,
-      productName: `${product.name} (${weight}kg)`,
-      unitPrice: product.price,
-      taxRate: product.tax_rate || 0.19,
-      quantity: weight,
-      subtotal: weightedPrice
-    });
-    
-    updateCartUI();
-    return;
-  }
+  // Default weight is 1 kg if not provided
+  const finalWeight = weight !== null ? weight : 1.0;
+  console.log('Final weight:', finalWeight);
   
+  // Check if product already exists in cart
   const existingItem = cart.find(item => item.productId === productId);
   
   if (existingItem) {
-    if (existingItem.quantity < product.stock) {
-      existingItem.quantity++;
-      existingItem.subtotal = existingItem.quantity * existingItem.unitPrice;
-    } else {
-      showAlert('Not enough stock available', 'warning', 'Stock Limit');
+    console.log('Product already in cart, combining quantities');
+    const newQuantity = existingItem.quantity + finalWeight;
+    
+    // Check stock for combined quantity
+    if (newQuantity > product.stock) {
+      showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
+      return;
     }
+    
+    // Update existing item
+    existingItem.quantity = newQuantity;
+    existingItem.subtotal = existingItem.unitPrice * newQuantity;
+    console.log('Updated cart item:', existingItem);
   } else {
-    cart.push({
+    console.log('Adding new product to cart');
+    
+    if (finalWeight > product.stock) {
+      showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
+      return;
+    }
+    
+    // Calculate price based on weight (price per kg)
+    const weightedPrice = product.price * finalWeight;
+    console.log('Weighted price:', weightedPrice);
+    
+    // Get tax rate from category
+    const category = allCategories.find(c => c.name === product.category);
+    const categoryTaxRate = category ? category.tax_rate : 0;
+    
+    // Add as new item
+    const cartItem = {
       productId: product.id,
       productName: product.name,
       unitPrice: product.price,
-      taxRate: product.tax_rate || 0.19,
-      quantity: 1,
-      subtotal: product.price
-    });
+      taxRate: categoryTaxRate,
+      quantity: finalWeight, // Store weight in quantity field
+      subtotal: weightedPrice
+    };
+    console.log('Cart item to add:', cartItem);
+    cart.push(cartItem);
   }
   
+  console.log('Cart after update:', cart);
+  
+  console.log('Calling updateCartDisplay');
   updateCartDisplay();
+  console.log('Calling updateCartSummary');
+  updateCartSummary();
 }
 
 function updateCartQuantity(productId, change) {
@@ -667,7 +1116,9 @@ function removeFromCart(productId) {
 }
 
 function updateCartDisplay() {
+  console.log('updateCartDisplay called, cart:', cart);
   const cartTableBody = document.getElementById('cartTableBody');
+  console.log('cartTableBody element:', cartTableBody);
   const checkoutBtn = document.getElementById('checkoutBtn');
   const currencySymbol = systemSettings?.currency_symbol || '$';
   
@@ -681,24 +1132,27 @@ function updateCartDisplay() {
   });
   
   if (cart.length === 0) {
+    console.log('Cart is empty, showing empty message');
     cartTableBody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 40px; color: #a0aec0;">Cart is empty</td></tr>';
     checkoutBtn.disabled = true;
   } else {
+    console.log('Cart has items, rendering...');
     cartTableBody.innerHTML = cart.map(item => `
       <tr>
         <td>${item.productName}</td>
-        <td>${currencySymbol}${item.unitPrice.toFixed(2)}</td>
+        <td>${currencySymbol}${item.unitPrice.toFixed(2)}/kg</td>
         <td>
           <div style="display: flex; align-items: center; gap: 8px;">
-            <button onclick="updateCartQuantity(${item.productId}, -1)" style="background: #fc8181; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">−</button>
-            <span style="min-width: 30px; text-align: center; font-weight: 800;">${item.quantity}</span>
-            <button onclick="updateCartQuantity(${item.productId}, 1)" style="background: #6EAFAF; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">+</button>
+            <button onclick="editCartWeight(${item.productId})" style="background: #6EAFAF; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 700;">Edit</button>
+            <span style="min-width: 50px; text-align: center; font-weight: 800;">${item.quantity.toFixed(2)} kg</span>
+            <button onclick="removeFromCart(${item.productId})" style="background: #fc8181; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">×</button>
           </div>
         </td>
         <td>${currencySymbol}0.00</td>
         <td style="font-weight: 800; color: #6E8FAF;">${currencySymbol}${item.subtotal.toFixed(2)}</td>
       </tr>
     `).join('');
+    console.log('Cart HTML updated');
     checkoutBtn.disabled = true; // Disabled until payment method selected
   }
   
@@ -710,31 +1164,47 @@ function updateCartSummary() {
   // Update summary
   const currencySymbol = systemSettings?.currency_symbol || '$';
   
-  const subtotal = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  // Product prices already include tax - we need to extract the tax amount
+  // Total = sum of all product prices (tax-included)
+  const total = cart.reduce((sum, item) => sum + item.subtotal, 0);
   
-  // Calculate tax per product based on their tax rates
-  const tax = cart.reduce((sum, item) => {
-    const itemTax = item.subtotal * (item.taxRate || 0.19);
-    return sum + itemTax;
-  }, 0);
+  // Calculate base price (before tax) and tax amount for each product
+  let totalBasePrice = 0;
+  let totalTaxAmount = 0;
+  
+  cart.forEach(item => {
+    const taxRate = item.taxRate || 0;
+    // Reverse calculation: Base = Total / (1 + tax_rate)
+    const basePrice = item.subtotal / (1 + taxRate);
+    const taxAmount = item.subtotal - basePrice;
+    
+    totalBasePrice += basePrice;
+    totalTaxAmount += taxAmount;
+  });
   
   updateCustomerDisplayData();
 
   const discount = 0; // Could implement discount logic
-  const total = subtotal + tax - discount;
   
-  document.getElementById('cartSubtotal').textContent = `${currencySymbol}${subtotal.toFixed(2)}`;
-  document.getElementById('cartTax').textContent = `${currencySymbol}${tax.toFixed(2)}`;
+  // Get payment amount from payment input field or default to total
+  const paymentInput = document.getElementById('paymentInput');
+  const paymentAmountText = paymentInput ? paymentInput.value : '';
+  const paymentAmount = paymentAmountText ? parseFloat(paymentAmountText) : total;
+  const change = Math.max(0, paymentAmount - total);
+  
+  document.getElementById('cartSubtotal').textContent = `${currencySymbol}${totalBasePrice.toFixed(2)}`;
+  document.getElementById('cartTax').textContent = `${currencySymbol}${totalTaxAmount.toFixed(2)}`;
   document.getElementById('cartDiscount').textContent = `${currencySymbol}${discount.toFixed(2)}`;
   document.getElementById('cartTotal').textContent = `${currencySymbol}${total.toFixed(2)}`;
-  document.getElementById('paymentAmount').textContent = `${currencySymbol}${total.toFixed(2)}`;
+  document.getElementById('paymentAmount').textContent = `${currencySymbol}${paymentAmount.toFixed(2)}`;
+  document.getElementById('changeAmount').textContent = `${currencySymbol}${change.toFixed(2)}`;
 }
 
 async function completeSale() {
   if (cart.length === 0) return;
   
   if (!selectedPaymentMethod) {
-    alert('Please select a payment method: CASH, CARD, or LOAN');
+    alert('Please select a payment method: CASH, CARD, or PACKING');
     return;
   }
   
@@ -743,15 +1213,23 @@ async function completeSale() {
     systemSettings = await window.api.getSystemSettings();
   }
   
-  const subtotal = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  // Product prices already include tax - extract tax from total
+  const total = cart.reduce((sum, item) => sum + item.subtotal, 0);
   
-  // Calculate tax per product
-  const tax = cart.reduce((sum, item) => {
-    const itemTax = item.subtotal * (item.taxRate || 0.19);
-    return sum + itemTax;
-  }, 0);
+  // Calculate base price (before tax) and tax amount
+  let subtotal = 0;
+  let tax = 0;
+  
+  cart.forEach(item => {
+    const taxRate = item.taxRate || 0;
+    const basePrice = item.subtotal / (1 + taxRate);
+    const taxAmount = item.subtotal - basePrice;
+    
+    subtotal += basePrice;
+    tax += taxAmount;
+  });
+  
   const discount = 0;
-  const total = subtotal + tax - discount;
   const paymentMethod = selectedPaymentMethod;
   
   // If loan is selected, open loan customer info modal
@@ -783,6 +1261,20 @@ async function completeSale() {
     
     // Clear cart
     cart = [];
+    
+    // Clear payment input
+    const paymentInput = document.getElementById('paymentInput');
+    if (paymentInput) paymentInput.value = '';
+    
+    // Reset payment method selection
+    selectedPaymentMethod = null;
+    document.querySelectorAll('.numpad-btn').forEach(b => {
+      if (['cash', 'card', 'loan'].includes(b.dataset.value)) {
+        b.style.opacity = '0.8';
+        b.style.transform = 'scale(1)';
+      }
+    });
+    
     updateCartDisplay();
     
     // Reload products to update stock
@@ -801,7 +1293,43 @@ function showReceipt(sale) {
   const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
   const currencySymbol = systemSettings?.currency_symbol || '$';
   const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
-  const taxRate = (systemSettings?.tax_rate || 0.10) * 100;
+  
+  // Calculate tax breakdown by rate
+  const taxBreakdown = {};
+  sale.items.forEach(item => {
+    const product = allProducts.find(p => p.id === item.product_id);
+    if (product) {
+      const category = allCategories.find(c => c.name === product.category);
+      const taxRate = category ? category.tax_rate : 0;
+      const taxRatePercent = Math.round(taxRate * 100);
+      
+      // Calculate base and tax amount for this item
+      const basePrice = item.subtotal / (1 + taxRate);
+      const taxAmount = item.subtotal - basePrice;
+      
+      if (!taxBreakdown[taxRatePercent]) {
+        taxBreakdown[taxRatePercent] = {
+          base: 0,
+          tax: 0,
+          total: 0
+        };
+      }
+      
+      taxBreakdown[taxRatePercent].base += basePrice;
+      taxBreakdown[taxRatePercent].tax += taxAmount;
+      taxBreakdown[taxRatePercent].total += item.subtotal;
+    }
+  });
+  
+  // Generate tax breakdown HTML
+  const taxBreakdownHtml = Object.keys(taxBreakdown).sort().map(rate => `
+    <div class="receipt-item" style="font-size: 12px; padding: 2px 0;">
+      <span>IVA ${rate}%</span>
+      <span>Base: ${currencySymbol}${taxBreakdown[rate].base.toFixed(2)}</span>
+      <span>Cuota: ${currencySymbol}${taxBreakdown[rate].tax.toFixed(2)}</span>
+      <span>Total: ${currencySymbol}${taxBreakdown[rate].total.toFixed(2)}</span>
+    </div>
+  `).join('');
   
   content.innerHTML = `
     <div class="receipt-header">
@@ -820,12 +1348,13 @@ function showReceipt(sale) {
     </div>
     
     <div class="receipt-summary">
-      <div class="receipt-item">
-        <span>Subtotal:</span>
+      <div class="receipt-item" style="border-top: 1px dashed #ccc; padding-top: 8px; margin-top: 8px;">
+        <span>Subtotal (Base):</span>
         <span>${currencySymbol}${sale.subtotal.toFixed(2)}</span>
       </div>
-      <div class="receipt-item">
-        <span>Tax (${taxRate}%):</span>
+      ${taxBreakdownHtml}
+      <div class="receipt-item" style="border-top: 1px dashed #ccc; padding-top: 8px; margin-top: 8px;">
+        <span>Total Tax:</span>
         <span>${currencySymbol}${sale.tax.toFixed(2)}</span>
       </div>
       <div class="receipt-item" style="font-weight: bold; font-size: 16px;">
@@ -858,7 +1387,7 @@ function openLoanModal(total, subtotal, tax) {
   modal.dataset.tax = tax;
 }
 
-async function completeLoanSale(customerName, customerPhone, notes) {
+async function completeLoanSale(customerType, customerName, customerPhone, restaurantName, restaurantNie, notes) {
   const modal = document.getElementById('loanModal');
   const total = parseFloat(modal.dataset.total);
   const subtotal = parseFloat(modal.dataset.subtotal);
@@ -884,8 +1413,11 @@ async function completeLoanSale(customerName, customerPhone, notes) {
     // Create the loan record
     const loanData = {
       receiptNumber,
+      customerType,
       customerName,
-      customerPhone,
+      customerPhone: customerPhone || null,
+      restaurantName: restaurantName || null,
+      restaurantNie: restaurantNie || null,
       saleId: sale.id,
       loanAmount: total,
       cashierId: currentUser.id,
@@ -908,7 +1440,7 @@ async function completeLoanSale(customerName, customerPhone, notes) {
     await loadAllProducts();
     displayQuickProducts();
   } catch (error) {
-    alert('Error creating loan: ' + error.message);
+    alert('Error creating Parking order: ' + error.message);
   }
 }
 
@@ -929,10 +1461,16 @@ function showLoanReceipt(sale, loan) {
   const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
   const taxRate = (systemSettings?.tax_rate || 0.10) * 100;
   
+  const customerType = loan.customer_type === 'restaurant' ? 'Restaurant' : 'Regular Customer';
+  const restaurantInfo = loan.customer_type === 'restaurant' ? `
+    <p><strong>Restaurant:</strong> ${loan.restaurant_name || 'N/A'}</p>
+    ${loan.restaurant_nie ? `<p><strong>NIE Number:</strong> ${loan.restaurant_nie}</p>` : ''}
+  ` : '';
+  
   content.innerHTML = `
     <div class="receipt-header">
       <h2>${storeName}</h2>
-      <h3 style="color: #6E8FAF;">LOAN RECEIPT</h3>
+      <h3 style="color: #6E8FAF;">PARKING RECEIPT</h3>
       <p>Receipt #${loan.receipt_number}</p>
       <p>${date.toLocaleString()}</p>
     </div>
@@ -956,14 +1494,16 @@ function showLoanReceipt(sale, loan) {
         <span>${currencySymbol}${sale.tax.toFixed(2)}</span>
       </div>
       <div class="receipt-item" style="font-weight: bold; font-size: 16px;">
-        <span>LOAN AMOUNT:</span>
+        <span>TOTAL AMOUNT:</span>
         <span>${currencySymbol}${sale.total.toFixed(2)}</span>
       </div>
     </div>
     
     <div class="loan-info" style="margin: 20px 0; padding: 15px; background: #f5f5f5; border-radius: 8px;">
-      <p><strong>Customer:</strong> ${loan.customer_name}</p>
-      <p><strong>Phone:</strong> ${loan.customer_phone}</p>
+      <p><strong>Customer Type:</strong> ${customerType}</p>
+      ${restaurantInfo}
+      <p><strong>Customer Name:</strong> ${loan.customer_name}</p>
+      ${loan.customer_phone ? `<p><strong>Phone:</strong> ${loan.customer_phone}</p>` : ''}
       <p style="margin-top: 10px; color: #6E8FAF;"><strong>Status:</strong> Pending Payment</p>
     </div>
     
@@ -987,19 +1527,19 @@ async function searchLoanByReceipt(receiptNumber) {
     const loan = await window.api.getLoanByReceipt(receiptNumber);
     
     if (!loan) {
-      alert('Loan not found with this receipt number');
+      alert('PACKING not found with this receipt number');
       return;
     }
     
     if (loan.status === 'paid') {
-      alert('This loan has already been paid in full');
+      alert('This PACKING has already been paid in full');
       return;
     }
     
     // Show loan payment modal
     showLoanPaymentModal(loan);
   } catch (error) {
-    alert('Error searching for loan: ' + error.message);
+    alert('Error searching for PACKING: ' + error.message);
   }
 }
 
@@ -1009,27 +1549,46 @@ function showLoanPaymentModal(loan) {
   
   const loanDate = new Date(loan.loan_date);
   
+  const customerTypeLabel = loan.customer_type === 'restaurant' ? '🍽️ Restaurant' : '👤 Regular Customer';
+  const restaurantInfo = loan.customer_type === 'restaurant' && loan.restaurant_name ? `
+    <div class="loan-detail-row">
+      <span>Restaurant:</span>
+      <span><strong>${loan.restaurant_name}</strong></span>
+    </div>
+    ${loan.restaurant_nie ? `
+    <div class="loan-detail-row">
+      <span>NIE:</span>
+      <span>${loan.restaurant_nie}</span>
+    </div>` : ''}
+  ` : '';
+  
   content.innerHTML = `
     <div class="loan-payment-info">
-      <h3>Loan Details</h3>
+      <h3>Parking Details</h3>
       <div class="loan-detail-row">
         <span>Receipt #:</span>
         <span><strong>${loan.receipt_number}</strong></span>
       </div>
       <div class="loan-detail-row">
+        <span>Type:</span>
+        <span>${customerTypeLabel}</span>
+      </div>
+      ${restaurantInfo}
+      <div class="loan-detail-row">
         <span>Customer:</span>
         <span>${loan.customer_name}</span>
       </div>
+      ${loan.customer_phone ? `
       <div class="loan-detail-row">
         <span>Phone:</span>
         <span>${loan.customer_phone}</span>
-      </div>
+      </div>` : ''}
       <div class="loan-detail-row">
-        <span>Loan Date:</span>
+        <span>Date:</span>
         <span>${loanDate.toLocaleDateString()}</span>
       </div>
       <div class="loan-detail-row" style="margin-top: 10px; padding-top: 10px; border-top: 2px solid #ddd;">
-        <span>Total Loan:</span>
+        <span>Total Amount:</span>
         <span><strong>$${loan.loan_amount.toFixed(2)}</strong></span>
       </div>
       <div class="loan-detail-row">
@@ -1136,7 +1695,7 @@ async function completeLoanPayment(loanId, amount, paymentMethod) {
     
     // Show success message
     if (result.status === 'paid') {
-      showAlert('Loan has been paid in full.\nThank you for your payment!', 'success', 'Payment Successful');
+      showAlert('PACKING has been paid in full.\nThank you for your payment!', 'success', 'Payment Successful');
     } else if (result.status === 'partial') {
       showAlert(`Amount Paid: $${amount.toFixed(2)}\nRemaining Balance: $${result.remaining_amount.toFixed(2)}\n\nThank you!`, 'success', 'Partial Payment Received');
     }
@@ -1155,7 +1714,7 @@ async function loadLoansView(status = null) {
   const tbody = document.querySelector('#loansTable tbody');
   
   if (loans.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty-state"><div class="icon">💳</div><p>No loans found</p></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-state"><div class="icon">💳</div><p>No Parking orders found</p></td></tr>';
     return;
   }
   
@@ -1165,11 +1724,17 @@ async function loadLoansView(status = null) {
     if (loan.status === 'paid') statusClass = 'status-paid';
     else if (loan.status === 'partial') statusClass = 'status-partial';
     
+    const customerType = loan.customer_type === 'restaurant' ? '🍽️ Restaurant' : '👤 Regular';
+    const displayName = loan.customer_type === 'restaurant' && loan.restaurant_name 
+      ? `${loan.restaurant_name}<br><small>${loan.customer_name}</small>` 
+      : loan.customer_name;
+    
     return `
       <tr>
         <td>${loan.receipt_number}</td>
-        <td>${loan.customer_name}</td>
-        <td>${loan.customer_phone}</td>
+        <td>${customerType}</td>
+        <td>${displayName}</td>
+        <td>${loan.customer_phone || '-'}</td>
         <td>$${loan.loan_amount.toFixed(2)}</td>
         <td>$${loan.paid_amount.toFixed(2)}</td>
         <td>$${loan.remaining_amount.toFixed(2)}</td>
@@ -1187,6 +1752,12 @@ async function loadLoansView(status = null) {
 function setupProductHandlers() {
   document.getElementById('addProductBtn')?.addEventListener('click', () => {
     openProductModal();
+  });
+  
+  document.getElementById('addCategoryBtnHeader')?.addEventListener('click', () => {
+    if (hasPermission('categories')) {
+      openCategoryModal();
+    }
   });
   
   document.getElementById('productSearch')?.addEventListener('input', (e) => {
@@ -1230,7 +1801,10 @@ function displayProducts(products) {
       ? `<span style="text-decoration: line-through; color: #999;">${currencySymbol}${(product.regular_price || product.price).toFixed(2)}</span> <span style="color: #e53e3e; font-weight: 700;">${currencySymbol}${product.price.toFixed(2)}</span>`
       : `${currencySymbol}${product.price.toFixed(2)}`;
     
-    const taxDisplay = product.tax_rate === 0.07 ? '7%' : '19%';
+    // Get tax rate from category
+    const category = allCategories.find(c => c.name === product.category);
+    const categoryTaxRate = category ? category.tax_rate : 0;
+    const taxDisplay = `${(categoryTaxRate * 100).toFixed(0)}%`;
     
     return `
       <tr>
@@ -1263,45 +1837,63 @@ function filterProducts(query) {
   }
 }
 
-function openProductModal(product = null) {
+async function openProductModal(product = null) {
   const modal = document.getElementById('productModal');
   const form = document.getElementById('productForm');
   const title = document.getElementById('productModalTitle');
+  
+  // Load categories first
+  await loadCategoriesForProductForm();
   
   if (product) {
     title.textContent = 'Edit Product';
     document.getElementById('productId').value = product.id;
     document.getElementById('productBarcode').value = product.barcode;
     document.getElementById('productName').value = product.name;
-    document.getElementById('productDescription').value = product.description || '';
     document.getElementById('productCategory').value = product.category || 'General';
-    document.getElementById('productTaxRate').value = product.tax_rate || 0.19;
     document.getElementById('productRegularPrice').value = product.regular_price || product.price;
     document.getElementById('productSalePrice').value = product.sale_price || '';
     document.getElementById('productDiscountPercent').value = product.discount_percent || 0;
     document.getElementById('productPrice').value = product.price;
-    document.getElementById('productCost').value = product.cost || '';
     document.getElementById('productStock').value = product.stock;
     document.getElementById('productMinStock').value = product.min_stock;
     
-    // Generate and display barcode
-    generateBarcodeDisplay(product.barcode);
+    // Load product image if exists
+    if (product.image) {
+      document.getElementById('productImageName').textContent = 'Image loaded';
+      document.getElementById('productImagePreview').style.display = 'block';
+      document.getElementById('productImagePreviewImg').src = product.image;
+    } else {
+      document.getElementById('productImageName').textContent = 'No image selected';
+      document.getElementById('productImagePreview').style.display = 'none';
+    }
     
-    // Show print barcode button when editing
-    document.getElementById('printBarcodeBtn').style.display = 'block';
+    // Load subcategories for the product's category
+    if (product.category) {
+      const categories = await window.api.getAllCategories();
+      const category = categories.find(c => c.name === product.category);
+      if (category) {
+        const subcategories = await window.api.getSubcategoriesByCategoryId(category.id);
+        const subcategorySelect = document.getElementById('productSubcategory');
+        const subcategoryGroup = document.getElementById('productSubcategoryGroup');
+        
+        if (subcategories && subcategories.length > 0) {
+          subcategorySelect.innerHTML = '<option value="">-- No Subcategory --</option>' +
+            subcategories.map(sub => `<option value="${sub.name}">${sub.name}</option>`).join('');
+          subcategoryGroup.style.display = 'block';
+          subcategorySelect.value = product.subcategory || '';
+        } else {
+          subcategoryGroup.style.display = 'none';
+        }
+      }
+    }
   } else {
     title.textContent = 'Add Product';
     form.reset();
     document.getElementById('productId').value = '';
-    document.getElementById('productTaxRate').value = 0.19;
-    document.getElementById('productCategory').value = 'General';
-    
-    // Clear barcode display
-    const barcodeDisplay = document.getElementById('barcodeDisplay');
-    if (barcodeDisplay) barcodeDisplay.innerHTML = '';
-    
-    // Hide print barcode button when adding new product
-    document.getElementById('printBarcodeBtn').style.display = 'none';
+    document.getElementById('productSubcategoryGroup').style.display = 'none';
+    document.getElementById('productImageName').textContent = 'No image selected';
+    document.getElementById('productImagePreview').style.display = 'none';
   }
   
   // Setup price calculation
@@ -1358,6 +1950,7 @@ async function saveProduct() {
   const regularPrice = parseFloat(document.getElementById('productRegularPrice').value);
   const salePrice = parseFloat(document.getElementById('productSalePrice').value) || null;
   const discountPercent = parseFloat(document.getElementById('productDiscountPercent').value) || 0;
+  const selectedCategory = document.getElementById('productCategory').value;
   
   // Calculate final price
   let finalPrice = regularPrice;
@@ -1367,19 +1960,46 @@ async function saveProduct() {
     finalPrice = regularPrice * (1 - discountPercent / 100);
   }
   
+  // Get tax rate from category
+  const categories = await window.api.getAllCategories();
+  const category = categories.find(c => c.name === selectedCategory);
+  const taxRate = category ? category.tax_rate : 0;
+  
+  // Get image if selected
+  const imageFile = document.getElementById('productImage').files[0];
+  let imageData = null;
+  
+  if (imageFile) {
+    imageData = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(imageFile);
+    });
+  } else if (id) {
+    // Keep existing image if editing and no new image selected
+    const products = await window.api.getAllProducts();
+    const existingProduct = products.find(p => p.id === parseInt(id));
+    if (existingProduct && existingProduct.image) {
+      imageData = existingProduct.image;
+    }
+  }
+  
   const product = {
     barcode: document.getElementById('productBarcode').value,
     name: document.getElementById('productName').value,
-    description: document.getElementById('productDescription').value,
-    category: document.getElementById('productCategory').value,
+    description: '',
+    category: selectedCategory,
+    subcategory: document.getElementById('productSubcategory').value || null,
     regular_price: regularPrice,
     sale_price: salePrice,
     discount_percent: discountPercent,
     price: finalPrice,
-    tax_rate: parseFloat(document.getElementById('productTaxRate').value),
-    cost: parseFloat(document.getElementById('productCost').value) || 0,
+    tax_rate: taxRate,
+    cost: 0,
     stock: parseInt(document.getElementById('productStock').value),
-    min_stock: parseInt(document.getElementById('productMinStock').value) || 5
+    min_stock: parseInt(document.getElementById('productMinStock').value) || 5,
+    image: imageData
   };
   
   try {
@@ -1471,6 +2091,36 @@ function loadReportsView() {
       displayReport(report);
     };
   }
+
+  // Initialize restaurant report year dropdown
+  const yearSelect = document.getElementById('restaurantReportYear');
+  if (yearSelect) {
+    const currentYear = new Date().getFullYear();
+    for (let year = currentYear; year >= currentYear - 5; year--) {
+      const option = document.createElement('option');
+      option.value = year;
+      option.textContent = year;
+      yearSelect.appendChild(option);
+    }
+  }
+
+  // Set current month
+  const monthSelect = document.getElementById('restaurantReportMonth');
+  if (monthSelect) {
+    monthSelect.value = new Date().getMonth() + 1;
+  }
+
+  // Restaurant report handler
+  const generateRestaurantReportBtn = document.getElementById('generateRestaurantReportBtn');
+  if (generateRestaurantReportBtn) {
+    generateRestaurantReportBtn.onclick = async () => {
+      const month = parseInt(document.getElementById('restaurantReportMonth').value);
+      const year = parseInt(document.getElementById('restaurantReportYear').value);
+      
+      const restaurants = await window.api.getMonthlyRestaurantReport(month, year);
+      displayRestaurantReport(restaurants, month, year);
+    };
+  }
 }
 
 function displayReport(report) {
@@ -1531,6 +2181,110 @@ function displayReport(report) {
           `).join('')}
         </tbody>
       </table>
+    </div>
+  `;
+}
+
+function displayRestaurantReport(restaurants, month, year) {
+  const container = document.getElementById('restaurantReportResults');
+  const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  
+  if (restaurants.length === 0) {
+    container.innerHTML = '<div class="report-section"><p>No restaurant orders found for this period.</p></div>';
+    return;
+  }
+
+  const totalAmount = restaurants.reduce((sum, r) => sum + r.totalAmount, 0);
+  const totalOrders = restaurants.reduce((sum, r) => sum + r.orderCount, 0);
+  
+  container.innerHTML = `
+    <div class="report-section">
+      <h3>Restaurant Report - ${monthNames[month - 1]} ${year}</h3>
+      <p><strong>Total Restaurants:</strong> ${restaurants.length}</p>
+      <p><strong>Total Orders:</strong> ${totalOrders}</p>
+      <p><strong>Total Amount:</strong> €${totalAmount.toFixed(2)}</p>
+      <p><strong>Total Paid:</strong> €${restaurants.reduce((sum, r) => sum + r.paidAmount, 0).toFixed(2)}</p>
+      <p><strong>Total Outstanding:</strong> €${restaurants.reduce((sum, r) => sum + r.remainingAmount, 0).toFixed(2)}</p>
+    </div>
+    
+    ${restaurants.map(restaurant => `
+      <div class="report-section" style="page-break-inside: avoid;">
+        <h4>🍽️ ${restaurant.name}</h4>
+        ${restaurant.nie ? `<p><strong>NIE:</strong> ${restaurant.nie}</p>` : ''}
+        
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 10px 0;">
+          <div>
+            <strong>Orders:</strong> ${restaurant.orderCount}
+          </div>
+          <div>
+            <strong>Total:</strong> €${restaurant.totalAmount.toFixed(2)}
+          </div>
+          <div>
+            <strong>Paid:</strong> €${restaurant.paidAmount.toFixed(2)}
+          </div>
+          <div>
+            <strong>Outstanding:</strong> €${restaurant.remainingAmount.toFixed(2)}
+          </div>
+        </div>
+
+        <h5>Products Ordered:</h5>
+        <table>
+          <thead>
+            <tr>
+              <th>Product</th>
+              <th>Total Quantity</th>
+              <th>Unit Price</th>
+              <th>Total Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${Object.values(restaurant.products).map(product => `
+              <tr>
+                <td>${product.name}</td>
+                <td>${product.totalQuantity}</td>
+                <td>€${product.unitPrice.toFixed(2)}</td>
+                <td>€${product.totalAmount.toFixed(2)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+          <tfoot>
+            <tr style="font-weight: bold;">
+              <td>TOTAL</td>
+              <td>${Object.values(restaurant.products).reduce((sum, p) => sum + p.totalQuantity, 0)}</td>
+              <td>-</td>
+              <td>€${Object.values(restaurant.products).reduce((sum, p) => sum + p.totalAmount, 0).toFixed(2)}</td>
+            </tr>
+          </tfoot>
+        </table>
+
+        <details style="margin-top: 10px;">
+          <summary style="cursor: pointer; font-weight: bold;">📋 View Orders (${restaurant.orderCount})</summary>
+          <table style="margin-top: 10px;">
+            <thead>
+              <tr>
+                <th>Receipt #</th>
+                <th>Date</th>
+                <th>Amount</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${restaurant.orders.map(order => `
+                <tr>
+                  <td>${order.receiptNumber}</td>
+                  <td>${new Date(order.date).toLocaleDateString()}</td>
+                  <td>€${order.amount.toFixed(2)}</td>
+                  <td><span class="status-badge status-${order.status}">${order.status.toUpperCase()}</span></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </details>
+      </div>
+    `).join('')}
+    
+    <div style="margin-top: 20px; text-align: right;">
+      <button class="btn-primary" onclick="window.print()">🖨️ Print Report</button>
     </div>
   `;
 }
@@ -1730,6 +2484,327 @@ async function changePassword() {
   }
 }
 
+// ============== CATEGORIES VIEW (Admin Only) ==============
+function setupCategoryHandlers() {
+  document.getElementById('addCategoryBtn')?.addEventListener('click', () => {
+    if (hasPermission('categories')) {
+      openCategoryModal();
+    }
+  });
+  
+  document.getElementById('categoryForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await saveCategory();
+  });
+
+  // Auto-update tax rate when category is selected in product form
+  document.getElementById('productCategory')?.addEventListener('change', async (e) => {
+    const categoryName = e.target.value;
+    const categories = await window.api.getAllCategories();
+    const category = categories.find(c => c.name === categoryName);
+    if (category) {
+      // Load subcategories for this category
+      const subcategories = await window.api.getSubcategoriesByCategoryId(category.id);
+      const subcategorySelect = document.getElementById('productSubcategory');
+      const subcategoryGroup = document.getElementById('productSubcategoryGroup');
+      
+      if (subcategories && subcategories.length > 0) {
+        subcategorySelect.innerHTML = '<option value="">-- No Subcategory --</option>' +
+          subcategories.map(sub => `<option value="${sub.name}">${sub.name}</option>`).join('');
+        subcategoryGroup.style.display = 'block';
+      } else {
+        subcategoryGroup.style.display = 'none';
+        subcategorySelect.innerHTML = '<option value="">-- No Subcategory --</option>';
+      }
+    }
+  });
+}
+
+async function loadCategoriesView() {
+  if (!hasPermission('categories')) {
+    showAlert('Access Denied: You do not have permission to view categories', 'error');
+    return;
+  }
+  
+  const categories = await window.api.getAllCategories();
+  const tbody = document.querySelector('#categoriesTable tbody');
+  
+  if (categories.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><div class="icon">🏷️</div><p>No categories found. Add your first category!</p></td></tr>';
+    return;
+  }
+  
+  tbody.innerHTML = categories.map(category => {
+    const date = new Date(category.created_at);
+    const isFavorite = category.is_favorite === 1;
+    const starIcon = isFavorite ? '⭐' : '☆';
+    
+    return `
+      <tr>
+        <td>
+          <button class="star-btn" onclick="toggleCategoryFavorite(${category.id}, ${!isFavorite})" title="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}">
+            ${starIcon}
+          </button>
+        </td>
+        <td>${category.name}</td>
+        <td>${(category.tax_rate * 100).toFixed(2)}%</td>
+        <td>${date.toLocaleDateString()}</td>
+        <td>
+          <button class="action-btn" onclick="editCategory(${category.id})" title="Edit">✏️</button>
+          <button class="action-btn" onclick="deleteCategory(${category.id})" title="Delete">🗑️</button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function toggleCategoryFavorite(id, isFavorite) {
+  try {
+    // Check if trying to add a favorite
+    if (isFavorite) {
+      const favoriteCategories = await window.api.getFavoriteCategories();
+      if (favoriteCategories.length >= 10) {
+        showAlert('Maximum 10 categories can be displayed on front screen. Please remove one first.', 'error');
+        return;
+      }
+    }
+    
+    await window.api.toggleCategoryFavorite(id, isFavorite);
+    await loadCategoriesView();
+    await loadCategoryTabs(); // Refresh category tabs in checkout
+    showAlert(`Category ${isFavorite ? 'added to' : 'removed from'} favorites!`, 'success');
+  } catch (error) {
+    console.error('Error toggling favorite:', error);
+    showAlert('Failed to update favorite status', 'error');
+  }
+}
+
+async function openCategoryModal(category = null) {
+  const modal = document.getElementById('categoryModal');
+  const form = document.getElementById('categoryForm');
+  const title = document.getElementById('categoryModalTitle');
+  const subcategoriesSection = document.getElementById('subcategoriesSection');
+  
+  if (category) {
+    title.textContent = 'Edit Category';
+    document.getElementById('categoryId').value = category.id;
+    document.getElementById('categoryName').value = category.name;
+    document.getElementById('categoryTaxRate').value = (category.tax_rate * 100).toFixed(2);
+    
+    // Show subcategories section when editing
+    subcategoriesSection.style.display = 'block';
+    await loadSubcategoriesForCategory(category.id);
+  } else {
+    title.textContent = 'Add Category';
+    form.reset();
+    document.getElementById('categoryId').value = '';
+    subcategoriesSection.style.display = 'none';
+  }
+  
+  modal.classList.add('active');
+}
+
+async function loadSubcategoriesForCategory(categoryId) {
+  const subcategories = await window.api.getSubcategoriesByCategoryId(categoryId);
+  const listContainer = document.getElementById('subcategoriesList');
+  
+  if (subcategories.length === 0) {
+    listContainer.innerHTML = '<p style="color: #718096; font-size: 14px;">No subcategories yet</p>';
+    return;
+  }
+  
+  listContainer.innerHTML = subcategories.map(sub => `
+    <div class="subcategory-item">
+      <span>${sub.name}</span>
+      <div>
+        <button type="button" class="action-btn" onclick="editSubcategory(${sub.id})" title="Edit">✏️</button>
+        <button type="button" class="action-btn" onclick="deleteSubcategory(${sub.id})" title="Delete">🗑️</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function openCategoryModalFromProduct() {
+  // Remember that we're opening from product modal
+  const categoryModal = document.getElementById('categoryModal');
+  categoryModal.dataset.openedFrom = 'product';
+  openCategoryModal();
+}
+
+async function editCategory(id) {
+  const category = await window.api.getCategoryById(id);
+  if (category) {
+    openCategoryModal(category);
+  }
+}
+
+async function deleteCategory(id) {
+  if (!confirm('Are you sure you want to delete this category?')) {
+    return;
+  }
+  
+  try {
+    await window.api.deleteCategory(id);
+    showAlert('Category deleted successfully', 'success');
+    await loadCategoriesView();
+  } catch (error) {
+    showAlert('Error deleting category: ' + error.message, 'error');
+  }
+}
+
+async function saveCategory() {
+  const id = document.getElementById('categoryId').value;
+  const category = {
+    name: document.getElementById('categoryName').value.trim(),
+    taxRate: parseFloat(document.getElementById('categoryTaxRate').value) / 100
+  };
+  
+  if (!category.name) {
+    showAlert('Please enter a category name', 'warning');
+    return;
+  }
+  
+  try {
+    const categoryModal = document.getElementById('categoryModal');
+    const openedFrom = categoryModal.dataset.openedFrom;
+    
+    let result;
+    if (id) {
+      await window.api.updateCategory(parseInt(id), category);
+      showAlert('Category updated successfully', 'success');
+    } else {
+      result = await window.api.addCategory(category);
+      showAlert('Category added successfully', 'success');
+    }
+    
+    closeModal('categoryModal');
+    
+    // Reload categories in product form if it was opened from there
+    if (openedFrom === 'product') {
+      await loadCategoriesForProductForm();
+      // Select the newly added category if we just created one
+      if (result && result.id) {
+        const categorySelect = document.getElementById('productCategory');
+        const categories = await window.api.getAllCategories();
+        const newCategory = categories.find(c => c.id === result.id);
+        if (newCategory) {
+          categorySelect.value = newCategory.name;
+          // Trigger change event to update tax rate
+          categorySelect.dispatchEvent(new Event('change'));
+        }
+      }
+      // Clear the flag
+      delete categoryModal.dataset.openedFrom;
+    } else {
+      await loadCategoriesView();
+      await loadCategoriesForProductForm();
+    }
+  } catch (error) {
+    showAlert('Error saving category: ' + error.message, 'error');
+  }
+}
+
+// ============== SUBCATEGORIES ==============
+function setupSubcategoryHandlers() {
+  document.getElementById('addSubcategoryBtn')?.addEventListener('click', () => {
+    const categoryId = document.getElementById('categoryId').value;
+    if (categoryId) {
+      openSubcategoryModal(null, categoryId);
+    }
+  });
+  
+  document.getElementById('subcategoryForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await saveSubcategory();
+  });
+}
+
+function openSubcategoryModal(subcategory = null, categoryId = null) {
+  const modal = document.getElementById('subcategoryModal');
+  const form = document.getElementById('subcategoryForm');
+  const title = document.getElementById('subcategoryModalTitle');
+  
+  if (subcategory) {
+    title.textContent = 'Edit Subcategory';
+    document.getElementById('subcategoryId').value = subcategory.id;
+    document.getElementById('subcategoryCategoryId').value = subcategory.category_id;
+    document.getElementById('subcategoryName').value = subcategory.name;
+  } else {
+    title.textContent = 'Add Subcategory';
+    form.reset();
+    document.getElementById('subcategoryId').value = '';
+    document.getElementById('subcategoryCategoryId').value = categoryId;
+  }
+  
+  modal.classList.add('active');
+}
+
+async function editSubcategory(id) {
+  const subcategory = await window.api.getSubcategoryById(id);
+  if (subcategory) {
+    openSubcategoryModal(subcategory);
+  }
+}
+
+async function deleteSubcategory(id) {
+  if (!confirm('Are you sure you want to delete this subcategory?')) {
+    return;
+  }
+  
+  try {
+    await window.api.deleteSubcategory(id);
+    showAlert('Subcategory deleted successfully', 'success');
+    const categoryId = document.getElementById('categoryId').value;
+    await loadSubcategoriesForCategory(categoryId);
+  } catch (error) {
+    showAlert('Error deleting subcategory: ' + error.message, 'error');
+  }
+}
+
+async function saveSubcategory() {
+  const id = document.getElementById('subcategoryId').value;
+  const subcategory = {
+    categoryId: parseInt(document.getElementById('subcategoryCategoryId').value),
+    name: document.getElementById('subcategoryName').value.trim()
+  };
+  
+  if (!subcategory.name) {
+    showAlert('Please enter a subcategory name', 'warning');
+    return;
+  }
+  
+  try {
+    if (id) {
+      await window.api.updateSubcategory(parseInt(id), subcategory);
+      showAlert('Subcategory updated successfully', 'success');
+    } else {
+      await window.api.addSubcategory(subcategory);
+      showAlert('Subcategory added successfully', 'success');
+    }
+    
+    closeModal('subcategoryModal');
+    await loadSubcategoriesForCategory(subcategory.categoryId);
+  } catch (error) {
+    showAlert('Error saving subcategory: ' + error.message, 'error');
+  }
+}
+
+
+async function loadCategoriesForProductForm() {
+  const categories = await window.api.getAllCategories();
+  const categorySelect = document.getElementById('productCategory');
+  const currentValue = categorySelect.value;
+  
+  categorySelect.innerHTML = categories.map(cat => 
+    `<option value="${cat.name}">${cat.name} (${(cat.tax_rate * 100).toFixed(2)}% tax)</option>`
+  ).join('');
+  
+  // Restore previous selection if it still exists
+  if (currentValue && categories.some(c => c.name === currentValue)) {
+    categorySelect.value = currentValue;
+  }
+}
+
 // ============== SYSTEM SETTINGS ==============
 async function loadSystemSettingsView() {
   if (!hasPermission('system')) {
@@ -1879,17 +2954,42 @@ async function updateSystemUI() {
 
 // ============== LOAN HANDLERS ==============
 function setupLoanHandlers() {
+  // Customer type change handler
+  document.getElementById('loanCustomerType')?.addEventListener('change', (e) => {
+    const type = e.target.value;
+    const restaurantFields = document.getElementById('restaurantFields');
+    const restaurantNieField = document.getElementById('restaurantNieField');
+    const restaurantNameInput = document.getElementById('loanRestaurantName');
+    
+    if (type === 'restaurant') {
+      restaurantFields.style.display = 'block';
+      restaurantNieField.style.display = 'block';
+      restaurantNameInput.required = true;
+    } else {
+      restaurantFields.style.display = 'none';
+      restaurantNieField.style.display = 'none';
+      restaurantNameInput.required = false;
+      restaurantNameInput.value = '';
+      document.getElementById('loanRestaurantNie').value = '';
+    }
+  });
+
   // Loan form submit
   document.getElementById('loanForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
+    const customerType = document.getElementById('loanCustomerType').value;
     const customerName = document.getElementById('loanCustomerName').value;
     const customerPhone = document.getElementById('loanCustomerPhone').value;
+    const restaurantName = document.getElementById('loanRestaurantName').value;
+    const restaurantNie = document.getElementById('loanRestaurantNie').value;
     const notes = document.getElementById('loanNotes').value;
     
-    await completeLoanSale(customerName, customerPhone, notes);
+    await completeLoanSale(customerType, customerName, customerPhone, restaurantName, restaurantNie, notes);
     
     // Reset form
     e.target.reset();
+    document.getElementById('restaurantFields').style.display = 'none';
+    document.getElementById('restaurantNieField').style.display = 'none';
   });
   
   // Search loan button
@@ -1956,12 +3056,37 @@ function closeModal(modalId) {
   document.getElementById(modalId).classList.remove('active');
 }
 
+// ============== PRODUCT IMAGE HANDLING ==============
+function clearProductImage() {
+  document.getElementById('productImage').value = '';
+  document.getElementById('productImagePreview').style.display = 'none';
+  document.getElementById('productImageName').textContent = 'No image selected';
+}
+
+// Setup image preview handler
+document.addEventListener('DOMContentLoaded', () => {
+  const imageInput = document.getElementById('productImage');
+  if (imageInput) {
+    imageInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          document.getElementById('productImagePreviewImg').src = e.target.result;
+          document.getElementById('productImagePreview').style.display = 'block';
+          document.getElementById('productImageName').textContent = file.name;
+        };
+        reader.readAsDataURL(file);
+      }
+    });
+  }
+});
+
 // ============== VIRTUAL KEYBOARD ==============
 let currentKeyboardInput = null;
 
 function setupVirtualKeyboard() {
   const keyboard = document.getElementById('virtualKeyboard');
-  const keyboardDisplay = document.getElementById('keyboardDisplay');
   const closeKeyboardBtn = document.getElementById('closeKeyboard');
   const keyButtons = document.querySelectorAll('.key-btn');
   
@@ -1976,17 +3101,14 @@ function setupVirtualKeyboard() {
   // Show keyboard when text inputs are focused (except barcode input)
   document.addEventListener('focusin', (e) => {
     if (e.target.tagName === 'INPUT' && 
-        (e.target.type === 'text' || e.target.type === 'tel') && 
+        (e.target.type === 'text' || e.target.type === 'tel' || e.target.type === 'number') && 
         e.target.id !== 'barcodeInput' &&
-        e.target.id !== 'keyboardDisplay' &&
         e.target.id !== 'paymentAmount') {
       currentKeyboardInput = e.target;
-      keyboardDisplay.value = e.target.value;
       keyboard.classList.add('active');
     }
     if (e.target.tagName === 'TEXTAREA') {
       currentKeyboardInput = e.target;
-      keyboardDisplay.value = e.target.value;
       keyboard.classList.add('active');
     }
   });
@@ -1997,23 +3119,23 @@ function setupVirtualKeyboard() {
       const key = btn.dataset.key;
       
       if (key === 'Backspace') {
-        keyboardDisplay.value = keyboardDisplay.value.slice(0, -1);
+        if (currentKeyboardInput) {
+          currentKeyboardInput.value = currentKeyboardInput.value.slice(0, -1);
+          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       } else if (key === 'Done') {
         if (currentKeyboardInput) {
-          currentKeyboardInput.value = keyboardDisplay.value;
           currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
         }
         keyboard.classList.remove('active');
         currentKeyboardInput = null;
       } else if (key !== 'Shift') {
         // Use lowercase letters always
-        const actualKey = btn.textContent === 'Space' ? ' ' : btn.textContent;
-        keyboardDisplay.value += actualKey;
-      }
-      
-      // Update the original input in real-time
-      if (currentKeyboardInput) {
-        currentKeyboardInput.value = keyboardDisplay.value;
+        const actualKey = btn.textContent === 'SPACE' ? ' ' : btn.textContent;
+        if (currentKeyboardInput) {
+          currentKeyboardInput.value += actualKey;
+          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       }
     });
   });
@@ -2021,7 +3143,6 @@ function setupVirtualKeyboard() {
   // Close keyboard button
   closeKeyboardBtn.addEventListener('click', () => {
     if (currentKeyboardInput) {
-      currentKeyboardInput.value = keyboardDisplay.value;
       currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
     }
     keyboard.classList.remove('active');
@@ -2775,11 +3896,10 @@ async function toggleCustomerDisplay() {
 async function openCashDrawer() {
   try {
     const result = await window.api.openCashDrawer();
-    if (result.success) {
-      showAlert('Cash drawer opened', 'success');
-    } else {
+    if (!result.success) {
       showAlert('Failed to open cash drawer', 'error');
     }
+    // Success - no message needed
   } catch (error) {
     showAlert('Error opening cash drawer', 'error');
   }
@@ -2823,6 +3943,8 @@ window.alert = showAlert;
 window.addToCart = addToCart;
 window.updateCartQuantity = updateCartQuantity;
 window.removeFromCart = removeFromCart;
+window.promptForWeight = promptForWeight;
+window.editCartWeight = editCartWeight;
 window.editProduct = editProduct;
 window.deleteProduct = deleteProduct;
 window.generateBarcodeDisplay = generateBarcodeDisplay;
@@ -2830,6 +3952,12 @@ window.viewSale = viewSale;
 window.editUser = editUser;
 window.deleteUser = deleteUser;
 window.changeUserPassword = changeUserPassword;
+window.editCategory = editCategory;
+window.deleteCategory = deleteCategory;
+window.toggleCategoryFavorite = toggleCategoryFavorite;
+window.editSubcategory = editSubcategory;
+window.deleteSubcategory = deleteSubcategory;
+window.openCategoryModalFromProduct = openCategoryModalFromProduct;
 window.toggleCustomerDisplay = toggleCustomerDisplay;
 window.openCashDrawer = openCashDrawer;
 window.printBarcodeLabel = printBarcodeLabel;

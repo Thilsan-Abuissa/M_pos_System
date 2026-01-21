@@ -1,10 +1,14 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const Database = require('./database');
+const { SerialPort } = require('serialport');
+const { ReadlineParser } = require('@serialport/parser-readline');
 
 let mainWindow;
 let customerDisplayWindow;
 let db;
+let scalePort = null;
+let scaleParser = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -203,6 +207,10 @@ ipcMain.handle('loans:getById', async (event, id) => {
   return db.getLoanById(id);
 });
 
+ipcMain.handle('loans:getMonthlyRestaurantReport', async (event, month, year) => {
+  return db.getMonthlyRestaurantReport(month, year);
+});
+
 // Returns handlers
 ipcMain.handle('returns:create', async (event, returnData) => {
   return db.createReturn(returnData);
@@ -293,5 +301,186 @@ ipcMain.handle('settings:get', async () => {
 
 ipcMain.handle('settings:update', async (event, settings) => {
   return db.updateSystemSettings(settings);
+});
+
+// Category handlers
+ipcMain.handle('categories:getAll', async () => {
+  return db.getAllCategories();
+});
+
+ipcMain.handle('categories:getById', async (event, id) => {
+  return db.getCategoryById(id);
+});
+
+ipcMain.handle('categories:add', async (event, category) => {
+  return db.addCategory(category);
+});
+
+ipcMain.handle('categories:update', async (event, id, category) => {
+  return db.updateCategory(id, category);
+});
+
+ipcMain.handle('categories:delete', async (event, id) => {
+  return db.deleteCategory(id);
+});
+
+ipcMain.handle('categories:toggleFavorite', async (event, id, isFavorite) => {
+  return db.toggleCategoryFavorite(id, isFavorite);
+});
+
+ipcMain.handle('categories:getFavorites', async () => {
+  return db.getFavoriteCategories();
+});
+
+// Subcategory handlers
+ipcMain.handle('subcategories:getAll', async () => {
+  return db.getAllSubcategories();
+});
+
+ipcMain.handle('subcategories:getByCategoryId', async (event, categoryId) => {
+  return db.getSubcategoriesByCategoryId(categoryId);
+});
+
+ipcMain.handle('subcategories:getById', async (event, id) => {
+  return db.getSubcategoryById(id);
+});
+
+ipcMain.handle('subcategories:add', async (event, subcategory) => {
+  return db.addSubcategory(subcategory);
+});
+
+ipcMain.handle('subcategories:update', async (event, id, subcategory) => {
+  return db.updateSubcategory(id, subcategory);
+});
+
+ipcMain.handle('subcategories:delete', async (event, id) => {
+  return db.deleteSubcategory(id);
+});
+
+// ========== SCALE FUNCTIONS ==========
+// List available serial ports
+ipcMain.handle('scale:listPorts', async () => {
+  try {
+    const ports = await SerialPort.list();
+    return ports.map(port => ({
+      path: port.path,
+      manufacturer: port.manufacturer,
+      serialNumber: port.serialNumber,
+      pnpId: port.pnpId,
+      vendorId: port.vendorId,
+      productId: port.productId
+    }));
+  } catch (error) {
+    console.error('Error listing ports:', error);
+    return [];
+  }
+});
+
+// Connect to scale
+ipcMain.handle('scale:connect', async (event, portPath) => {
+  try {
+    if (scalePort && scalePort.isOpen) {
+      scalePort.close();
+    }
+
+    scalePort = new SerialPort({
+      path: portPath,
+      baudRate: 9600,
+      dataBits: 8,
+      stopBits: 1,
+      parity: 'none'
+    });
+
+    scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\r\n' }));
+
+    return { success: true, message: 'Scale connected successfully' };
+  } catch (error) {
+    console.error('Error connecting to scale:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+// Read weight from scale
+ipcMain.handle('scale:readWeight', async () => {
+  return new Promise((resolve, reject) => {
+    if (!scalePort || !scalePort.isOpen) {
+      resolve({ success: false, message: 'Scale not connected' });
+      return;
+    }
+
+    let timeout = setTimeout(() => {
+      resolve({ success: false, message: 'Timeout reading from scale' });
+    }, 10000); // Increased to 10 seconds to allow more time for scale response
+
+    const dataHandler = (data) => {
+      clearTimeout(timeout);
+      scaleParser.removeListener('data', dataHandler);
+      
+      console.log('Raw scale data:', data);
+      
+      // Parse weight from scale data
+      // GRAM ZFOC can send various formats:
+      // "  0.500 kg", "0.500", "ST,GS,+0.500kg", etc.
+      
+      // Remove common prefixes and suffixes
+      let cleanData = data.replace(/ST,GS,/g, '').replace(/kg/gi, '').replace(/\s+/g, '');
+      
+      // Extract number (handle both positive and negative)
+      const match = cleanData.match(/([+-]?\d+\.?\d*)/);
+      if (match) {
+        const weight = Math.abs(parseFloat(match[1])); // Use absolute value
+        
+        // Validate weight is reasonable (0.001 kg to 100 kg)
+        if (weight >= 0.001 && weight <= 100) {
+          console.log('Parsed weight:', weight);
+          resolve({ success: true, weight: weight });
+        } else if (weight === 0) {
+          resolve({ success: false, message: 'Scale shows 0. Please place item on scale.' });
+        } else {
+          resolve({ success: false, message: 'Weight out of range: ' + weight });
+        }
+      } else {
+        resolve({ success: false, message: 'Could not parse weight data: ' + data });
+      }
+    };
+
+    scaleParser.on('data', dataHandler);
+
+    // Try multiple commands that GRAM scales might respond to
+    try {
+      scalePort.write('P\r\n'); // Request weight
+      
+      // Some scales respond without needing a command
+      // If no response after 1 second, try alternative command
+      setTimeout(() => {
+        if (scalePort && scalePort.isOpen) {
+          try {
+            scalePort.write('W\r\n'); // Alternative weight request
+          } catch (e) {
+            console.error('Error sending alternative command:', e);
+          }
+        }
+      }, 1000);
+      
+    } catch (error) {
+      clearTimeout(timeout);
+      scaleParser.removeListener('data', dataHandler);
+      resolve({ success: false, message: 'Error writing to scale' });
+    }
+  });
+});
+
+// Disconnect scale
+ipcMain.handle('scale:disconnect', async () => {
+  try {
+    if (scalePort && scalePort.isOpen) {
+      scalePort.close();
+      scalePort = null;
+      scaleParser = null;
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
 });
 

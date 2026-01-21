@@ -93,8 +93,11 @@ class POSDatabase {
       CREATE TABLE IF NOT EXISTS loans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         receipt_number TEXT UNIQUE NOT NULL,
+        customer_type TEXT DEFAULT 'regular',
         customer_name TEXT NOT NULL,
         customer_phone TEXT,
+        restaurant_name TEXT,
+        restaurant_nie TEXT,
         sale_id INTEGER NOT NULL,
         loan_amount REAL NOT NULL,
         paid_amount REAL DEFAULT 0,
@@ -145,6 +148,23 @@ class POSDatabase {
       CREATE INDEX IF NOT EXISTS idx_z_reports_date ON z_reports(report_date);
       CREATE INDEX IF NOT EXISTS idx_z_reports_number ON z_reports(report_number);
 
+      CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        tax_rate REAL DEFAULT 0,
+        is_favorite INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS subcategories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE,
+        UNIQUE(category_id, name)
+      );
+
       CREATE TABLE IF NOT EXISTS system_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         store_name TEXT DEFAULT 'SUPERMARKET POS',
@@ -177,6 +197,36 @@ class POSDatabase {
             receipt_footer = 'Vielen Dank für Ihren Einkauf!'
         WHERE id = 1
       `).run();
+    }
+
+    // Add is_favorite column to categories table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE categories ADD COLUMN is_favorite INTEGER DEFAULT 0').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding is_favorite column:', error);
+      }
+    }
+
+    // Add subcategory column to products table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE products ADD COLUMN subcategory TEXT').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding subcategory column:', error);
+      }
+    }
+
+    // Add image column to products table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE products ADD COLUMN image TEXT').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding image column:', error);
+      }
     }
 
     // Don't create default users - let setup wizard handle it
@@ -232,40 +282,16 @@ class POSDatabase {
 
   addProduct(product) {
     const stmt = this.db.prepare(`
-      INSERT INTO products (barcode, name, description, category, price, regular_price, sale_price, 
-                           discount_percent, cost, tax_rate, stock, min_stock)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO products (barcode, name, description, category, subcategory, price, regular_price, sale_price, 
+                           discount_percent, cost, tax_rate, stock, min_stock, image)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const result = stmt.run(
       product.barcode,
       product.name,
       product.description || null,
       product.category || 'General',
-      product.price,
-      product.regular_price || product.price,
-      product.sale_price || null,
-      product.discount_percent || 0,
-      product.cost || 0,
-      product.tax_rate || 0.19,
-      product.stock || 0,
-      product.min_stock || 5
-    );
-    return { id: result.lastInsertRowid, ...product };
-  }
-
-  updateProduct(id, product) {
-    const stmt = this.db.prepare(`
-      UPDATE products 
-      SET barcode = ?, name = ?, description = ?, category = ?, 
-          price = ?, regular_price = ?, sale_price = ?, discount_percent = ?,
-          cost = ?, tax_rate = ?, stock = ?, min_stock = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
-    stmt.run(
-      product.barcode,
-      product.name,
-      product.description || null,
-      product.category || 'General',
+      product.subcategory || null,
       product.price,
       product.regular_price || product.price,
       product.sale_price || null,
@@ -274,6 +300,34 @@ class POSDatabase {
       product.tax_rate || 0.19,
       product.stock || 0,
       product.min_stock || 5,
+      product.image || null
+    );
+    return { id: result.lastInsertRowid, ...product };
+  }
+
+  updateProduct(id, product) {
+    const stmt = this.db.prepare(`
+      UPDATE products 
+      SET barcode = ?, name = ?, description = ?, category = ?, subcategory = ?,
+          price = ?, regular_price = ?, sale_price = ?, discount_percent = ?,
+          cost = ?, tax_rate = ?, stock = ?, min_stock = ?, image = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `);
+    stmt.run(
+      product.barcode,
+      product.name,
+      product.description || null,
+      product.category || 'General',
+      product.subcategory || null,
+      product.price,
+      product.regular_price || product.price,
+      product.sale_price || null,
+      product.discount_percent || 0,
+      product.cost || 0,
+      product.tax_rate || 0.19,
+      product.stock || 0,
+      product.min_stock || 5,
+      product.image || null,
       id
     );
     return { id, ...product };
@@ -508,13 +562,16 @@ class POSDatabase {
   // Loan operations
   createLoan(loanData) {
     const stmt = this.db.prepare(`
-      INSERT INTO loans (receipt_number, customer_name, customer_phone, sale_id, loan_amount, remaining_amount, cashier_id, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO loans (receipt_number, customer_type, customer_name, customer_phone, restaurant_name, restaurant_nie, sale_id, loan_amount, remaining_amount, cashier_id, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const result = stmt.run(
       loanData.receiptNumber,
+      loanData.customerType || 'regular',
       loanData.customerName,
       loanData.customerPhone || null,
+      loanData.restaurantName || null,
+      loanData.restaurantNie || null,
       loanData.saleId,
       loanData.loanAmount,
       loanData.loanAmount,
@@ -571,6 +628,72 @@ class POSDatabase {
 
   getLoanById(id) {
     return this.db.prepare('SELECT * FROM loans WHERE id = ?').get(id);
+  }
+
+  // Get monthly restaurant report with all products ordered
+  getMonthlyRestaurantReport(month, year) {
+    const startDate = new Date(year, month - 1, 1).toISOString();
+    const endDate = new Date(year, month, 0, 23, 59, 59).toISOString();
+    
+    // Get all restaurant loans for the month
+    const loans = this.db.prepare(`
+      SELECT * FROM loans 
+      WHERE customer_type = 'restaurant' 
+      AND loan_date >= ? AND loan_date <= ?
+      ORDER BY restaurant_name, loan_date
+    `).all(startDate, endDate);
+    
+    // Build report grouped by restaurant
+    const restaurants = {};
+    
+    loans.forEach(loan => {
+      const restName = loan.restaurant_name || 'Unknown';
+      if (!restaurants[restName]) {
+        restaurants[restName] = {
+          name: restName,
+          nie: loan.restaurant_nie,
+          totalAmount: 0,
+          paidAmount: 0,
+          remainingAmount: 0,
+          orderCount: 0,
+          products: {},
+          orders: []
+        };
+      }
+      
+      const rest = restaurants[restName];
+      rest.totalAmount += loan.loan_amount;
+      rest.paidAmount += loan.paid_amount;
+      rest.remainingAmount += loan.remaining_amount;
+      rest.orderCount++;
+      
+      // Get sale items for this loan
+      const sale = this.getSaleById(loan.sale_id);
+      if (sale) {
+        const items = this.db.prepare('SELECT * FROM sale_items WHERE sale_id = ?').all(sale.id);
+        items.forEach(item => {
+          if (!rest.products[item.product_name]) {
+            rest.products[item.product_name] = {
+              name: item.product_name,
+              totalQuantity: 0,
+              totalAmount: 0,
+              unitPrice: item.unit_price
+            };
+          }
+          rest.products[item.product_name].totalQuantity += item.quantity;
+          rest.products[item.product_name].totalAmount += item.subtotal;
+        });
+      }
+      
+      rest.orders.push({
+        receiptNumber: loan.receipt_number,
+        date: loan.loan_date,
+        amount: loan.loan_amount,
+        status: loan.status
+      });
+    });
+    
+    return Object.values(restaurants);
   }
 
   // Returns Management
@@ -804,6 +927,98 @@ class POSDatabase {
       settings.receiptFooter
     );
     return this.getSystemSettings();
+  }
+
+  // Category Management
+  getAllCategories() {
+    return this.db.prepare('SELECT * FROM categories ORDER BY name').all();
+  }
+
+  getCategoryById(id) {
+    return this.db.prepare('SELECT * FROM categories WHERE id = ?').get(id);
+  }
+
+  getCategoryByName(name) {
+    return this.db.prepare('SELECT * FROM categories WHERE name = ?').get(name);
+  }
+
+  addCategory(category) {
+    const stmt = this.db.prepare(`
+      INSERT INTO categories (name, tax_rate)
+      VALUES (?, ?)
+    `);
+    const result = stmt.run(category.name, category.taxRate || 0);
+    return { success: true, id: result.lastInsertRowid };
+  }
+
+  updateCategory(id, category) {
+    const stmt = this.db.prepare(`
+      UPDATE categories 
+      SET name = ?, tax_rate = ?
+      WHERE id = ?
+    `);
+    stmt.run(category.name, category.taxRate || 0, id);
+    return { success: true };
+  }
+
+  toggleCategoryFavorite(id, isFavorite) {
+    const stmt = this.db.prepare('UPDATE categories SET is_favorite = ? WHERE id = ?');
+    stmt.run(isFavorite ? 1 : 0, id);
+    return { success: true };
+  }
+
+  getFavoriteCategories() {
+    const stmt = this.db.prepare('SELECT * FROM categories WHERE is_favorite = 1 ORDER BY name LIMIT 10');
+    return stmt.all();
+  }
+
+  deleteCategory(id) {
+    const stmt = this.db.prepare('DELETE FROM categories WHERE id = ?');
+    stmt.run(id);
+    return { success: true };
+  }
+
+  // Subcategory Management
+  getAllSubcategories() {
+    return this.db.prepare(`
+      SELECT s.*, c.name as category_name 
+      FROM subcategories s 
+      JOIN categories c ON s.category_id = c.id 
+      ORDER BY c.name, s.name
+    `).all();
+  }
+
+  getSubcategoriesByCategoryId(categoryId) {
+    return this.db.prepare('SELECT * FROM subcategories WHERE category_id = ? ORDER BY name').all(categoryId);
+  }
+
+  getSubcategoryById(id) {
+    return this.db.prepare('SELECT * FROM subcategories WHERE id = ?').get(id);
+  }
+
+  addSubcategory(subcategory) {
+    const stmt = this.db.prepare(`
+      INSERT INTO subcategories (category_id, name)
+      VALUES (?, ?)
+    `);
+    const result = stmt.run(subcategory.categoryId, subcategory.name);
+    return { success: true, id: result.lastInsertRowid };
+  }
+
+  updateSubcategory(id, subcategory) {
+    const stmt = this.db.prepare(`
+      UPDATE subcategories 
+      SET category_id = ?, name = ?
+      WHERE id = ?
+    `);
+    stmt.run(subcategory.categoryId, subcategory.name, id);
+    return { success: true };
+  }
+
+  deleteSubcategory(id) {
+    const stmt = this.db.prepare('DELETE FROM subcategories WHERE id = ?');
+    stmt.run(id);
+    return { success: true };
   }
 }
 
