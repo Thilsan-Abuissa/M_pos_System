@@ -8,12 +8,14 @@ let systemSettings = null; // System settings
 let currentLogoData = ''; // Current logo data
 let scaleConnected = false; // Scale connection status
 let scalePort = null; // Currently connected scale port
+let lastSale = null; // Store last sale for reprinting
+let isWeightModalOpen = false; // Flag to prevent multiple modal opens
 
 // Role-based permissions - Only admin can manage users and system settings
 const PERMISSIONS = {
-  cashier: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans', 'categories', 'settings'],
-  manager: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans', 'categories', 'settings'],
-  admin: ['checkout', 'products', 'sales', 'reports', 'returns', 'inventory', 'loans', 'users', 'system', 'categories', 'settings']
+  cashier: ['checkout', 'products', 'sales', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  manager: ['checkout', 'products', 'sales', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  admin: ['checkout', 'products', 'sales', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'users', 'system', 'categories', 'settings']
 };
 
 // Initialize app
@@ -314,6 +316,9 @@ function loadViewData(view) {
     case 'reports':
       if (hasPermission('reports')) loadReportsView();
       break;
+    case 'analytics':
+      if (hasPermission('reports')) loadAnalyticsView();
+      break;
     case 'returns':
       if (hasPermission('sales')) loadReturnsView();
       break;
@@ -397,6 +402,12 @@ function setupNavigationHandlers() {
     settingsCards.forEach(card => {
       const view = card.dataset.view;
       
+      // Skip special action buttons (Customer Display, Cash Drawer)
+      if (!view) {
+        card.style.display = 'flex';
+        return;
+      }
+      
       // Show/hide based on permissions
       if (allowedViews.includes(view)) {
         card.style.display = 'flex';
@@ -435,6 +446,31 @@ function setupNavigationHandlers() {
       });
     });
   }
+  
+  // Setup special action buttons (Customer Display & Cash Drawer)
+  function setupSpecialButtons() {
+    const customerDisplayBtn = document.querySelector('.customer-display-btn');
+    const cashDrawerBtn = document.querySelector('.cash-drawer-btn');
+    
+    if (customerDisplayBtn) {
+      customerDisplayBtn.style.display = 'flex';
+      customerDisplayBtn.addEventListener('click', () => {
+        toggleCustomerDisplay();
+      });
+    }
+    
+    if (cashDrawerBtn) {
+      cashDrawerBtn.style.display = 'flex';
+      cashDrawerBtn.addEventListener('click', () => {
+        openCashDrawer();
+      });
+    }
+  }
+  
+  // Call after settings cards are setup
+  setTimeout(() => {
+    setupSpecialButtons();
+  }, 100);
   
   if (settingsMenu) {    // Handle menu item clicks
     settingsMenuItems.forEach(item => {
@@ -595,34 +631,115 @@ async function loadCategoryTabs() {
   const categoryTabsContainer = document.getElementById('categoryTabs');
   const favoriteCategories = await window.api.getFavoriteCategories();
   
-  // Keep the ALL button
-  const allButton = categoryTabsContainer.querySelector('[data-category="all"]');
+  // Clear and rebuild all category tabs (including ALL button)
   categoryTabsContainer.innerHTML = '';
+  
+  // Array of vibrant colors for category buttons
+  const categoryColors = [
+    '#4d6b8a', // Default blue (for ALL)
+    '#e74c3c', // Red
+    '#3498db', // Blue
+    '#2ecc71', // Green
+    '#f39c12', // Orange
+    '#9b59b6', // Purple
+    '#1abc9c', // Turquoise
+    '#e67e22', // Dark Orange
+    '#34495e', // Dark Gray
+    '#16a085', // Dark Turquoise
+    '#c0392b'  // Dark Red
+  ];
+  
+  // Create ALL button
+  const allButton = document.createElement('button');
+  allButton.className = 'category-tab active';
+  allButton.setAttribute('data-category', 'all');
+  allButton.textContent = 'ALL';
+  allButton.style.backgroundColor = categoryColors[0];
   categoryTabsContainer.appendChild(allButton);
   
-  // Add click handler for ALL button
-  allButton.addEventListener('click', async () => {
-    document.querySelectorAll('.category-tab').forEach(t => t.classList.remove('active'));
-    allButton.classList.add('active');
-    hideSubcategoryFilters();
-    displayQuickProducts('', 'all');
-  });
-  
   // Add favorite categories (max 10)
-  favoriteCategories.slice(0, 10).forEach(category => {
+  favoriteCategories.slice(0, 10).forEach((category, index) => {
     const button = document.createElement('button');
     button.className = 'category-tab';
     button.setAttribute('data-category', category.name);
     button.setAttribute('data-category-id', category.id);
     button.textContent = category.name.toUpperCase();
-    button.addEventListener('click', async () => {
-      document.querySelectorAll('.category-tab').forEach(t => t.classList.remove('active'));
-      button.classList.add('active');
-      await loadSubcategoryFilters(category.id, category.name);
-      displayQuickProducts('', category.name);
-    });
+    
+    // Assign color from array (cycling through colors if more than 10 categories)
+    const colorIndex = (index + 1) % categoryColors.length;
+    button.style.backgroundColor = categoryColors[colorIndex];
+    
     categoryTabsContainer.appendChild(button);
   });
+  
+  // Setup double-click detection using event delegation
+  setupCategoryTabListeners();
+}
+
+function setupCategoryTabListeners() {
+  const categoryTabsContainer = document.getElementById('categoryTabs');
+  if (!categoryTabsContainer) {
+    console.error('Category tabs container not found!');
+    return;
+  }
+  
+  console.log('Setting up category tab listeners...');
+  
+  let clickTimer = null;
+  let clickedCategoryName = null;
+  
+  categoryTabsContainer.addEventListener('click', async (e) => {
+    console.log('Click on categoryTabs container', e.target);
+    const tab = e.target.closest('.category-tab');
+    if (!tab) {
+      console.log('Not a category tab');
+      return;
+    }
+    
+    const categoryName = tab.getAttribute('data-category');
+    const categoryId = tab.getAttribute('data-category-id');
+    console.log('Category tab clicked:', categoryName, 'Timer exists:', !!clickTimer, 'Previous clicked:', clickedCategoryName);
+    
+    // If there's already a timer for the same category, this is a double-click
+    if (clickTimer && clickedCategoryName === categoryName) {
+      console.log('DOUBLE-CLICK DETECTED for category:', categoryName);
+      clearTimeout(clickTimer);
+      clickTimer = null;
+      clickedCategoryName = null;
+      
+      // Double-click: open add product modal
+      if (!hasPermission('products')) {
+        alert('You do not have permission to add products');
+        return;
+      }
+      
+      console.log('Opening product modal with category:', categoryId, categoryName);
+      openProductModal(null, categoryId ? parseInt(categoryId) : null, categoryName === 'all' ? null : categoryName);
+    } else {
+      console.log('First click, setting timer...');
+      // First click: set timer for single-click action
+      clickedCategoryName = categoryName;
+      clickTimer = setTimeout(async () => {
+        console.log('Single-click action executing for:', categoryName);
+        clickTimer = null;
+        clickedCategoryName = null;
+        
+        // Single-click: change category
+        document.querySelectorAll('.category-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        
+        if (categoryName === 'all') {
+          hideSubcategoryFilters();
+          displayQuickProducts('', 'all');
+        } else if (categoryId) {
+          await loadSubcategoryFilters(parseInt(categoryId), categoryName);
+          displayQuickProducts('', categoryName);
+        }
+      }, 250);
+    }
+  });
+  
+  console.log('Category tab listeners setup complete');
 }
 
 async function loadSubcategoryFilters(categoryId, categoryName) {
@@ -634,6 +751,22 @@ async function loadSubcategoryFilters(categoryId, categoryName) {
     return;
   }
   
+  // Array of vibrant colors for subcategory buttons
+  const subcategoryColors = [
+    '#3498db', // Blue
+    '#e74c3c', // Red
+    '#2ecc71', // Green
+    '#f39c12', // Orange
+    '#9b59b6', // Purple
+    '#1abc9c', // Turquoise
+    '#e67e22', // Dark Orange
+    '#16a085', // Dark Turquoise
+    '#c0392b', // Dark Red
+    '#8e44ad', // Dark Purple
+    '#27ae60', // Dark Green
+    '#d35400'  // Pumpkin
+  ];
+  
   subcategoryFilters.style.display = 'flex';
   subcategoryFilters.innerHTML = '';
   
@@ -641,6 +774,8 @@ async function loadSubcategoryFilters(categoryId, categoryName) {
   const allBtn = document.createElement('button');
   allBtn.className = 'subcategory-btn active';
   allBtn.textContent = 'All';
+  allBtn.style.backgroundColor = subcategoryColors[0];
+  allBtn.style.borderColor = subcategoryColors[0];
   allBtn.addEventListener('click', () => {
     document.querySelectorAll('.subcategory-btn').forEach(b => b.classList.remove('active'));
     allBtn.classList.add('active');
@@ -649,10 +784,16 @@ async function loadSubcategoryFilters(categoryId, categoryName) {
   subcategoryFilters.appendChild(allBtn);
   
   // Add subcategory buttons
-  subcategories.forEach(subcategory => {
+  subcategories.forEach((subcategory, index) => {
     const btn = document.createElement('button');
     btn.className = 'subcategory-btn';
     btn.textContent = subcategory.name;
+    
+    // Assign color from array (cycling through colors)
+    const colorIndex = (index + 1) % subcategoryColors.length;
+    btn.style.backgroundColor = subcategoryColors[colorIndex];
+    btn.style.borderColor = subcategoryColors[colorIndex];
+    
     btn.addEventListener('click', () => {
       document.querySelectorAll('.subcategory-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
@@ -728,17 +869,112 @@ function displayQuickProducts(searchQuery = '', category = null, subcategory = n
   
   const currencySymbol = systemSettings?.currency_symbol || '$';
   
-  container.innerHTML = filteredProducts.map(product => `
-    <div class="quick-product-card" onclick="promptForWeight(${product.id})">
-      <div class="product-image">${productIcons[product.name] || '📦'}</div>
-      <div class="name">${product.name}</div>
-      <div class="price">${currencySymbol}${product.price.toFixed(2)}/kg</div>
-    </div>
-  `).join('');
+  container.innerHTML = filteredProducts.map(product => {
+    // Use product image if available, otherwise use emoji icon
+    let imageHtml = '';
+    if (product.image && product.image.trim() !== '') {
+      imageHtml = `<img src="${product.image}" alt="${product.name}" style="width: 100%; height: 100%; object-fit: cover; border-radius: 8px;">`;
+    } else {
+      imageHtml = productIcons[product.name] || '📦';
+    }
+    
+    // Determine unit display
+    const isWeightBased = product.unit_type === 'weight' || !product.unit_type;
+    let unit;
+    let amountInfo = '';
+    
+    if (isWeightBased) {
+      const weightUnit = product.weight_unit || 'kg';
+      unit = `/${weightUnit}`;
+      // Show weight amount if available - add unit if not already included
+      if (product.weight_amount) {
+        const amount = product.weight_amount.trim();
+        // Check if amount already includes unit (kg, g, etc.)
+        const hasUnit = /\s*(kg|g|gram|kilogram)$/i.test(amount);
+        const displayAmount = hasUnit ? amount : `${amount} ${weightUnit}`;
+        amountInfo = `<div class="product-unit-info">${displayAmount}</div>`;
+      }
+    } else {
+      const quantityUnit = product.quantity_unit || 'piece';
+      unit = `/${quantityUnit}`;
+      // Show quantity amount if available - add unit if not already included
+      if (product.quantity_amount) {
+        const amount = product.quantity_amount.trim();
+        // Check if amount already includes unit
+        const hasUnit = /\s*(piece|pack|box|bottle|can|bag|pc|pcs)s?$/i.test(amount);
+        const displayAmount = hasUnit ? amount : `${amount} ${quantityUnit}`;
+        amountInfo = `<div class="product-unit-info">${displayAmount}</div>`;
+      }
+    }
+    
+    return `
+      <div class="quick-product-card" data-product-id="${product.id}">
+        <div class="product-image">${imageHtml}</div>
+        <div class="name">${product.name}</div>
+        ${amountInfo}
+        <div class="price">${currencySymbol}${product.price.toFixed(2)}</div>
+      </div>
+    `;
+  }).join('');
+  
+  // Add event listeners for single click and double click
+  setupProductCardListeners();
+}
+
+// ============== PRODUCT CARD CLICK HANDLERS ==============
+function setupProductCardListeners() {
+  const container = document.getElementById('quickProductsList');
+  if (!container) return;
+  
+  let clickTimer = null;
+  let clickedProductId = null;
+  
+  container.addEventListener('click', (e) => {
+    const card = e.target.closest('.quick-product-card');
+    if (!card) return;
+    
+    const productId = parseInt(card.dataset.productId);
+    if (!productId) return;
+    
+    // If there's already a timer, this is a double-click
+    if (clickTimer && clickedProductId === productId) {
+      clearTimeout(clickTimer);
+      clickTimer = null;
+      clickedProductId = null;
+      // Double-click: edit product
+      handleDoubleClick(productId);
+    } else {
+      // First click: set timer for single-click action
+      clickedProductId = productId;
+      clickTimer = setTimeout(() => {
+        clickTimer = null;
+        clickedProductId = null;
+        // Single-click: add to cart
+        promptForWeight(productId);
+      }, 250); // 250ms delay to detect double-click
+    }
+  });
+}
+
+function handleDoubleClick(productId) {
+  // Check if user has permission to edit products
+  if (!hasPermission('products')) {
+    showAlert('Access Denied: You do not have permission to edit products', 'error', 'Access Denied');
+    return;
+  }
+  
+  // Open edit modal
+  editProduct(productId);
 }
 
 // ============== WEIGHT PROMPT ==============
 function promptForWeight(productId) {
+  // Prevent opening multiple modals
+  if (isWeightModalOpen) {
+    console.log('Weight modal already open, ignoring duplicate call');
+    return;
+  }
+  
   console.log('promptForWeight called with productId:', productId);
   const product = allProducts.find(p => p.id === productId);
   console.log('Product found:', product);
@@ -747,25 +983,82 @@ function promptForWeight(productId) {
     return;
   }
   
+  // Set flag to prevent duplicate opens
+  isWeightModalOpen = true;
+  
   const currencySymbol = systemSettings?.currency_symbol || '$';
+  let isWeightBased = product.unit_type === 'weight' || !product.unit_type; // Default to weight if not set
   
   // Show custom modal
   const modal = document.getElementById('weightModal');
+  const modalTitle = document.getElementById('weightModalTitle');
   const productNameEl = document.getElementById('weightProductName');
   const productPriceEl = document.getElementById('weightProductPrice');
   const weightInput = document.getElementById('weightInput');
+  const weightInputLabel = document.getElementById('weightInputLabel');
+  const priceInput = document.getElementById('weightPriceInput');
+  const priceInputLabel = document.getElementById('priceInputLabel');
   const okBtn = document.getElementById('weightOkBtn');
   const cancelBtn = document.getElementById('weightCancelBtn');
   const scaleBtn = document.getElementById('readScaleBtn');
+  const scaleButtonContainer = document.getElementById('scaleButtonContainer');
+  const weightModeBtn = document.getElementById('weightModeBtn');
+  const quantityModeBtn = document.getElementById('quantityModeBtn');
   
   productNameEl.textContent = product.name;
-  productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/kg`;
-  weightInput.value = '';
-  weightInput.placeholder = 'Reading from scale...';
+  priceInput.value = product.price.toFixed(2); // Set default price
   modal.style.display = 'flex';
   
-  // Automatically read from scale when modal opens
-  readWeightFromScale();
+  // Function to update UI based on mode
+  function updateModeUI() {
+    if (isWeightBased) {
+      modalTitle.textContent = 'Enter Weight';
+      weightInputLabel.textContent = 'Weight (kg)';
+      weightInput.placeholder = 'Enter weight';
+      priceInputLabel.textContent = `Price per kg (${currencySymbol})`;
+      priceInput.placeholder = 'Price per kg';
+      productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/kg`;
+      scaleButtonContainer.style.display = 'flex';
+      weightModeBtn.style.background = '#6E8FAF';
+      quantityModeBtn.style.background = '#94a3b8';
+      weightInput.value = '';
+    } else {
+      modalTitle.textContent = 'Enter Quantity';
+      weightInputLabel.textContent = 'Quantity (pieces)';
+      weightInput.placeholder = 'Enter quantity';
+      priceInputLabel.textContent = `Price per piece (${currencySymbol})`;
+      priceInput.placeholder = 'Price per piece';
+      productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/piece`;
+      scaleButtonContainer.style.display = 'none';
+      weightModeBtn.style.background = '#94a3b8';
+      quantityModeBtn.style.background = '#6E8FAF';
+      weightInput.value = '1';
+    }
+    // Don't auto-focus - let user click when ready
+  }
+  
+  // Initial UI setup
+  updateModeUI();
+  
+  // Toggle button handlers
+  weightModeBtn.onclick = () => {
+    isWeightBased = true;
+    updateModeUI();
+    if (scaleConnected) {
+      readWeightFromScale();
+    }
+  };
+  
+  quantityModeBtn.onclick = () => {
+    isWeightBased = false;
+    updateModeUI();
+  };
+  
+  // Automatically read from scale when modal opens (only for weight-based products)
+  if (isWeightBased) {
+    readWeightFromScale();
+  }
+  // Don't auto-focus for quantity products - let user click when ready
   
   // Function to read weight from scale
   async function readWeightFromScale() {
@@ -774,43 +1067,8 @@ function promptForWeight(productId) {
     weightInput.placeholder = 'Reading from scale...';
     
     try {
-      // Auto-connect to first available scale if not connected
-      if (!scaleConnected) {
-        console.log('Scale not connected, searching for ports...');
-        const ports = await window.api.listScalePorts();
-        console.log('Available ports:', ports);
-        
-        if (ports && ports.length > 0) {
-          console.log('Attempting to connect to:', ports[0].path);
-          const result = await window.api.connectScale(ports[0].path);
-          console.log('Connection result:', result);
-          
-          if (result.success) {
-            scaleConnected = true;
-            scalePort = ports[0].path;
-            console.log('Scale connected successfully to:', scalePort);
-            
-            // Small delay after connection
-            await new Promise(resolve => setTimeout(resolve, 500));
-          } else {
-            console.error('Failed to connect to scale:', result.message);
-            weightInput.placeholder = 'Enter weight manually or click button to retry';
-            showAlert('Could not connect to scale. Please check cable connection and try again.', 'warning', 'Scale Connection');
-            scaleBtn.disabled = false;
-            scaleBtn.textContent = '🔄 Try Again';
-            weightInput.focus();
-            return;
-          }
-        } else {
-          console.warn('No serial ports found');
-          weightInput.placeholder = 'No scale found - Enter weight manually';
-          showAlert('No scale detected. Please connect your GRAM ZFOC scale.', 'warning', 'Scale Not Found');
-          scaleBtn.disabled = false;
-          scaleBtn.textContent = '🔄 Try Again';
-          weightInput.focus();
-          return;
-        }
-      }
+      // Backend auto-connects to scale, we just read
+      scaleConnected = true; // Assume scale is available
       
       // Read weight from scale
       console.log('Reading weight from scale...');
@@ -820,10 +1078,14 @@ function promptForWeight(productId) {
       if (weightResult.success) {
         const weight = weightResult.weight.toFixed(3); // 3 decimals for precision
         const totalPrice = (product.price * weightResult.weight).toFixed(2);
+        // Clear the input first, then set the new value
+        weightInput.value = '';
         weightInput.value = weight;
         weightInput.placeholder = `${weight} kg`;
         productPriceEl.innerHTML = `${currencySymbol}${product.price.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}${totalPrice}</strong>`;
         console.log('Weight read successfully:', weight, 'kg, Total:', totalPrice);
+        // Select the text so user can easily replace it
+        weightInput.select();
         okBtn.focus(); // Focus on Add to Cart button
       } else {
         console.error('Failed to read weight:', weightResult.message);
@@ -834,55 +1096,93 @@ function promptForWeight(productId) {
           showAlert('Scale shows 0 kg. Please place the product on the scale.', 'info', 'No Weight');
         }
         // Timeout and other errors - no popup, just set placeholder
-        
-        weightInput.focus();
       }
     } catch (error) {
       console.error('Scale reading error:', error);
       weightInput.placeholder = 'Error - Enter weight manually';
       showAlert('Error reading from scale: ' + error.message + '. Please enter weight manually.', 'error', 'Scale Error');
-      weightInput.focus();
     }
     
     scaleBtn.disabled = false;
     scaleBtn.textContent = '🔄 Read Again';
   }
   
+  // Prevent multiple submissions
+  let isSubmitting = false;
+  
   // Handle OK button
   const handleOk = () => {
-    const weight = weightInput.value;
-    console.log('Weight entered:', weight);
+    if (isSubmitting) {
+      console.log('Already submitting, ignoring duplicate call');
+      return;
+    }
+    
+    console.log('Setting isSubmitting to true');
+    isSubmitting = true;
+    
+    const weight = weightInput.value.trim(); // Trim whitespace
+    const customPrice = priceInput.value.trim(); // Trim whitespace
+    console.log('=== HANDLE OK CLICKED ===');
+    console.log('weightInput element:', weightInput);
+    console.log('weightInput.value (raw):', weight, 'type:', typeof weight, 'length:', weight.length);
+    console.log('priceInput.value (raw):', customPrice);
+    console.log('isWeightBased:', isWeightBased);
     
     if (!weight) {
-      console.log('No weight entered');
-      showAlert('Please enter a weight or read from scale', 'error', 'Invalid Weight');
+      console.log('No value entered');
+      const fieldName = isWeightBased ? 'weight' : 'quantity';
+      showAlert(`Please enter a ${fieldName}`, 'error', `Invalid ${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`);
+      isSubmitting = false;
       return;
     }
     
     const weightNum = parseFloat(weight);
-    console.log('Weight parsed:', weightNum);
+    console.log('>>> PARSED weightNum:', weightNum, 'type:', typeof weightNum);
     if (isNaN(weightNum) || weightNum <= 0) {
-      console.log('Invalid weight');
-      showAlert('Please enter a valid weight', 'error', 'Invalid Weight');
+      console.log('Invalid value');
+      const fieldName = isWeightBased ? 'weight' : 'quantity';
+      showAlert(`Please enter a valid ${fieldName}`, 'error', `Invalid ${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`);
+      isSubmitting = false;
       return;
     }
     
     if (weightNum > product.stock) {
       console.log('Not enough stock');
-      showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
+      const unit = isWeightBased ? 'kg' : 'pieces';
+      showAlert(`Only ${product.stock} ${unit} available in stock`, 'warning', 'Stock Limit');
+      isSubmitting = false;
       return;
     }
     
-    console.log('Calling addToCart with productId:', productId, 'weight:', weightNum);
+    // Validate custom price
+    const priceNum = parseFloat(customPrice);
+    if (isNaN(priceNum) || priceNum <= 0) {
+      showAlert('Please enter a valid price', 'error', 'Invalid Price');
+      isSubmitting = false;
+      return;
+    }
+    
+    console.log('>>> CALLING addToCart with weight:', weightNum, 'price:', priceNum);
+    console.log('isSubmitting flag:', isSubmitting);
+    
+    // Close modal first
     modal.style.display = 'none';
+    
+    // Call addToCart
+    addToCart(productId, weightNum, priceNum, isWeightBased);
+    
+    // Cleanup immediately
     cleanup();
-    addToCart(productId, weightNum);
+    
+    console.log('handleOk completed - item should be added once');
   };
   
   // Handle Cancel button
   const handleCancel = () => {
+    if (isSubmitting) return; // Prevent action if already submitting
     console.log('User cancelled');
     modal.style.display = 'none';
+    isWeightModalOpen = false; // Reset flag
     cleanup();
   };
   
@@ -892,22 +1192,32 @@ function promptForWeight(productId) {
     cancelBtn.removeEventListener('click', handleCancel);
     weightInput.removeEventListener('keypress', handleEnter);
     scaleBtn.removeEventListener('click', handleScaleRead);
+    isWeightModalOpen = false; // Reset flag on cleanup
   };
   
   // Handle Enter key
   const handleEnter = (e) => {
     if (e.key === 'Enter') {
+      e.preventDefault(); // Prevent any default behavior
       handleOk();
     }
   };
   
   // Handle scale button click (for manual re-read)
   const handleScaleRead = () => {
+    if (isSubmitting) return; // Prevent if already submitting
     readWeightFromScale();
   };
   
-  okBtn.addEventListener('click', handleOk);
-  cancelBtn.addEventListener('click', handleCancel);
+  // Remove any existing listeners before adding new ones
+  okBtn.removeEventListener('click', handleOk);
+  cancelBtn.removeEventListener('click', handleCancel);
+  weightInput.removeEventListener('keypress', handleEnter);
+  scaleBtn.removeEventListener('click', handleScaleRead);
+  
+  // Add event listeners with { once: true } to prevent double submission
+  okBtn.addEventListener('click', handleOk, { once: true });
+  cancelBtn.addEventListener('click', handleCancel, { once: true });
   weightInput.addEventListener('keypress', handleEnter);
   scaleBtn.addEventListener('click', handleScaleRead);
 }
@@ -1019,10 +1329,15 @@ async function searchAndAddProduct(query) {
   }
 }
 
-function addToCart(productId, weight = null) {
-  console.log('addToCart called with productId:', productId, 'weight:', weight);
+function addToCart(productId, weight = null, customPrice = null, isWeightBased = true) {
+  console.log('=== addToCart START ===');
+  console.log('productId:', productId);
+  console.log('weight parameter:', weight, 'type:', typeof weight);
+  console.log('customPrice:', customPrice);
+  console.log('isWeightBased:', isWeightBased);
+  
   const product = allProducts.find(p => p.id === productId);
-  console.log('Product in addToCart:', product);
+  console.log('Product found:', product);
   if (!product) {
     console.log('Product not found in addToCart');
     return;
@@ -1035,53 +1350,39 @@ function addToCart(productId, weight = null) {
   
   // Default weight is 1 kg if not provided
   const finalWeight = weight !== null ? weight : 1.0;
-  console.log('Final weight:', finalWeight);
+  // Use custom price if provided, otherwise use product price
+  const finalPrice = customPrice !== null ? customPrice : product.price;
+  console.log('>>> CALCULATED: Final weight:', finalWeight, 'Final price:', finalPrice);
   
-  // Check if product already exists in cart
-  const existingItem = cart.find(item => item.productId === productId);
+  // Always add as new item - don't combine with existing items
+  console.log('Adding new product to cart as separate line item');
   
-  if (existingItem) {
-    console.log('Product already in cart, combining quantities');
-    const newQuantity = existingItem.quantity + finalWeight;
-    
-    // Check stock for combined quantity
-    if (newQuantity > product.stock) {
-      showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
-      return;
-    }
-    
-    // Update existing item
-    existingItem.quantity = newQuantity;
-    existingItem.subtotal = existingItem.unitPrice * newQuantity;
-    console.log('Updated cart item:', existingItem);
-  } else {
-    console.log('Adding new product to cart');
-    
-    if (finalWeight > product.stock) {
-      showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
-      return;
-    }
-    
-    // Calculate price based on weight (price per kg)
-    const weightedPrice = product.price * finalWeight;
-    console.log('Weighted price:', weightedPrice);
-    
-    // Get tax rate from category
-    const category = allCategories.find(c => c.name === product.category);
-    const categoryTaxRate = category ? category.tax_rate : 0;
-    
-    // Add as new item
-    const cartItem = {
-      productId: product.id,
-      productName: product.name,
-      unitPrice: product.price,
-      taxRate: categoryTaxRate,
-      quantity: finalWeight, // Store weight in quantity field
-      subtotal: weightedPrice
-    };
-    console.log('Cart item to add:', cartItem);
-    cart.push(cartItem);
+  if (finalWeight > product.stock) {
+    showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
+    return;
   }
+  
+  // Calculate price based on weight (price per kg)
+  const weightedPrice = finalPrice * finalWeight;
+  console.log('Weighted price:', weightedPrice);
+  
+  // Get tax rate from category
+  const category = allCategories.find(c => c.name === product.category);
+  const categoryTaxRate = category ? category.tax_rate : 0;
+  
+  // Add as new item - each addition is a separate line
+  const cartItem = {
+    productId: product.id,
+    productName: product.name,
+    unitPrice: finalPrice, // Use the custom or default price
+    taxRate: categoryTaxRate,
+    quantity: finalWeight, // Store weight in quantity field
+    subtotal: weightedPrice,
+    isWeightBased: isWeightBased, // Track whether it's weight or quantity based
+    cartItemId: Date.now() // Unique ID for each cart item to allow duplicates
+  };
+  console.log('Cart item to add:', cartItem);
+  cart.push(cartItem);
   
   console.log('Cart after update:', cart);
   
@@ -1110,9 +1411,101 @@ function updateCartQuantity(productId, change) {
   }
 }
 
-function removeFromCart(productId) {
-  cart = cart.filter(item => item.productId !== productId);
+function removeFromCart(cartItemId) {
+  cart = cart.filter(item => item.cartItemId !== cartItemId);
   updateCartDisplay();
+}
+
+function setupInlineCartEditing() {
+  const currencySymbol = systemSettings?.currency_symbol || '$';
+  
+  // Handle quantity editing - inline
+  document.querySelectorAll('.editable-quantity').forEach(el => {
+    el.addEventListener('click', function() {
+      const cartItemId = parseInt(this.dataset.cartItemId);
+      const cartItem = cart.find(item => item.cartItemId === cartItemId);
+      if (!cartItem) return;
+      
+      const unit = cartItem.isWeightBased ? 'kg' : 'pc';
+      const currentValue = cartItem.quantity.toFixed(2);
+      
+      // Replace with input
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = '0.01';
+      input.min = '0.01';
+      input.value = currentValue;
+      input.style.cssText = 'width: 80px; text-align: center; font-weight: 800; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+      
+      this.innerHTML = '';
+      this.appendChild(input);
+      input.focus();
+      input.select();
+      
+      const saveValue = () => {
+        const newValue = parseFloat(input.value);
+        if (!isNaN(newValue) && newValue > 0) {
+          const product = allProducts.find(p => p.id === cartItem.productId);
+          if (product && newValue > product.stock + cartItem.quantity) {
+            alert(`Only ${(product.stock + cartItem.quantity).toFixed(2)} ${unit} available in stock`);
+            updateCartDisplay();
+            return;
+          }
+          cartItem.quantity = newValue;
+          cartItem.subtotal = newValue * cartItem.unitPrice;
+        }
+        updateCartDisplay();
+        updateCartSummary();
+      };
+      
+      input.addEventListener('blur', saveValue);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') saveValue();
+        if (e.key === 'Escape') updateCartDisplay();
+      });
+    });
+  });
+  
+  // Handle price editing - inline
+  document.querySelectorAll('.editable-price').forEach(el => {
+    el.addEventListener('click', function() {
+      const cartItemId = parseInt(this.dataset.cartItemId);
+      const cartItem = cart.find(item => item.cartItemId === cartItemId);
+      if (!cartItem) return;
+      
+      const unitLabel = cartItem.isWeightBased ? '/kg' : '/pc';
+      const currentValue = cartItem.unitPrice.toFixed(2);
+      
+      // Replace with input
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = '0.01';
+      input.min = '0';
+      input.value = currentValue;
+      input.style.cssText = 'width: 100px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+      
+      this.textContent = '';
+      this.appendChild(input);
+      input.focus();
+      input.select();
+      
+      const saveValue = () => {
+        const newValue = parseFloat(input.value);
+        if (!isNaN(newValue) && newValue >= 0) {
+          cartItem.unitPrice = newValue;
+          cartItem.subtotal = cartItem.quantity * newValue;
+        }
+        updateCartDisplay();
+        updateCartSummary();
+      };
+      
+      input.addEventListener('blur', saveValue);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') saveValue();
+        if (e.key === 'Escape') updateCartDisplay();
+      });
+    });
+  });
 }
 
 function updateCartDisplay() {
@@ -1137,22 +1530,29 @@ function updateCartDisplay() {
     checkoutBtn.disabled = true;
   } else {
     console.log('Cart has items, rendering...');
-    cartTableBody.innerHTML = cart.map(item => `
+    cartTableBody.innerHTML = cart.map(item => {
+      const unit = item.isWeightBased ? 'kg' : 'pc';
+      const unitLabel = item.isWeightBased ? '/kg' : '/pc';
+      return `
       <tr>
         <td>${item.productName}</td>
-        <td>${currencySymbol}${item.unitPrice.toFixed(2)}/kg</td>
+        <td class="editable-price" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${currencySymbol}${item.unitPrice.toFixed(2)}${unitLabel}</td>
         <td>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <button onclick="editCartWeight(${item.productId})" style="background: #6EAFAF; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 700;">Edit</button>
-            <span style="min-width: 50px; text-align: center; font-weight: 800;">${item.quantity.toFixed(2)} kg</span>
-            <button onclick="removeFromCart(${item.productId})" style="background: #fc8181; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">×</button>
+          <div style="display: flex; align-items: center; gap: 8px; justify-content: center;">
+            <span class="editable-quantity" data-cart-item-id="${item.cartItemId}" style="min-width: 50px; text-align: center; font-weight: 800; cursor: pointer; user-select: none;">${item.quantity.toFixed(2)} ${unit}</span>
+            <button onclick="removeFromCart(${item.cartItemId})" style="background: #fc8181; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">×</button>
           </div>
         </td>
         <td>${currencySymbol}0.00</td>
         <td style="font-weight: 800; color: #6E8FAF;">${currencySymbol}${item.subtotal.toFixed(2)}</td>
       </tr>
-    `).join('');
+    `;
+    }).join('');
     console.log('Cart HTML updated');
+    
+    // Add click handlers for inline editing
+    setupInlineCartEditing();
+    
     checkoutBtn.disabled = true; // Disabled until payment method selected
   }
   
@@ -1291,6 +1691,9 @@ function showReceipt(sale) {
   
   const date = new Date(sale.sale_date);
   const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const ownerName = systemSettings?.owner_name || '';
+  const nieNumber = systemSettings?.nie_number || '';
+  const companyAddress = systemSettings?.company_address || '';
   const currencySymbol = systemSettings?.currency_symbol || '$';
   const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
   
@@ -1334,6 +1737,10 @@ function showReceipt(sale) {
   content.innerHTML = `
     <div class="receipt-header">
       <h2>${storeName}</h2>
+      ${ownerName ? `<p>${ownerName}</p>` : ''}
+      ${nieNumber ? `<p>${nieNumber}</p>` : ''}
+      ${companyAddress ? `<p style="white-space: pre-line;">${companyAddress}</p>` : ''}
+      <h3 style="margin-top: 10px;">FACTURA SIMPLIFICADA</h3>
       <p>Receipt #${sale.id}</p>
       <p>${date.toLocaleString()}</p>
     </div>
@@ -1374,6 +1781,14 @@ function showReceipt(sale) {
   `;
   
   modal.classList.add('active');
+  
+  // Store sale for manual reprint
+  lastSale = sale;
+  
+  // Auto-print receipt directly to thermal printer (no dialog)
+  setTimeout(async () => {
+    await printReceiptToThermalPrinter(sale);
+  }, 300);
 }
 
 // ============== LOAN FUNCTIONS ==============
@@ -1457,6 +1872,9 @@ function showLoanReceipt(sale, loan) {
   
   const date = new Date(sale.sale_date);
   const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const ownerName = systemSettings?.owner_name || '';
+  const nieNumber = systemSettings?.nie_number || '';
+  const companyAddress = systemSettings?.company_address || '';
   const currencySymbol = systemSettings?.currency_symbol || '$';
   const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
   const taxRate = (systemSettings?.tax_rate || 0.10) * 100;
@@ -1470,6 +1888,10 @@ function showLoanReceipt(sale, loan) {
   content.innerHTML = `
     <div class="receipt-header">
       <h2>${storeName}</h2>
+      ${ownerName ? `<p>${ownerName}</p>` : ''}
+      ${nieNumber ? `<p>${nieNumber}</p>` : ''}
+      ${companyAddress ? `<p style="white-space: pre-line;">${companyAddress}</p>` : ''}
+      <h3 style="margin-top: 10px;">FACTURA SIMPLIFICADA</h3>
       <h3 style="color: #6E8FAF;">PARKING RECEIPT</h3>
       <p>Receipt #${loan.receipt_number}</p>
       <p>${date.toLocaleString()}</p>
@@ -1695,9 +2117,9 @@ async function completeLoanPayment(loanId, amount, paymentMethod) {
     
     // Show success message
     if (result.status === 'paid') {
-      showAlert('PACKING has been paid in full.\nThank you for your payment!', 'success', 'Payment Successful');
+      // Success message removed
     } else if (result.status === 'partial') {
-      showAlert(`Amount Paid: $${amount.toFixed(2)}\nRemaining Balance: $${result.remaining_amount.toFixed(2)}\n\nThank you!`, 'success', 'Partial Payment Received');
+      // Success message removed
     }
     
     // Reload loans view if it's active
@@ -1796,10 +2218,25 @@ function displayProducts(products) {
       statusText = 'Low Stock';
     }
     
+    // Determine unit type
+    const isWeightBased = product.unit_type === 'weight' || !product.unit_type;
+    
+    // Get specific unit
+    let unitLabel = '';
+    if (isWeightBased) {
+      const weightUnit = product.weight_unit || 'kg';
+      unitLabel = `/${weightUnit}`;
+      unitTypeDisplay = `<span style="color: #3b82f6; font-weight: 600;">⚖️ Weight (${weightUnit})</span>`;
+    } else {
+      const quantityUnit = product.quantity_unit || 'piece';
+      unitLabel = `/${quantityUnit}`;
+      unitTypeDisplay = `<span style="color: #10b981; font-weight: 600;">🔢 ${quantityUnit.charAt(0).toUpperCase() + quantityUnit.slice(1)}</span>`;
+    }
+    
     const hasDiscount = product.sale_price || product.discount_percent > 0;
     const priceDisplay = hasDiscount 
-      ? `<span style="text-decoration: line-through; color: #999;">${currencySymbol}${(product.regular_price || product.price).toFixed(2)}</span> <span style="color: #e53e3e; font-weight: 700;">${currencySymbol}${product.price.toFixed(2)}</span>`
-      : `${currencySymbol}${product.price.toFixed(2)}`;
+      ? `<span style="text-decoration: line-through; color: #999;">${currencySymbol}${(product.regular_price || product.price).toFixed(2)}</span> <span style="color: #e53e3e; font-weight: 700;">${currencySymbol}${product.price.toFixed(2)}${unitLabel}</span>`
+      : `${currencySymbol}${product.price.toFixed(2)}${unitLabel}`;
     
     // Get tax rate from category
     const category = allCategories.find(c => c.name === product.category);
@@ -1808,9 +2245,9 @@ function displayProducts(products) {
     
     return `
       <tr>
-        <td>${product.barcode}</td>
         <td>${product.name}</td>
         <td>${product.category || 'General'}</td>
+        <td>${unitTypeDisplay}</td>
         <td>${priceDisplay}</td>
         <td>${taxDisplay}</td>
         <td>${product.stock}</td>
@@ -1837,7 +2274,7 @@ function filterProducts(query) {
   }
 }
 
-async function openProductModal(product = null) {
+async function openProductModal(product = null, categoryId = null, categoryName = null) {
   const modal = document.getElementById('productModal');
   const form = document.getElementById('productForm');
   const title = document.getElementById('productModalTitle');
@@ -1851,12 +2288,17 @@ async function openProductModal(product = null) {
     document.getElementById('productBarcode').value = product.barcode;
     document.getElementById('productName').value = product.name;
     document.getElementById('productCategory').value = product.category || 'General';
+    document.getElementById('productUnitType').value = product.unit_type || 'weight';
+    document.getElementById('productWeightUnit').value = product.weight_unit || 'kg';
+    document.getElementById('productQuantityUnit').value = product.quantity_unit || 'piece';
+    document.getElementById('productWeightAmount').value = product.weight_amount || '';
+    document.getElementById('productQuantityAmount').value = product.quantity_amount || '';
     document.getElementById('productRegularPrice').value = product.regular_price || product.price;
     document.getElementById('productSalePrice').value = product.sale_price || '';
-    document.getElementById('productDiscountPercent').value = product.discount_percent || 0;
-    document.getElementById('productPrice').value = product.price;
     document.getElementById('productStock').value = product.stock;
-    document.getElementById('productMinStock').value = product.min_stock;
+    
+    // Show appropriate unit field
+    toggleUnitFields(product.unit_type || 'weight');
     
     // Load product image if exists
     if (product.image) {
@@ -1891,44 +2333,64 @@ async function openProductModal(product = null) {
     title.textContent = 'Add Product';
     form.reset();
     document.getElementById('productId').value = '';
+    document.getElementById('productUnitType').value = 'weight';
+    document.getElementById('productWeightUnit').value = 'kg';
+    document.getElementById('productQuantityUnit').value = 'piece';
+    document.getElementById('productWeightAmount').value = '';
+    document.getElementById('productQuantityAmount').value = '';
     document.getElementById('productSubcategoryGroup').style.display = 'none';
     document.getElementById('productImageName').textContent = 'No image selected';
     document.getElementById('productImagePreview').style.display = 'none';
+    
+    // Pre-select category if provided
+    if (categoryName) {
+      document.getElementById('productCategory').value = categoryName;
+      
+      // Load subcategories for the pre-selected category
+      if (categoryId) {
+        const subcategories = await window.api.getSubcategoriesByCategoryId(categoryId);
+        const subcategorySelect = document.getElementById('productSubcategory');
+        const subcategoryGroup = document.getElementById('productSubcategoryGroup');
+        
+        if (subcategories && subcategories.length > 0) {
+          subcategorySelect.innerHTML = '<option value="">-- No Subcategory --</option>' +
+            subcategories.map(sub => `<option value="${sub.name}">${sub.name}</option>`).join('');
+          subcategoryGroup.style.display = 'block';
+        } else {
+          subcategoryGroup.style.display = 'none';
+        }
+      }
+    }
+    
+    // Show weight unit by default
+    toggleUnitFields('weight');
   }
   
-  // Setup price calculation
-  setupPriceCalculation();
+  // Setup unit type change listener
+  document.getElementById('productUnitType').addEventListener('change', (e) => {
+    toggleUnitFields(e.target.value);
+  });
   
   modal.classList.add('active');
 }
 
-function setupPriceCalculation() {
-  const regularPriceInput = document.getElementById('productRegularPrice');
-  const salePriceInput = document.getElementById('productSalePrice');
-  const discountInput = document.getElementById('productDiscountPercent');
-  const finalPriceInput = document.getElementById('productPrice');
+function toggleUnitFields(unitType) {
+  const weightUnitGroup = document.getElementById('productWeightUnitGroup');
+  const quantityUnitGroup = document.getElementById('productQuantityUnitGroup');
+  const weightAmountGroup = document.getElementById('productWeightAmountGroup');
+  const quantityAmountGroup = document.getElementById('productQuantityAmountGroup');
   
-  const calculateFinalPrice = () => {
-    const regularPrice = parseFloat(regularPriceInput.value) || 0;
-    const salePrice = parseFloat(salePriceInput.value) || null;
-    const discountPercent = parseFloat(discountInput.value) || 0;
-    
-    let finalPrice = regularPrice;
-    if (salePrice) {
-      finalPrice = salePrice;
-    } else if (discountPercent > 0) {
-      finalPrice = regularPrice * (1 - discountPercent / 100);
-    }
-    
-    finalPriceInput.value = finalPrice.toFixed(2);
-  };
-  
-  regularPriceInput?.addEventListener('input', calculateFinalPrice);
-  salePriceInput?.addEventListener('input', calculateFinalPrice);
-  discountInput?.addEventListener('input', calculateFinalPrice);
-  
-  // Initial calculation
-  calculateFinalPrice();
+  if (unitType === 'weight') {
+    weightUnitGroup.style.display = 'block';
+    weightAmountGroup.style.display = 'block';
+    quantityUnitGroup.style.display = 'none';
+    quantityAmountGroup.style.display = 'none';
+  } else {
+    weightUnitGroup.style.display = 'none';
+    weightAmountGroup.style.display = 'none';
+    quantityUnitGroup.style.display = 'block';
+    quantityAmountGroup.style.display = 'block';
+  }
 }
 
 async function editProduct(id) {
@@ -1949,15 +2411,20 @@ async function saveProduct() {
   const id = document.getElementById('productId').value;
   const regularPrice = parseFloat(document.getElementById('productRegularPrice').value);
   const salePrice = parseFloat(document.getElementById('productSalePrice').value) || null;
-  const discountPercent = parseFloat(document.getElementById('productDiscountPercent').value) || 0;
   const selectedCategory = document.getElementById('productCategory').value;
+  const unitType = document.getElementById('productUnitType').value;
+  
+  // Auto-generate barcode for new products
+  let barcode = document.getElementById('productBarcode').value;
+  if (!id && !barcode) {
+    // Generate barcode: timestamp + random 4 digits
+    barcode = Date.now().toString() + Math.floor(1000 + Math.random() * 9000);
+  }
   
   // Calculate final price
   let finalPrice = regularPrice;
   if (salePrice) {
     finalPrice = salePrice;
-  } else if (discountPercent > 0) {
-    finalPrice = regularPrice * (1 - discountPercent / 100);
   }
   
   // Get tax rate from category
@@ -1986,19 +2453,24 @@ async function saveProduct() {
   }
   
   const product = {
-    barcode: document.getElementById('productBarcode').value,
+    barcode: barcode,
     name: document.getElementById('productName').value,
     description: '',
     category: selectedCategory,
     subcategory: document.getElementById('productSubcategory').value || null,
+    unit_type: unitType,
+    weight_unit: document.getElementById('productWeightUnit').value,
+    quantity_unit: document.getElementById('productQuantityUnit').value,
+    weight_amount: document.getElementById('productWeightAmount').value || null,
+    quantity_amount: document.getElementById('productQuantityAmount').value || null,
     regular_price: regularPrice,
     sale_price: salePrice,
-    discount_percent: discountPercent,
+    discount_percent: 0,
     price: finalPrice,
     tax_rate: taxRate,
     cost: 0,
     stock: parseInt(document.getElementById('productStock').value),
-    min_stock: parseInt(document.getElementById('productMinStock').value) || 5,
+    min_stock: 5,
     image: imageData
   };
   
@@ -2013,43 +2485,98 @@ async function saveProduct() {
     await loadProductsView();
     await loadAllProducts();
     displayQuickProducts();
-    showAlert('Product saved successfully!', 'success', 'Success');
+    // Product saved - no popup
   } catch (error) {
     showAlert('Error saving product: ' + error.message, 'error', 'Error');
   }
 }
 
 // ============== SALES VIEW ==============
+let allSalesData = [];
+let currentPaymentFilter = 'all';
+
 async function loadSalesView() {
   const today = await window.api.getTodaySales();
+  allSalesData = today.sales;
   
   // Display summary
+  updateSalesSummary(today.summary);
+  
+  // Display filtered sales
+  displayFilteredSales();
+  
+  // Add filter button handlers
+  setupPaymentFilters();
+  
+  // Add print button handler
+  const printBtn = document.getElementById('printTodaySalesBtn');
+  if (printBtn) {
+    printBtn.onclick = () => printTodaySales(today);
+  }
+}
+
+function updateSalesSummary(summary) {
   const summaryDiv = document.getElementById('todaySummary');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   summaryDiv.innerHTML = `
-    Today's Sales: <strong>${today.summary.transaction_count}</strong> transactions | 
-    Total: <strong>$${(today.summary.total_sales || 0).toFixed(2)}</strong>
+    Today's Sales: <strong>${summary.transaction_count}</strong> transactions | 
+    Total: <strong>${currencySymbol}${(summary.total_sales || 0).toFixed(2)}</strong>
   `;
-  
-  // Display sales table
+}
+
+function setupPaymentFilters() {
+  const filterButtons = document.querySelectorAll('.btn-filter');
+  filterButtons.forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      // Update active state
+      filterButtons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      
+      // Update filter and display
+      currentPaymentFilter = btn.dataset.filter;
+      displayFilteredSales();
+    });
+  });
+}
+
+async function displayFilteredSales() {
   const tbody = document.querySelector('#salesTable tbody');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
-  if (today.sales.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="icon">💰</div><p>No sales today</p></td></tr>';
+  // Filter sales based on payment method
+  let filteredSales = allSalesData;
+  if (currentPaymentFilter !== 'all') {
+    filteredSales = allSalesData.filter(sale => sale.payment_method === currentPaymentFilter);
+  }
+  
+  if (filteredSales.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="icon">💰</div><p>No sales found</p></td></tr>';
     return;
   }
   
-  tbody.innerHTML = today.sales.map(sale => {
+  // Fetch items for all sales
+  const salesWithItems = await Promise.all(
+    filteredSales.map(async (sale) => {
+      const fullSale = await window.api.getSaleById(sale.id);
+      return fullSale;
+    })
+  );
+  
+  tbody.innerHTML = salesWithItems.map(sale => {
     const date = new Date(sale.sale_date);
-    const itemCount = sale.id; // Would need to query items for actual count
+    const itemsList = sale.items.map(item => `${item.product_name} (${item.quantity})`).join(', ');
+    const itemsShort = itemsList.length > 50 ? itemsList.substring(0, 50) + '...' : itemsList;
     
     return `
       <tr>
         <td>${date.toLocaleString()}</td>
-        <td>-</td>
-        <td>$${sale.subtotal.toFixed(2)}</td>
-        <td>$${sale.tax.toFixed(2)}</td>
-        <td>$${sale.total.toFixed(2)}</td>
-        <td>${sale.payment_method}</td>
+        <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${itemsList}">
+          ${itemsShort}
+        </td>
+        <td>${currencySymbol}${sale.subtotal.toFixed(2)}</td>
+        <td>${currencySymbol}${sale.tax.toFixed(2)}</td>
+        <td style="font-weight: 700;">${currencySymbol}${sale.total.toFixed(2)}</td>
+        <td><span class="payment-badge payment-${sale.payment_method}">${sale.payment_method.toUpperCase()}</span></td>
         <td>
           <button class="action-btn" onclick="viewSale(${sale.id})" title="View">👁️</button>
         </td>
@@ -2063,32 +2590,291 @@ async function viewSale(id) {
   showReceipt(sale);
 }
 
+function printTodaySales(todayData) {
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const today = new Date();
+  
+  // Create print window
+  const printWindow = window.open('', '_blank');
+  
+  const printContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Today's Sales Report - ${today.toLocaleDateString()}</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+          font-family: 'Segoe UI', Arial, sans-serif;
+          padding: 40px;
+          color: #1a202c;
+        }
+        .header {
+          text-align: center;
+          margin-bottom: 40px;
+          padding-bottom: 20px;
+          border-bottom: 3px solid #6E8FAF;
+        }
+        .header h1 {
+          font-size: 32px;
+          color: #6E8FAF;
+          margin-bottom: 10px;
+        }
+        .header h2 {
+          font-size: 24px;
+          color: #4a5568;
+          margin-bottom: 5px;
+        }
+        .header p {
+          font-size: 16px;
+          color: #718096;
+        }
+        .summary {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 20px;
+          margin-bottom: 40px;
+        }
+        .summary-card {
+          background: linear-gradient(135deg, #6E8FAF 0%, #6EAFAF 100%);
+          color: white;
+          padding: 24px;
+          border-radius: 12px;
+          text-align: center;
+        }
+        .summary-card label {
+          font-size: 14px;
+          opacity: 0.9;
+          display: block;
+          margin-bottom: 8px;
+        }
+        .summary-card value {
+          font-size: 32px;
+          font-weight: 800;
+          display: block;
+        }
+        table {
+          width: 100%;
+          border-collapse: collapse;
+          margin-bottom: 40px;
+        }
+        th, td {
+          padding: 12px;
+          text-align: left;
+          border-bottom: 1px solid #e2e8f0;
+        }
+        th {
+          background: #f7fafc;
+          font-weight: 700;
+          color: #2d3748;
+          text-transform: uppercase;
+          font-size: 12px;
+          letter-spacing: 0.5px;
+        }
+        tr:hover {
+          background: #f7fafc;
+        }
+        .total-row {
+          background: #6E8FAF !important;
+          color: white;
+          font-weight: 800;
+          font-size: 16px;
+        }
+        .footer {
+          text-align: center;
+          margin-top: 60px;
+          padding-top: 20px;
+          border-top: 2px solid #e2e8f0;
+          color: #718096;
+        }
+        @media print {
+          body { padding: 20px; }
+          .no-print { display: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>${storeName}</h1>
+        <h2>Daily Sales Report</h2>
+        <p>${today.toLocaleDateString()} - ${today.toLocaleTimeString()}</p>
+      </div>
+      
+      <div class="summary">
+        <div class="summary-card">
+          <label>Total Transactions</label>
+          <value>${todayData.summary.transaction_count}</value>
+        </div>
+        <div class="summary-card">
+          <label>Total Sales</label>
+          <value>${currencySymbol}${(todayData.summary.total_sales || 0).toFixed(2)}</value>
+        </div>
+        <div class="summary-card">
+          <label>Average Sale</label>
+          <value>${currencySymbol}${(todayData.summary.total_sales / todayData.summary.transaction_count || 0).toFixed(2)}</value>
+        </div>
+      </div>
+      
+      <h3 style="margin-bottom: 20px; color: #2d3748; font-size: 20px;">Transaction Details</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Receipt #</th>
+            <th>Subtotal</th>
+            <th>Tax</th>
+            <th>Total</th>
+            <th>Payment Method</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${todayData.sales.map(sale => {
+            const date = new Date(sale.sale_date);
+            return `
+              <tr>
+                <td>${date.toLocaleTimeString()}</td>
+                <td>#${sale.id}</td>
+                <td>${currencySymbol}${sale.subtotal.toFixed(2)}</td>
+                <td>${currencySymbol}${sale.tax.toFixed(2)}</td>
+                <td style="font-weight: 700;">${currencySymbol}${sale.total.toFixed(2)}</td>
+                <td>${sale.payment_method.toUpperCase()}</td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+        <tfoot>
+          <tr class="total-row">
+            <td colspan="2">TOTAL</td>
+            <td>${currencySymbol}${todayData.sales.reduce((sum, s) => sum + s.subtotal, 0).toFixed(2)}</td>
+            <td>${currencySymbol}${todayData.sales.reduce((sum, s) => sum + s.tax, 0).toFixed(2)}</td>
+            <td>${currencySymbol}${(todayData.summary.total_sales || 0).toFixed(2)}</td>
+            <td></td>
+          </tr>
+        </tfoot>
+      </table>
+      
+      <div class="footer">
+        <p>Generated by ${storeName} POS System</p>
+        <p>${today.toLocaleString()}</p>
+      </div>
+      
+      <script>
+        window.onload = () => {
+          setTimeout(() => {
+            window.print();
+          }, 500);
+        };
+      </script>
+    </body>
+    </html>
+  `;
+  
+  printWindow.document.write(printContent);
+  printWindow.document.close();
+}
+
 // ============== REPORTS VIEW ==============
 function loadReportsView() {
   // Load Z-Reports by default
   loadZReportsView();
   
-  // Set default dates for sales reports
+  // Initialize year dropdowns
+  const currentYear = new Date().getFullYear();
+  const reportYearSelect = document.getElementById('reportYear');
+  if (reportYearSelect) {
+    reportYearSelect.innerHTML = '';
+    for (let year = currentYear; year >= currentYear - 5; year--) {
+      const option = document.createElement('option');
+      option.value = year;
+      option.textContent = year;
+      reportYearSelect.appendChild(option);
+    }
+  }
+  
+  // Set current month
+  const reportMonthSelect = document.getElementById('reportMonth');
+  if (reportMonthSelect) {
+    reportMonthSelect.value = new Date().getMonth() + 1;
+  }
+  
+  // Handle report period type change
+  const reportPeriodType = document.getElementById('reportPeriodType');
+  if (reportPeriodType) {
+    reportPeriodType.addEventListener('change', (e) => {
+      const type = e.target.value;
+      const customDateGroup = document.getElementById('customDateGroup');
+      const customDateGroup2 = document.getElementById('customDateGroup2');
+      const monthYearGroup = document.getElementById('monthYearGroup');
+      const yearGroup = document.getElementById('yearGroup');
+      
+      // Hide all optional groups
+      customDateGroup.style.display = 'none';
+      customDateGroup2.style.display = 'none';
+      monthYearGroup.style.display = 'none';
+      
+      if (type === 'custom') {
+        customDateGroup.style.display = 'flex';
+        customDateGroup2.style.display = 'flex';
+        yearGroup.style.display = 'none';
+      } else if (type === 'monthly') {
+        monthYearGroup.style.display = 'flex';
+        yearGroup.style.display = 'flex';
+      } else if (type === 'yearly') {
+        yearGroup.style.display = 'flex';
+      } else if (type === 'weekly' || type === 'daily') {
+        yearGroup.style.display = 'flex';
+      }
+    });
+  }
+  
+  // Set default dates for custom reports
   const endDate = new Date();
   const startDate = new Date();
   startDate.setDate(startDate.getDate() - 7);
   
-  document.getElementById('reportStartDate').value = startDate.toISOString().split('T')[0];
-  document.getElementById('reportEndDate').value = endDate.toISOString().split('T')[0];
+  const reportStartDate = document.getElementById('reportStartDate');
+  const reportEndDate = document.getElementById('reportEndDate');
+  if (reportStartDate) reportStartDate.value = startDate.toISOString().split('T')[0];
+  if (reportEndDate) reportEndDate.value = endDate.toISOString().split('T')[0];
   
   const generateSalesReportBtn = document.getElementById('generateSalesReportBtn');
   if (generateSalesReportBtn) {
     generateSalesReportBtn.onclick = async () => {
-      const start = document.getElementById('reportStartDate').value;
-      const end = document.getElementById('reportEndDate').value;
+      const periodType = document.getElementById('reportPeriodType').value;
       
-      if (!start || !end) {
-        alert('Please select date range');
-        return;
+      let startDate, endDate;
+      
+      if (periodType === 'custom') {
+        startDate = document.getElementById('reportStartDate').value;
+        endDate = document.getElementById('reportEndDate').value;
+        
+        if (!startDate || !endDate) {
+          showAlert('Please select date range', 'warning', 'Missing Information');
+          return;
+        }
+      } else if (periodType === 'daily') {
+        const year = parseInt(document.getElementById('reportYear').value);
+        startDate = `${year}-01-01`;
+        endDate = `${year}-12-31`;
+      } else if (periodType === 'weekly') {
+        const year = parseInt(document.getElementById('reportYear').value);
+        startDate = `${year}-01-01`;
+        endDate = `${year}-12-31`;
+      } else if (periodType === 'monthly') {
+        const year = parseInt(document.getElementById('reportYear').value);
+        const month = parseInt(document.getElementById('reportMonth').value);
+        startDate = `${year}-${String(month).padStart(2, '0')}-01`;
+        const lastDay = new Date(year, month, 0).getDate();
+        endDate = `${year}-${String(month).padStart(2, '0')}-${lastDay}`;
+      } else if (periodType === 'yearly') {
+        const year = parseInt(document.getElementById('reportYear').value);
+        startDate = `${year}-01-01`;
+        endDate = `${year}-12-31`;
       }
       
-      const report = await window.api.getSalesReport(start, end);
-      displayReport(report);
+      const report = await window.api.getSalesReport(startDate, endDate);
+      displayReport(report, periodType);
     };
   }
 
@@ -2123,66 +2909,174 @@ function loadReportsView() {
   }
 }
 
-function displayReport(report) {
+function displayReport(report, periodType = 'custom') {
   const container = document.getElementById('reportResults');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   const totalSales = report.sales.reduce((sum, day) => sum + (day.total_sales || 0), 0);
   const totalTransactions = report.sales.reduce((sum, day) => sum + day.transaction_count, 0);
+  const totalTax = report.sales.reduce((sum, day) => sum + (day.tax || 0), 0);
+  const totalSubtotal = report.sales.reduce((sum, day) => sum + (day.subtotal || 0), 0);
+  
+  let periodTitle = 'Sales Report';
+  if (periodType === 'daily') periodTitle = 'Daily Sales Report';
+  else if (periodType === 'weekly') periodTitle = 'Weekly Sales Report';
+  else if (periodType === 'monthly') periodTitle = 'Monthly Sales Report';
+  else if (periodType === 'yearly') periodTitle = 'Yearly Sales Report';
+  
+  // Group by week for weekly reports
+  let groupedData = report.sales;
+  if (periodType === 'weekly') {
+    const weekMap = {};
+    report.sales.forEach(day => {
+      const date = new Date(day.date);
+      const weekNum = getWeekNumber(date);
+      const weekKey = `Week ${weekNum} (${date.getFullYear()})`;
+      
+      if (!weekMap[weekKey]) {
+        weekMap[weekKey] = {
+          week: weekKey,
+          transaction_count: 0,
+          total_sales: 0,
+          tax: 0,
+          subtotal: 0
+        };
+      }
+      
+      weekMap[weekKey].transaction_count += day.transaction_count;
+      weekMap[weekKey].total_sales += day.total_sales || 0;
+      weekMap[weekKey].tax += day.tax || 0;
+      weekMap[weekKey].subtotal += day.subtotal || 0;
+    });
+    groupedData = Object.values(weekMap);
+  }
+  
+  // Group by month for yearly reports
+  if (periodType === 'yearly') {
+    const monthMap = {};
+    const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    
+    report.sales.forEach(day => {
+      const date = new Date(day.date);
+      const monthKey = monthNames[date.getMonth()];
+      
+      if (!monthMap[monthKey]) {
+        monthMap[monthKey] = {
+          month: monthKey,
+          transaction_count: 0,
+          total_sales: 0,
+          tax: 0,
+          subtotal: 0
+        };
+      }
+      
+      monthMap[monthKey].transaction_count += day.transaction_count;
+      monthMap[monthKey].total_sales += day.total_sales || 0;
+      monthMap[monthKey].tax += day.tax || 0;
+      monthMap[monthKey].subtotal += day.subtotal || 0;
+    });
+    groupedData = Object.values(monthMap);
+  }
   
   container.innerHTML = `
     <div class="report-section">
-      <h3>Summary</h3>
-      <p><strong>Total Sales:</strong> $${totalSales.toFixed(2)}</p>
-      <p><strong>Total Transactions:</strong> ${totalTransactions}</p>
-      <p><strong>Average Transaction:</strong> $${(totalSales / totalTransactions || 0).toFixed(2)}</p>
+      <h3>${periodTitle}</h3>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 20px;">
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
+          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Total Sales</div>
+          <div style="font-size: 32px; font-weight: 800;">${currencySymbol}${totalSales.toFixed(2)}</div>
+        </div>
+        <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
+          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Transactions</div>
+          <div style="font-size: 32px; font-weight: 800;">${totalTransactions}</div>
+        </div>
+        <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
+          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Avg Transaction</div>
+          <div style="font-size: 32px; font-weight: 800;">${currencySymbol}${(totalSales / totalTransactions || 0).toFixed(2)}</div>
+        </div>
+        <div style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
+          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Total Tax</div>
+          <div style="font-size: 32px; font-weight: 800;">${currencySymbol}${totalTax.toFixed(2)}</div>
+        </div>
+      </div>
     </div>
     
     <div class="report-section">
-      <h3>Daily Breakdown</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>Date</th>
-            <th>Transactions</th>
-            <th>Total Sales</th>
-            <th>Tax</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${report.sales.map(day => `
+      <h3>${periodType === 'weekly' ? 'Weekly' : periodType === 'yearly' ? 'Monthly' : 'Daily'} Breakdown</h3>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
             <tr>
-              <td>${day.date}</td>
-              <td>${day.transaction_count}</td>
-              <td>$${(day.total_sales || 0).toFixed(2)}</td>
-              <td>$${(day.tax || 0).toFixed(2)}</td>
+              <th>${periodType === 'weekly' ? 'Week' : periodType === 'yearly' ? 'Month' : 'Date'}</th>
+              <th>Transactions</th>
+              <th>Subtotal</th>
+              <th>Tax</th>
+              <th>Total Sales</th>
             </tr>
-          `).join('')}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            ${groupedData.map(item => `
+              <tr>
+                <td style="font-weight: 600;">${item.date || item.week || item.month}</td>
+                <td>${item.transaction_count}</td>
+                <td>${currencySymbol}${(item.subtotal || 0).toFixed(2)}</td>
+                <td>${currencySymbol}${(item.tax || 0).toFixed(2)}</td>
+                <td style="font-weight: 700; color: #6E8FAF;">${currencySymbol}${(item.total_sales || 0).toFixed(2)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+          <tfoot>
+            <tr style="background: #f7fafc; font-weight: 800;">
+              <td>TOTAL</td>
+              <td>${totalTransactions}</td>
+              <td>${currencySymbol}${totalSubtotal.toFixed(2)}</td>
+              <td>${currencySymbol}${totalTax.toFixed(2)}</td>
+              <td style="color: #6E8FAF;">${currencySymbol}${totalSales.toFixed(2)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
     </div>
     
     <div class="report-section">
       <h3>Top Products</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>Product</th>
-            <th>Quantity Sold</th>
-            <th>Revenue</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${report.topProducts.map(product => `
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
             <tr>
-              <td>${product.product_name}</td>
-              <td>${product.total_quantity}</td>
-              <td>$${product.total_revenue.toFixed(2)}</td>
+              <th>#</th>
+              <th>Product</th>
+              <th>Quantity Sold</th>
+              <th>Revenue</th>
             </tr>
-          `).join('')}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            ${report.topProducts.map((product, index) => `
+              <tr>
+                <td style="font-weight: 700; color: #6E8FAF;">${index + 1}</td>
+                <td style="font-weight: 600;">${product.product_name}</td>
+                <td>${product.total_quantity}</td>
+                <td style="font-weight: 700;">${currencySymbol}${product.total_revenue.toFixed(2)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    
+    <div style="margin-top: 30px; text-align: right;">
+      <button class="btn-primary" onclick="window.print()">🖨️ Print Report</button>
     </div>
   `;
+}
+
+// Helper function to get week number
+function getWeekNumber(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
 }
 
 function displayRestaurantReport(restaurants, month, year) {
@@ -2572,7 +3466,7 @@ async function toggleCategoryFavorite(id, isFavorite) {
     await window.api.toggleCategoryFavorite(id, isFavorite);
     await loadCategoriesView();
     await loadCategoryTabs(); // Refresh category tabs in checkout
-    showAlert(`Category ${isFavorite ? 'added to' : 'removed from'} favorites!`, 'success');
+    // Category favorite toggled - no popup
   } catch (error) {
     console.error('Error toggling favorite:', error);
     showAlert('Failed to update favorite status', 'error');
@@ -2598,7 +3492,9 @@ async function openCategoryModal(category = null) {
     title.textContent = 'Add Category';
     form.reset();
     document.getElementById('categoryId').value = '';
-    subcategoriesSection.style.display = 'none';
+    // Show subcategories section even for new categories (will be empty until saved)
+    subcategoriesSection.style.display = 'block';
+    document.getElementById('subcategoriesList').innerHTML = '<p style="color: #718096; font-size: 14px;">Save category first, then add subcategories</p>';
   }
   
   modal.classList.add('active');
@@ -2613,15 +3509,32 @@ async function loadSubcategoriesForCategory(categoryId) {
     return;
   }
   
-  listContainer.innerHTML = subcategories.map(sub => `
-    <div class="subcategory-item">
-      <span>${sub.name}</span>
-      <div>
-        <button type="button" class="action-btn" onclick="editSubcategory(${sub.id})" title="Edit">✏️</button>
-        <button type="button" class="action-btn" onclick="deleteSubcategory(${sub.id})" title="Delete">🗑️</button>
-      </div>
-    </div>
-  `).join('');
+  // Build nested structure
+  const buildSubcategoryTree = async (parentSubcategories, level = 0) => {
+    let html = '';
+    for (const sub of parentSubcategories) {
+      const indent = level * 20;
+      html += `
+        <div class="subcategory-item" style="margin-left: ${indent}px; border-left: ${level > 0 ? '2px solid #e2e8f0' : 'none'}; padding-left: ${level > 0 ? '10px' : '0'};">
+          <span>${'└─ '.repeat(level)}${sub.name}</span>
+          <div>
+            <button type="button" class="action-btn" onclick="addChildSubcategory(${sub.id}, ${categoryId})" title="Add Child">➕</button>
+            <button type="button" class="action-btn" onclick="editSubcategory(${sub.id})" title="Edit">✏️</button>
+            <button type="button" class="action-btn" onclick="deleteSubcategory(${sub.id})" title="Delete">🗑️</button>
+          </div>
+        </div>
+      `;
+      
+      // Load children
+      const children = await window.api.getSubcategoriesByParentId(sub.id);
+      if (children && children.length > 0) {
+        html += await buildSubcategoryTree(children, level + 1);
+      }
+    }
+    return html;
+  };
+  
+  listContainer.innerHTML = await buildSubcategoryTree(subcategories);
 }
 
 function openCategoryModalFromProduct() {
@@ -2645,7 +3558,7 @@ async function deleteCategory(id) {
   
   try {
     await window.api.deleteCategory(id);
-    showAlert('Category deleted successfully', 'success');
+    // Category deleted - no popup
     await loadCategoriesView();
   } catch (error) {
     showAlert('Error deleting category: ' + error.message, 'error');
@@ -2667,14 +3580,16 @@ async function saveCategory() {
   try {
     const categoryModal = document.getElementById('categoryModal');
     const openedFrom = categoryModal.dataset.openedFrom;
+    const isNew = !id;
     
     let result;
     if (id) {
       await window.api.updateCategory(parseInt(id), category);
-      showAlert('Category updated successfully', 'success');
+      // Category updated - no popup
+      result = { id: parseInt(id) };
     } else {
       result = await window.api.addCategory(category);
-      showAlert('Category added successfully', 'success');
+      // Category added - no popup
     }
     
     closeModal('categoryModal');
@@ -2697,7 +3612,17 @@ async function saveCategory() {
       delete categoryModal.dataset.openedFrom;
     } else {
       await loadCategoriesView();
-      await loadCategoriesForProductForm();
+      
+      // If this was a new category, automatically open edit mode to add subcategories
+      if (isNew && result && result.id) {
+        // Small delay to let the list reload
+        setTimeout(async () => {
+          const newCategory = await window.api.getCategoryById(result.id);
+          if (newCategory) {
+            await openCategoryModal(newCategory);
+          }
+        }, 300);
+      }
     }
   } catch (error) {
     showAlert('Error saving category: ' + error.message, 'error');
@@ -2706,10 +3631,13 @@ async function saveCategory() {
 
 // ============== SUBCATEGORIES ==============
 function setupSubcategoryHandlers() {
-  document.getElementById('addSubcategoryBtn')?.addEventListener('click', () => {
+  document.getElementById('addSubcategoryBtn')?.addEventListener('click', async () => {
     const categoryId = document.getElementById('categoryId').value;
     if (categoryId) {
-      openSubcategoryModal(null, categoryId);
+      await openSubcategoryModal(null, categoryId);
+    } else {
+      // Need to save category first
+      showAlert('Please save the category first before adding subcategories', 'warning');
     }
   });
   
@@ -2719,30 +3647,69 @@ function setupSubcategoryHandlers() {
   });
 }
 
-function openSubcategoryModal(subcategory = null, categoryId = null) {
+async function openSubcategoryModal(subcategory = null, categoryId = null, parentId = null) {
   const modal = document.getElementById('subcategoryModal');
   const form = document.getElementById('subcategoryForm');
   const title = document.getElementById('subcategoryModalTitle');
+  const parentSelect = document.getElementById('subcategoryParentId');
+  
+  // Load all subcategories for this category to populate parent dropdown
+  if (categoryId) {
+    const allSubcategories = await loadAllSubcategoriesFlat(categoryId);
+    parentSelect.innerHTML = '<option value="">None (Top Level)</option>';
+    
+    allSubcategories.forEach(sub => {
+      // Don't allow selecting itself as parent when editing
+      if (!subcategory || sub.id !== subcategory.id) {
+        const level = sub.level || 0;
+        const indent = '&nbsp;&nbsp;'.repeat(level);
+        parentSelect.innerHTML += `<option value="${sub.id}">${indent}${sub.name}</option>`;
+      }
+    });
+  }
   
   if (subcategory) {
     title.textContent = 'Edit Subcategory';
     document.getElementById('subcategoryId').value = subcategory.id;
     document.getElementById('subcategoryCategoryId').value = subcategory.category_id;
+    document.getElementById('subcategoryParentId').value = subcategory.parent_id || '';
     document.getElementById('subcategoryName').value = subcategory.name;
   } else {
     title.textContent = 'Add Subcategory';
     form.reset();
     document.getElementById('subcategoryId').value = '';
     document.getElementById('subcategoryCategoryId').value = categoryId;
+    document.getElementById('subcategoryParentId').value = parentId || '';
   }
   
   modal.classList.add('active');
 }
 
+// Helper function to get all subcategories in flat structure with levels
+async function loadAllSubcategoriesFlat(categoryId, parentId = null, level = 0) {
+  let result = [];
+  const subcategories = parentId 
+    ? await window.api.getSubcategoriesByParentId(parentId)
+    : await window.api.getSubcategoriesByCategoryId(categoryId);
+  
+  for (const sub of subcategories) {
+    result.push({ ...sub, level });
+    const children = await loadAllSubcategoriesFlat(categoryId, sub.id, level + 1);
+    result = result.concat(children);
+  }
+  
+  return result;
+}
+
+// New function to add a child subcategory
+async function addChildSubcategory(parentId, categoryId) {
+  await openSubcategoryModal(null, categoryId, parentId);
+}
+
 async function editSubcategory(id) {
   const subcategory = await window.api.getSubcategoryById(id);
   if (subcategory) {
-    openSubcategoryModal(subcategory);
+    await openSubcategoryModal(subcategory, subcategory.category_id);
   }
 }
 
@@ -2753,7 +3720,7 @@ async function deleteSubcategory(id) {
   
   try {
     await window.api.deleteSubcategory(id);
-    showAlert('Subcategory deleted successfully', 'success');
+    // Subcategory deleted - no popup
     const categoryId = document.getElementById('categoryId').value;
     await loadSubcategoriesForCategory(categoryId);
   } catch (error) {
@@ -2763,8 +3730,10 @@ async function deleteSubcategory(id) {
 
 async function saveSubcategory() {
   const id = document.getElementById('subcategoryId').value;
+  const parentIdValue = document.getElementById('subcategoryParentId').value;
   const subcategory = {
     categoryId: parseInt(document.getElementById('subcategoryCategoryId').value),
+    parentId: parentIdValue ? parseInt(parentIdValue) : null,
     name: document.getElementById('subcategoryName').value.trim()
   };
   
@@ -2776,10 +3745,10 @@ async function saveSubcategory() {
   try {
     if (id) {
       await window.api.updateSubcategory(parseInt(id), subcategory);
-      showAlert('Subcategory updated successfully', 'success');
+      // Subcategory updated - no popup
     } else {
       await window.api.addSubcategory(subcategory);
-      showAlert('Subcategory added successfully', 'success');
+      // Subcategory added - no popup
     }
     
     closeModal('subcategoryModal');
@@ -2821,6 +3790,9 @@ async function loadSystemSettingsView() {
     // Populate form
     document.getElementById('storeName').value = systemSettings.store_name || '';
     document.getElementById('storeLogo').value = systemSettings.store_logo || '';
+    document.getElementById('ownerName').value = systemSettings.owner_name || '';
+    document.getElementById('nieNumber').value = systemSettings.nie_number || '';
+    document.getElementById('companyAddress').value = systemSettings.company_address || '';
     
     // Update logo preview
     const logoPreviewText = document.getElementById('logoPreviewText');
@@ -2836,6 +3808,7 @@ async function loadSystemSettingsView() {
     document.getElementById('currencyCode').value = systemSettings.currency_code || '';
     document.getElementById('taxRate').value = (systemSettings.tax_rate * 100) || 0;
     document.getElementById('receiptFooter').value = systemSettings.receipt_footer || '';
+    document.getElementById('printerName').value = systemSettings.printer_name || '';
   } catch (error) {
     alert('Error loading settings: ' + error.message);
   }
@@ -2920,14 +3893,18 @@ async function saveSystemSettings() {
     const settings = {
       storeName: document.getElementById('storeName').value,
       storeLogo: logoValue,
+      ownerName: document.getElementById('ownerName').value,
+      nieNumber: document.getElementById('nieNumber').value,
+      companyAddress: document.getElementById('companyAddress').value,
       currencySymbol: document.getElementById('currencySymbol').value,
       currencyCode: document.getElementById('currencyCode').value,
       taxRate: parseFloat(document.getElementById('taxRate').value) / 100,
-      receiptFooter: document.getElementById('receiptFooter').value
+      receiptFooter: document.getElementById('receiptFooter').value,
+      printerName: document.getElementById('printerName').value
     };
     
     systemSettings = await window.api.updateSystemSettings(settings);
-    showAlert('Your system settings have been updated successfully!\n\nChanges will be applied to all receipts and the interface.', 'success', 'Settings Saved');
+    // Settings saved - no popup
     
     // Update logo in the app
     await updateSystemUI();
@@ -3039,10 +4016,35 @@ function setupModalHandlers() {
     });
   });
   
-  // Print receipt
-  document.getElementById('printReceiptBtn')?.addEventListener('click', () => {
-    window.print();
-  });
+  // Print receipt - with debounce to prevent multiple prints
+  let isPrinting = false;
+  const printBtn = document.getElementById('printReceiptBtn');
+  if (printBtn) {
+    // Remove any existing listeners by cloning the button
+    const newPrintBtn = printBtn.cloneNode(true);
+    printBtn.parentNode.replaceChild(newPrintBtn, printBtn);
+    
+    newPrintBtn.addEventListener('click', async () => {
+      if (isPrinting) {
+        console.log('Print already in progress, ignoring duplicate request');
+        return;
+      }
+      
+      if (!lastSale) {
+        console.log('No sale to print');
+        return;
+      }
+      
+      isPrinting = true;
+      console.log('Reprinting receipt...');
+      await printReceiptToThermalPrinter(lastSale);
+      
+      // Reset flag after 2 seconds
+      setTimeout(() => {
+        isPrinting = false;
+      }, 2000);
+    });
+  }
   
   // Setup virtual keyboard
   setupVirtualKeyboard();
@@ -3089,14 +4091,31 @@ function setupVirtualKeyboard() {
   const keyboard = document.getElementById('virtualKeyboard');
   const closeKeyboardBtn = document.getElementById('closeKeyboard');
   const keyButtons = document.querySelectorAll('.key-btn');
+  let isShiftActive = false;
   
   // Initialize keyboard in lowercase mode
-  keyButtons.forEach(btn => {
-    const key = btn.dataset.key;
-    if (key && key.length === 1 && /[A-Z]/.test(key)) {
-      btn.textContent = key.toLowerCase();
+  function updateKeyboardCase() {
+    keyButtons.forEach(btn => {
+      const key = btn.dataset.key;
+      if (key && key.length === 1 && /[A-Z]/.test(key)) {
+        btn.textContent = isShiftActive ? key.toUpperCase() : key.toLowerCase();
+      }
+    });
+    
+    // Update shift key appearance
+    const shiftBtn = document.querySelector('.key-shift');
+    if (shiftBtn) {
+      if (isShiftActive) {
+        shiftBtn.style.background = 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)';
+        shiftBtn.style.color = 'white';
+      } else {
+        shiftBtn.style.background = 'white';
+        shiftBtn.style.color = '#1e293b';
+      }
     }
-  });
+  }
+  
+  updateKeyboardCase();
   
   // Show keyboard when text inputs are focused (except barcode input)
   document.addEventListener('focusin', (e) => {
@@ -3118,7 +4137,10 @@ function setupVirtualKeyboard() {
     btn.addEventListener('click', () => {
       const key = btn.dataset.key;
       
-      if (key === 'Backspace') {
+      if (key === 'Shift') {
+        isShiftActive = !isShiftActive;
+        updateKeyboardCase();
+      } else if (key === 'Backspace') {
         if (currentKeyboardInput) {
           currentKeyboardInput.value = currentKeyboardInput.value.slice(0, -1);
           currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -3129,12 +4151,19 @@ function setupVirtualKeyboard() {
         }
         keyboard.classList.remove('active');
         currentKeyboardInput = null;
-      } else if (key !== 'Shift') {
-        // Use lowercase letters always
+        isShiftActive = false;
+        updateKeyboardCase();
+      } else {
+        // Use the actual displayed text (respects shift state)
         const actualKey = btn.textContent === 'SPACE' ? ' ' : btn.textContent;
         if (currentKeyboardInput) {
           currentKeyboardInput.value += actualKey;
           currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        // Auto-turn off shift after typing one character
+        if (isShiftActive) {
+          isShiftActive = false;
+          updateKeyboardCase();
         }
       }
     });
@@ -3147,6 +4176,8 @@ function setupVirtualKeyboard() {
     }
     keyboard.classList.remove('active');
     currentKeyboardInput = null;
+    isShiftActive = false;
+    updateKeyboardCase();
   });
 }
 
@@ -3329,7 +4360,7 @@ async function completeReturn() {
   try {
     const result = await window.api.createReturn(returnData);
     closeModal('returnModal');
-    showAlert(`Return processed successfully!\\nRefund amount: ${systemSettings?.currency_symbol || '$'}${total.toFixed(2)}`, 'success', 'Return Completed');
+    // Return processed - no popup
     await loadReturnsView();
   } catch (error) {
     showAlert('Error processing return: ' + error.message, 'error', 'Error');
@@ -3614,7 +4645,7 @@ async function completeZReport() {
   try {
     const result = await window.api.createZReport(reportData);
     closeModal('zReportModal');
-    showAlert('Z-Report completed successfully!', 'success', 'Report Complete');
+    // Z-Report completed - no popup
     await loadZReportsView();
     currentZReportData = null;
   } catch (error) {
@@ -3886,7 +4917,7 @@ async function updateCustomerDisplayData() {
 async function toggleCustomerDisplay() {
   try {
     await window.api.openCustomerDisplay();
-    showAlert('Customer display opened', 'success');
+    // Customer display opened - no popup
     updateCustomerDisplayData();
   } catch (error) {
     showAlert('Failed to open customer display', 'error');
@@ -3897,12 +4928,213 @@ async function openCashDrawer() {
   try {
     const result = await window.api.openCashDrawer();
     if (!result.success) {
-      showAlert('Failed to open cash drawer', 'error');
+      console.error('Cash drawer error:', result.error);
+      showAlert(result.error || 'Failed to open cash drawer. Please check printer settings.', 'error');
+    } else {
+      console.log('Cash drawer opened successfully');
+      // Success - optionally show brief success message
+      // showAlert('Cash drawer opened', 'success');
     }
-    // Success - no message needed
   } catch (error) {
-    showAlert('Error opening cash drawer', 'error');
+    console.error('Error opening cash drawer:', error);
+    showAlert('Error opening cash drawer: ' + error.message, 'error');
   }
+}
+
+async function printReceiptToThermalPrinter(sale) {
+  try {
+    if (!systemSettings) {
+      systemSettings = await window.api.getSystemSettings();
+    }
+    
+    const printerName = systemSettings?.printer_name;
+    
+    // If no printer configured, use fallback
+    if (!printerName) {
+      console.log('No thermal printer configured, using fallback print...');
+      printReceiptFallback(sale);
+      return;
+    }
+    
+    const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+    const ownerName = systemSettings?.owner_name || '';
+    const nieNumber = systemSettings?.nie_number || '';
+    const companyAddress = systemSettings?.company_address || '';
+    const currencySymbol = systemSettings?.currency_symbol || '$';
+    const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
+    
+    const receiptData = {
+      storeName: storeName,
+      ownerName: ownerName,
+      nieNumber: nieNumber,
+      companyAddress: companyAddress,
+      receiptId: sale.id,
+      date: new Date(sale.sale_date).toLocaleString(),
+      items: sale.items.map(item => ({
+        name: item.product_name,
+        quantity: item.quantity,
+        subtotal: item.subtotal
+      })),
+      subtotal: sale.subtotal,
+      tax: sale.tax,
+      total: sale.total,
+      paymentMethod: sale.payment_method,
+      currency: currencySymbol,
+      footer: receiptFooter,
+      cashier: currentUser.full_name
+    };
+    
+    console.log('Printing receipt to thermal printer...');
+    const result = await window.api.printReceipt(receiptData);
+    
+    if (!result.success) {
+      console.error('Thermal print error:', result.error);
+      // Fallback to standard printing
+      console.log('Falling back to standard print...');
+      printReceiptFallback(sale);
+    } else {
+      console.log('Receipt printed successfully to thermal printer');
+    }
+  } catch (error) {
+    console.error('Error printing receipt:', error);
+    // Fallback to standard printing
+    printReceiptFallback(sale);
+  }
+}
+
+// Fallback: Print receipt using standard browser print (same as daily report)
+function printReceiptFallback(sale) {
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const ownerName = systemSettings?.owner_name || '';
+  const nieNumber = systemSettings?.nie_number || '';
+  const companyAddress = systemSettings?.company_address || '';
+  const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
+  const date = new Date(sale.sale_date).toLocaleString();
+  
+  const printWindow = window.open('', '_blank');
+  printWindow.document.write(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Receipt #${sale.id}</title>
+      <style>
+        body {
+          font-family: 'Courier New', monospace;
+          max-width: 80mm;
+          margin: 0 auto;
+          padding: 10mm;
+          font-size: 12px;
+        }
+        .center {
+          text-align: center;
+        }
+        .header {
+          text-align: center;
+          margin-bottom: 10px;
+          padding-bottom: 10px;
+          border-bottom: 1px dashed #000;
+        }
+        .header h2 {
+          margin: 5px 0;
+          font-size: 16px;
+        }
+        .header p {
+          margin: 2px 0;
+          font-size: 11px;
+        }
+        .items {
+          margin: 10px 0;
+        }
+        .item {
+          display: flex;
+          justify-content: space-between;
+          margin: 5px 0;
+        }
+        .separator {
+          border-top: 1px dashed #000;
+          margin: 10px 0;
+        }
+        .total-line {
+          display: flex;
+          justify-content: space-between;
+          font-weight: bold;
+          font-size: 14px;
+          margin: 5px 0;
+        }
+        .footer {
+          text-align: center;
+          margin-top: 10px;
+          padding-top: 10px;
+          border-top: 1px dashed #000;
+          font-size: 11px;
+        }
+        @media print {
+          body {
+            padding: 0;
+            margin: 0;
+          }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h2>${storeName}</h2>
+        ${ownerName ? `<p>${ownerName}</p>` : ''}
+        ${nieNumber ? `<p>NIE: ${nieNumber}</p>` : ''}
+        ${companyAddress ? `<p>${companyAddress.replace(/\n/g, '<br>')}</p>` : ''}
+        <p style="font-weight: bold; margin-top: 8px;">FACTURA SIMPLIFICADA</p>
+        <p>Receipt #${sale.id}</p>
+        <p>${date}</p>
+      </div>
+      
+      <div class="items">
+        ${sale.items.map(item => `
+          <div class="item">
+            <span>${item.product_name} x${item.quantity}</span>
+            <span>${currencySymbol}${item.subtotal.toFixed(2)}</span>
+          </div>
+        `).join('')}
+      </div>
+      
+      <div class="separator"></div>
+      
+      <div class="item">
+        <span>Subtotal:</span>
+        <span>${currencySymbol}${sale.subtotal.toFixed(2)}</span>
+      </div>
+      <div class="item">
+        <span>Tax:</span>
+        <span>${currencySymbol}${sale.tax.toFixed(2)}</span>
+      </div>
+      <div class="total-line">
+        <span>TOTAL:</span>
+        <span>${currencySymbol}${sale.total.toFixed(2)}</span>
+      </div>
+      <div class="item">
+        <span>Payment:</span>
+        <span>${sale.payment_method.toUpperCase()}</span>
+      </div>
+      
+      <div class="footer">
+        <p>${receiptFooter}</p>
+        <p>Cashier: ${currentUser.full_name}</p>
+        <p>Generated by SUPERMARKET POS</p>
+        <p>Date: ${new Date().toLocaleString()}</p>
+      </div>
+      
+      <script>
+        window.onload = function() {
+          window.print();
+          setTimeout(function() {
+            window.close();
+          }, 500);
+        };
+      </script>
+    </body>
+    </html>
+  `);
+  printWindow.document.close();
 }
 
 async function printBarcodeLabel(product) {
@@ -3914,7 +5146,7 @@ async function printBarcodeLabel(product) {
     };
     const result = await window.api.printBarcodeLabel(barcodeData);
     if (result.success) {
-      showAlert('Barcode label sent to printer', 'success');
+      // Barcode sent - no popup
     } else {
       showAlert('Failed to print barcode label', 'error');
     }
@@ -3964,3 +5196,345 @@ window.printBarcodeLabel = printBarcodeLabel;
 window.printProductBarcode = printProductBarcode;
 window.showAlert = showAlert;
 window.viewZReportDetails = viewZReportDetails;
+
+// Detect available printers
+async function detectPrinters() {
+  const printerListDiv = document.getElementById('printerList');
+  printerListDiv.innerHTML = '<p style="color: #667eea;">🔍 Detecting printers...</p>';
+  
+  try {
+    const result = await window.api.getPrinterList();
+    
+    if (result.success && result.printers.length > 0) {
+      printerListDiv.innerHTML = '<p style="font-weight: bold; margin-top: 10px;">Available Printers:</p>';
+      const ul = document.createElement('ul');
+      ul.style.marginLeft = '20px';
+      
+      result.printers.forEach(printer => {
+        const li = document.createElement('li');
+        li.innerHTML = `<a href="#" style="color: #667eea; text-decoration: underline;" onclick="selectPrinter('${printer.replace(/'/g, "\\'")}'); return false;">${printer}</a>`;
+        ul.appendChild(li);
+      });
+      
+      printerListDiv.appendChild(ul);
+    } else {
+      printerListDiv.innerHTML = '<p style="color: #e74c3c;">No printers detected. Enter printer name manually.</p>';
+    }
+  } catch (error) {
+    printerListDiv.innerHTML = '<p style="color: #e74c3c;">Error detecting printers. Enter printer name manually.</p>';
+  }
+}
+
+function selectPrinter(printerName) {
+  document.getElementById('printerName').value = printerName;
+  document.getElementById('printerList').innerHTML = '<p style="color: #27ae60;">✓ Selected: ' + printerName + '</p>';
+}
+
+// ============== ANALYTICS DASHBOARD ==============
+let analyticsCharts = {};
+
+async function loadAnalyticsView() {
+  // Set default dates (last 30 days)
+  const endDate = new Date();
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - 30);
+  
+  document.getElementById('analyticsStartDate').valueAsDate = startDate;
+  document.getElementById('analyticsEndDate').valueAsDate = endDate;
+  
+  // Setup event listeners
+  document.getElementById('loadAnalyticsBtn').onclick = loadAnalyticsData;
+}
+
+async function loadAnalyticsData() {
+  const startDate = document.getElementById('analyticsStartDate').value;
+  const endDate = document.getElementById('analyticsEndDate').value;
+  
+  if (!startDate || !endDate) {
+    showAlert('Please select both start and end dates', 'warning', 'Invalid Dates');
+    return;
+  }
+  
+  try {
+    const data = await window.api.getAnalyticsData(startDate, endDate);
+    displayAnalytics(data);
+  } catch (error) {
+    console.error('Error loading analytics:', error);
+    showAlert('Error loading analytics data', 'error');
+  }
+}
+
+function displayAnalytics(data) {
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  
+  // Show analytics sections
+  document.getElementById('analyticsSummary').style.display = 'grid';
+  document.getElementById('analyticsCharts').style.display = 'block';
+  
+  // Update summary cards
+  document.getElementById('totalRevenue').textContent = 
+    currencySymbol + (data.summary.total_revenue || 0).toFixed(2);
+  document.getElementById('totalProfit').textContent = 
+    currencySymbol + (data.summary.total_profit || 0).toFixed(2);
+  document.getElementById('profitMargin').textContent = 
+    (data.summary.profit_margin || 0) + '%';
+  document.getElementById('totalTransactions').textContent = 
+    (data.summary.total_transactions || 0).toLocaleString();
+  document.getElementById('avgTransaction').textContent = 
+    currencySymbol + (data.summary.avg_transaction || 0).toFixed(2);
+  
+  // Destroy existing charts
+  Object.values(analyticsCharts).forEach(chart => chart?.destroy());
+  analyticsCharts = {};
+  
+  // Sales Trends Chart
+  const salesTrendsCtx = document.getElementById('salesTrendsChart').getContext('2d');
+  analyticsCharts.salesTrends = new Chart(salesTrendsCtx, {
+    type: 'line',
+    data: {
+      labels: data.salesTrends.map(d => new Date(d.date).toLocaleDateString()),
+      datasets: [{
+        label: 'Total Sales',
+        data: data.salesTrends.map(d => d.total_sales),
+        borderColor: '#3b82f6',
+        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+        fill: true,
+        tension: 0.4
+      }, {
+        label: 'Transactions',
+        data: data.salesTrends.map(d => d.transaction_count),
+        borderColor: '#10b981',
+        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+        fill: true,
+        tension: 0.4,
+        yAxisID: 'y1'
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      interaction: {
+        mode: 'index',
+        intersect: false
+      },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top'
+        }
+      },
+      scales: {
+        y: {
+          type: 'linear',
+          display: true,
+          position: 'left',
+          title: {
+            display: true,
+            text: 'Sales (' + currencySymbol + ')'
+          }
+        },
+        y1: {
+          type: 'linear',
+          display: true,
+          position: 'right',
+          title: {
+            display: true,
+            text: 'Transactions'
+          },
+          grid: {
+            drawOnChartArea: false
+          }
+        }
+      }
+    }
+  });
+  
+  // Peak Hours Chart
+  const peakHoursCtx = document.getElementById('peakHoursChart').getContext('2d');
+  analyticsCharts.peakHours = new Chart(peakHoursCtx, {
+    type: 'bar',
+    data: {
+      labels: data.peakHours.map(h => h.hour + ':00'),
+      datasets: [{
+        label: 'Total Sales',
+        data: data.peakHours.map(h => h.total_sales),
+        backgroundColor: 'rgba(168, 85, 247, 0.6)',
+        borderColor: '#a855f7',
+        borderWidth: 1
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: {
+          display: false
+        },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              const hour = data.peakHours[context.dataIndex];
+              return [
+                'Sales: ' + currencySymbol + hour.total_sales.toFixed(2),
+                'Transactions: ' + hour.transaction_count,
+                'Avg: ' + currencySymbol + hour.avg_transaction
+              ];
+            }
+          }
+        }
+      },
+      scales: {
+        y: {
+          beginAtZero: true,
+          title: {
+            display: true,
+            text: 'Sales (' + currencySymbol + ')'
+          }
+        },
+        x: {
+          title: {
+            display: true,
+            text: 'Hour of Day'
+          }
+        }
+      }
+    }
+  });
+  
+  // Top Products Chart
+  const topProductsCtx = document.getElementById('topProductsChart').getContext('2d');
+  const topProducts = data.topProducts.slice(0, 10);
+  analyticsCharts.topProducts = new Chart(topProductsCtx, {
+    type: 'bar',
+    data: {
+      labels: topProducts.map(p => p.product_name.length > 20 ? p.product_name.substring(0, 20) + '...' : p.product_name),
+      datasets: [{
+        label: 'Revenue',
+        data: topProducts.map(p => p.total_revenue),
+        backgroundColor: 'rgba(34, 197, 94, 0.6)',
+        borderColor: '#22c55e',
+        borderWidth: 1
+      }, {
+        label: 'Profit',
+        data: topProducts.map(p => p.total_profit),
+        backgroundColor: 'rgba(249, 115, 22, 0.6)',
+        borderColor: '#f97316',
+        borderWidth: 1
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top'
+        }
+      },
+      scales: {
+        x: {
+          beginAtZero: true,
+          title: {
+            display: true,
+            text: 'Amount (' + currencySymbol + ')'
+          }
+        }
+      }
+    }
+  });
+  
+  // Category Profit Chart
+  const categoryProfitCtx = document.getElementById('categoryProfitChart').getContext('2d');
+  analyticsCharts.categoryProfit = new Chart(categoryProfitCtx, {
+    type: 'doughnut',
+    data: {
+      labels: data.categoryProfit.map(c => c.category),
+      datasets: [{
+        label: 'Profit',
+        data: data.categoryProfit.map(c => c.total_profit),
+        backgroundColor: [
+          '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6',
+          '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#14b8a6'
+        ]
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: {
+          position: 'right'
+        },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              const category = data.categoryProfit[context.dataIndex];
+              return [
+                category.category + ':',
+                'Revenue: ' + currencySymbol + category.total_revenue.toFixed(2),
+                'Profit: ' + currencySymbol + category.total_profit.toFixed(2),
+                'Margin: ' + category.profit_margin_percent + '%'
+              ];
+            }
+          }
+        }
+      }
+    }
+  });
+  
+  // Payment Methods Chart
+  const paymentMethodsCtx = document.getElementById('paymentMethodsChart').getContext('2d');
+  analyticsCharts.paymentMethods = new Chart(paymentMethodsCtx, {
+    type: 'pie',
+    data: {
+      labels: data.paymentMethods.map(pm => pm.payment_method || 'Unknown'),
+      datasets: [{
+        data: data.paymentMethods.map(pm => pm.total_sales),
+        backgroundColor: ['#22c55e', '#3b82f6', '#f59e0b', '#ef4444']
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: {
+          position: 'bottom'
+        },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              const pm = data.paymentMethods[context.dataIndex];
+              return [
+                pm.payment_method + ':',
+                'Sales: ' + currencySymbol + pm.total_sales.toFixed(2),
+                'Transactions: ' + pm.transaction_count,
+                'Avg: ' + currencySymbol + pm.avg_transaction
+              ];
+            }
+          }
+        }
+      }
+    }
+  });
+  
+  // Profit Margins Table
+  const tbody = document.querySelector('#profitMarginsTable tbody');
+  tbody.innerHTML = topProducts.map(product => `
+    <tr>
+      <td style="font-weight: 500;">${product.product_name}</td>
+      <td style="color: #10b981;">${currencySymbol}${product.total_revenue.toFixed(2)}</td>
+      <td style="color: #f59e0b;">${currencySymbol}${product.total_profit.toFixed(2)}</td>
+      <td>
+        <span style="padding: 4px 8px; border-radius: 4px; font-weight: 600; 
+          background: ${product.profit_margin_percent > 30 ? '#d1fae5' : product.profit_margin_percent > 15 ? '#fef3c7' : '#fee2e2'};
+          color: ${product.profit_margin_percent > 30 ? '#065f46' : product.profit_margin_percent > 15 ? '#92400e' : '#991b1b'};">
+          ${product.profit_margin_percent}%
+        </span>
+      </td>
+    </tr>
+  `).join('');
+}
+
+window.detectPrinters = detectPrinters;
+window.selectPrinter = selectPrinter;

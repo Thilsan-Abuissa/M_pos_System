@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Supermarket POS System</title>
   <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <!-- Loading Screen -->
@@ -212,6 +213,10 @@
                         <span class="menu-icon">📊</span>
                         <span class="menu-text">Reports</span>
                       </button>
+                      <button class="settings-menu-item" data-view="analytics">
+                        <span class="menu-icon">📈</span>
+                        <span class="menu-text">Analytics</span>
+                      </button>
                       <button class="settings-menu-item" data-view="inventory">
                         <span class="menu-icon">📋</span>
                         <span class="menu-text">Inventory</span>
@@ -239,14 +244,17 @@
                 <!-- Dynamic categories will be loaded here -->
               </div>
 
-              <!-- Subcategory Filters -->
-              <div class="subcategory-filters" id="subcategoryFilters" style="display: none;">
-                <!-- Subcategories will be loaded here when a category is selected -->
-              </div>
+              <!-- Categories and Products Container -->
+              <div class="categories-products-container">
+                <!-- Quick Products Grid -->
+                <div class="quick-products-grid-wrapper">
+                  <div id="quickProductsList" class="quick-products-grid-images"></div>
+                </div>
 
-              <!-- Quick Products Grid -->
-              <div class="quick-products-grid-wrapper">
-                <div id="quickProductsList" class="quick-products-grid-images"></div>
+                <!-- Subcategory Filters - Right Side -->
+                <div class="subcategory-filters-right" id="subcategoryFilters" style="display: none;">
+                  <!-- Subcategories will be loaded here when a category is selected -->
+                </div>
               </div>
             </div>
           </div>
@@ -276,6 +284,11 @@
                 <span class="settings-card-icon">📊</span>
                 <span class="settings-card-title">Reports</span>
                 <span class="settings-card-desc">Generate business reports</span>
+              </button>
+              <button class="settings-card" data-view="analytics">
+                <span class="settings-card-icon">📈</span>
+                <span class="settings-card-title">Analytics</span>
+                <span class="settings-card-desc">Advanced charts & insights</span>
               </button>
               <button class="settings-card" data-view="returns">
                 <span class="settings-card-icon">↩️</span>
@@ -307,12 +320,12 @@
                 <span class="settings-card-title">Users</span>
                 <span class="settings-card-desc">Manage user accounts</span>
               </button>
-              <button class="settings-card" onclick="toggleCustomerDisplay()">
+              <button class="settings-card customer-display-btn" id="customerDisplayCard">
                 <span class="settings-card-icon">🖥️</span>
                 <span class="settings-card-title">Customer Display</span>
                 <span class="settings-card-desc">Open second screen for customers</span>
               </button>
-              <button class="settings-card" onclick="openCashDrawer()">
+              <button class="settings-card cash-drawer-btn" id="cashDrawerCard">
                 <span class="settings-card-icon">💵</span>
                 <span class="settings-card-title">Cash Drawer</span>
                 <span class="settings-card-desc">Open cash drawer manually</span>
@@ -341,9 +354,9 @@
                 <table id="productsTable">
                   <thead>
                     <tr>
-                      <th>Product ID</th>
                       <th>Name</th>
                       <th>Category</th>
+                      <th>Unit Type</th>
                       <th>Price</th>
                       <th>Tax</th>
                       <th>Stock</th>
@@ -364,7 +377,16 @@
             <div class="view-content">
               <div class="view-header">
                 <h2>Sales History</h2>
-                <div class="today-summary" id="todaySummary"></div>
+                <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+                  <div class="today-summary" id="todaySummary"></div>
+                  <div style="display: flex; gap: 8px;">
+                    <button id="filterAllBtn" class="btn-filter active" data-filter="all">All</button>
+                    <button id="filterCashBtn" class="btn-filter" data-filter="cash">💵 Cash</button>
+                    <button id="filterCardBtn" class="btn-filter" data-filter="card">💳 Card</button>
+                    <button id="filterLoanBtn" class="btn-filter" data-filter="loan">📦 Packing</button>
+                  </div>
+                  <button id="printTodaySalesBtn" class="btn-primary" style="min-width: 150px;">🖨️ Print Today</button>
+                </div>
               </div>
 
               <div class="table-container">
@@ -429,9 +451,46 @@
               <!-- Sales Reports Tab -->
               <div id="sales-reports" class="report-tab-content">
                 <div class="report-filters">
-                  <input type="date" id="reportStartDate">
-                  <input type="date" id="reportEndDate">
-                  <button id="generateSalesReportBtn" class="btn-primary">Generate Report</button>
+                  <div class="filter-group">
+                    <label class="filter-label">� Report Type</label>
+                    <select id="reportPeriodType" class="filter-select">
+                      <option value="daily">Daily Sales</option>
+                      <option value="weekly">Weekly Sales</option>
+                      <option value="monthly">Monthly Sales</option>
+                      <option value="yearly">Yearly Sales</option>
+                      <option value="custom">Custom Date Range</option>
+                    </select>
+                  </div>
+                  <div class="filter-group" id="customDateGroup" style="display: none;">
+                    <label class="filter-label">📅 Start Date</label>
+                    <input type="date" id="reportStartDate" class="filter-input">
+                  </div>
+                  <div class="filter-group" id="customDateGroup2" style="display: none;">
+                    <label class="filter-label">📅 End Date</label>
+                    <input type="date" id="reportEndDate" class="filter-input">
+                  </div>
+                  <div class="filter-group" id="monthYearGroup" style="display: none;">
+                    <label class="filter-label">📅 Month</label>
+                    <select id="reportMonth" class="filter-select">
+                      <option value="1">January</option>
+                      <option value="2">February</option>
+                      <option value="3">March</option>
+                      <option value="4">April</option>
+                      <option value="5">May</option>
+                      <option value="6">June</option>
+                      <option value="7">July</option>
+                      <option value="8">August</option>
+                      <option value="9">September</option>
+                      <option value="10">October</option>
+                      <option value="11">November</option>
+                      <option value="12">December</option>
+                    </select>
+                  </div>
+                  <div class="filter-group" id="yearGroup">
+                    <label class="filter-label">📅 Year</label>
+                    <select id="reportYear" class="filter-select"></select>
+                  </div>
+                  <button id="generateSalesReportBtn" class="btn-primary btn-large">📊 Generate Report</button>
                 </div>
                 <div id="reportResults" class="report-results"></div>
               </div>
@@ -439,25 +498,144 @@
               <!-- Restaurant Reports Tab -->
               <div id="restaurant-reports" class="report-tab-content">
                 <div class="report-filters">
-                  <label>Select Month:</label>
-                  <select id="restaurantReportMonth">
-                    <option value="1">January</option>
-                    <option value="2">February</option>
-                    <option value="3">March</option>
-                    <option value="4">April</option>
-                    <option value="5">May</option>
-                    <option value="6">June</option>
-                    <option value="7">July</option>
-                    <option value="8">August</option>
-                    <option value="9">September</option>
-                    <option value="10">October</option>
-                    <option value="11">November</option>
-                    <option value="12">December</option>
-                  </select>
-                  <select id="restaurantReportYear"></select>
-                  <button id="generateRestaurantReportBtn" class="btn-primary">🍽️ Generate Restaurant Report</button>
+                  <div class="filter-group">
+                    <label class="filter-label">📅 Select Month</label>
+                    <select id="restaurantReportMonth" class="filter-select">
+                      <option value="1">January</option>
+                      <option value="2">February</option>
+                      <option value="3">March</option>
+                      <option value="4">April</option>
+                      <option value="5">May</option>
+                      <option value="6">June</option>
+                      <option value="7">July</option>
+                      <option value="8">August</option>
+                      <option value="9">September</option>
+                      <option value="10">October</option>
+                      <option value="11">November</option>
+                      <option value="12">December</option>
+                    </select>
+                  </div>
+                  <div class="filter-group">
+                    <label class="filter-label">📅 Year</label>
+                    <select id="restaurantReportYear" class="filter-select"></select>
+                  </div>
+                  <button id="generateRestaurantReportBtn" class="btn-primary btn-large">🍽️ Generate Report</button>
                 </div>
                 <div id="restaurantReportResults" class="report-results"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Analytics View -->
+        <div id="analyticsView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>📈 Advanced Analytics Dashboard</h2>
+              </div>
+
+              <!-- Date Range Filter -->
+              <div class="analytics-filters">
+                <div class="filter-group">
+                  <label class="filter-label">📅 Start Date</label>
+                  <input type="date" id="analyticsStartDate" class="filter-input">
+                </div>
+                <div class="filter-group">
+                  <label class="filter-label">📅 End Date</label>
+                  <input type="date" id="analyticsEndDate" class="filter-input">
+                </div>
+                <button id="loadAnalyticsBtn" class="btn-primary btn-large">📊 Load Analytics</button>
+              </div>
+
+              <!-- Summary Cards -->
+              <div class="analytics-summary-cards" id="analyticsSummary" style="display: none;">
+                <div class="analytics-card">
+                  <div class="analytics-card-icon">💰</div>
+                  <div class="analytics-card-content">
+                    <div class="analytics-card-label">Total Revenue</div>
+                    <div class="analytics-card-value" id="totalRevenue">€0.00</div>
+                  </div>
+                </div>
+                <div class="analytics-card">
+                  <div class="analytics-card-icon">💵</div>
+                  <div class="analytics-card-content">
+                    <div class="analytics-card-label">Total Profit</div>
+                    <div class="analytics-card-value" id="totalProfit">€0.00</div>
+                  </div>
+                </div>
+                <div class="analytics-card">
+                  <div class="analytics-card-icon">📊</div>
+                  <div class="analytics-card-content">
+                    <div class="analytics-card-label">Profit Margin</div>
+                    <div class="analytics-card-value" id="profitMargin">0%</div>
+                  </div>
+                </div>
+                <div class="analytics-card">
+                  <div class="analytics-card-icon">🛒</div>
+                  <div class="analytics-card-content">
+                    <div class="analytics-card-label">Transactions</div>
+                    <div class="analytics-card-value" id="totalTransactions">0</div>
+                  </div>
+                </div>
+                <div class="analytics-card">
+                  <div class="analytics-card-icon">💳</div>
+                  <div class="analytics-card-content">
+                    <div class="analytics-card-label">Avg Transaction</div>
+                    <div class="analytics-card-value" id="avgTransaction">€0.00</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Charts Container -->
+              <div class="analytics-charts-container" id="analyticsCharts" style="display: none;">
+                <!-- Sales Trends Chart -->
+                <div class="chart-card">
+                  <h3>📈 Sales Trends Over Time</h3>
+                  <canvas id="salesTrendsChart"></canvas>
+                </div>
+
+                <!-- Peak Hours Chart -->
+                <div class="chart-card">
+                  <h3>⏰ Peak Hours Analysis</h3>
+                  <canvas id="peakHoursChart"></canvas>
+                </div>
+
+                <!-- Top Products Chart -->
+                <div class="chart-card">
+                  <h3>🏆 Top 10 Products by Revenue</h3>
+                  <canvas id="topProductsChart"></canvas>
+                </div>
+
+                <!-- Category Profit Chart -->
+                <div class="chart-card">
+                  <h3>📦 Profit by Category</h3>
+                  <canvas id="categoryProfitChart"></canvas>
+                </div>
+
+                <!-- Payment Methods Chart -->
+                <div class="chart-card chart-card-half">
+                  <h3>💳 Payment Methods Distribution</h3>
+                  <canvas id="paymentMethodsChart"></canvas>
+                </div>
+
+                <!-- Profit Margins Table -->
+                <div class="chart-card chart-card-half">
+                  <h3>💰 Product Profit Margins</h3>
+                  <div class="table-container" style="max-height: 400px; overflow-y: auto;">
+                    <table id="profitMarginsTable" class="analytics-table">
+                      <thead>
+                        <tr>
+                          <th>Product</th>
+                          <th>Revenue</th>
+                          <th>Profit</th>
+                          <th>Margin %</th>
+                        </tr>
+                      </thead>
+                      <tbody></tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -576,6 +754,18 @@
                     <input type="text" id="storeName" required>
                   </div>
                   <div class="form-group">
+                    <label>Owner Name</label>
+                    <input type="text" id="ownerName" placeholder="e.g., Akash">
+                  </div>
+                  <div class="form-group">
+                    <label>NIE Number</label>
+                    <input type="text" id="nieNumber" placeholder="e.g., 0452391E">
+                  </div>
+                  <div class="form-group">
+                    <label>Company Address</label>
+                    <textarea id="companyAddress" rows="2" placeholder="e.g., Merbella, Spain"></textarea>
+                  </div>
+                  <div class="form-group">
                   <label>Store Logo</label>
                   <input type="file" id="storeLogoFile" accept="image/*" style="display: none;">
                   <div class="logo-upload-container">
@@ -621,6 +811,19 @@
                   <div class="form-group">
                     <label>Receipt Footer</label>
                     <textarea id="receiptFooter" rows="2" placeholder="Thank you for shopping with us!"></textarea>
+                  </div>
+                </div>
+
+                <div class="settings-section">
+                  <h3>Printer Settings</h3>
+                  <div class="form-group">
+                    <label>Receipt Printer Name</label>
+                    <div style="display: flex; gap: 10px;">
+                      <input type="text" id="printerName" placeholder="e.g., POS-80C or \\.\COM1" style="flex: 1;">
+                      <button type="button" class="btn-secondary" onclick="detectPrinters()">🔍 Detect</button>
+                    </div>
+                    <small>Enter printer name (Windows: printer share name, USB: \\.\COMx, or LPT1)</small>
+                    <div id="printerList" style="margin-top: 10px;"></div>
                   </div>
                 </div>
 
@@ -704,10 +907,7 @@
       </div>
       <form id="productForm">
         <input type="hidden" id="productId">
-        <div class="form-group">
-          <label>Product ID *</label>
-          <input type="text" id="productBarcode" required>
-        </div>
+        <input type="hidden" id="productBarcode">
         <div class="form-group">
           <label>Product Name *</label>
           <input type="text" id="productName" required>
@@ -737,6 +937,42 @@
             <!-- Subcategories will be loaded dynamically -->
           </select>
         </div>
+        <div class="form-group">
+          <label>Unit Type *</label>
+          <select id="productUnitType" required>
+            <option value="weight">⚖️ Weight - For items sold by weight</option>
+            <option value="quantity">🔢 Quantity - For items sold by count</option>
+          </select>
+          <small style="color: #718096; display: block; margin-top: 5px;">Choose how this product will be measured</small>
+        </div>
+        <div class="form-group" id="productWeightUnitGroup" style="display: none;">
+          <label>Weight Unit *</label>
+          <select id="productWeightUnit">
+            <option value="kg">Kilogram (kg)</option>
+            <option value="g">Gram (g)</option>
+          </select>
+        </div>
+        <div class="form-group" id="productWeightAmountGroup" style="display: none;">
+          <label>Default Weight Amount</label>
+          <input type="text" id="productWeightAmount" placeholder="e.g., 1 kg, 500 g, 0.5 kg">
+          <small style="color: #718096; display: block; margin-top: 5px;">Optional: Enter weight with unit (e.g., 1 kg, 500 g, 2.5 kg)</small>
+        </div>
+        <div class="form-group" id="productQuantityUnitGroup" style="display: none;">
+          <label>Quantity Unit *</label>
+          <select id="productQuantityUnit">
+            <option value="piece">Piece(s)</option>
+            <option value="pack">Pack(s)</option>
+            <option value="box">Box(es)</option>
+            <option value="bottle">Bottle(s)</option>
+            <option value="can">Can(s)</option>
+            <option value="bag">Bag(s)</option>
+          </select>
+        </div>
+        <div class="form-group" id="productQuantityAmountGroup" style="display: none;">
+          <label>Default Quantity Amount</label>
+          <input type="text" id="productQuantityAmount" placeholder="e.g., 1 piece, 2 packs, 6 cans">
+          <small style="color: #718096; display: block; margin-top: 5px;">Optional: Enter quantity with unit (e.g., 1 piece, 2 packs)</small>
+        </div>
         <div class="form-row">
           <div class="form-group">
             <label>Regular Price *</label>
@@ -747,23 +983,9 @@
             <input type="number" id="productSalePrice" step="0.01" placeholder="Leave empty if not on sale">
           </div>
         </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>Discount %</label>
-            <input type="number" id="productDiscountPercent" step="0.01" min="0" max="100" value="0">
-          </div>
-          <div class="form-group">
-            <label>Final Price *</label>
-            <input type="number" id="productPrice" step="0.01" required readonly style="background: #f7fafc;">
-          </div>
-        </div>
         <div class="form-group">
-          <label>Stock *</label>
+          <label>Current Stock *</label>
           <input type="number" id="productStock" required>
-        </div>
-        <div class="form-group">
-          <label>Minimum Stock</label>
-          <input type="number" id="productMinStock" value="5">
         </div>
         <div class="modal-footer">
           <button type="button" class="btn-secondary cancel-btn">Cancel</button>
@@ -865,6 +1087,13 @@
       <form id="subcategoryForm">
         <input type="hidden" id="subcategoryId">
         <input type="hidden" id="subcategoryCategoryId">
+        <div class="form-group">
+          <label>Parent Subcategory (Optional)</label>
+          <select id="subcategoryParentId">
+            <option value="">None (Top Level)</option>
+          </select>
+          <small style="color: #718096; display: block; margin-top: 5px;">Select a parent to create a nested subcategory</small>
+        </div>
         <div class="form-group">
           <label>Subcategory Name *</label>
           <input type="text" id="subcategoryName" required>
@@ -1026,7 +1255,7 @@
     <div class="modal-content modal-large">
       <div class="modal-header">
         <h3>Generate Z-Report (End of Day)</h3>
-        <button class="modal-close">&times;</button>
+        <button class="modal-close" onclick="closeModal('zReportModal')">&times;</button>
       </div>
       
       <form id="zReportForm">
@@ -1207,6 +1436,7 @@
         <button class="key-btn" data-key="L">L</button>
       </div>
       <div class="keyboard-row">
+        <button class="key-btn key-shift" data-key="Shift">⇧</button>
         <button class="key-btn" data-key="Z">Z</button>
         <button class="key-btn" data-key="X">X</button>
         <button class="key-btn" data-key="C">C</button>
@@ -1232,17 +1462,38 @@
       <div class="custom-alert-icon" style="background: linear-gradient(135deg, #6E8FAF 0%, #6EAFAF 100%);">
         <span style="font-size: 32px;">⚖️</span>
       </div>
-      <h2 id="weightModalTitle">Enter Weight</h2>
+      <h2 id="weightModalTitle">Enter Quantity</h2>
       <p id="weightModalMessage">Product: <span id="weightProductName"></span><br>Price: <span id="weightProductPrice"></span></p>
+      
+      <!-- Mode Toggle -->
+      <div style="display: flex; gap: 10px; margin: 15px 0; justify-content: center;">
+        <button id="weightModeBtn" class="custom-alert-btn" style="flex: 1; max-width: 150px; background: #6E8FAF; padding: 10px;">
+          ⚖️ Weight
+        </button>
+        <button id="quantityModeBtn" class="custom-alert-btn" style="flex: 1; max-width: 150px; background: #94a3b8; padding: 10px;">
+          🔢 Quantity
+        </button>
+      </div>
+      
       <div style="margin: 20px 0;">
+        <label id="weightInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Quantity (pieces)</label>
         <input type="number" id="weightInput" 
                style="width: 100%; padding: 15px; font-size: 24px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;" 
-               placeholder="Enter weight (kg)" 
+               placeholder="Enter quantity" 
                step="0.01" 
                min="0.01"
                autofocus>
       </div>
-      <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+      <div style="margin: 20px 0;">
+        <label id="priceInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Price per piece (€)</label>
+        <input type="number" id="weightPriceInput" 
+               style="width: 100%; padding: 15px; font-size: 20px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;" 
+               placeholder="Price per piece" 
+               step="0.01" 
+               min="0.01">
+        <small style="display: block; color: #64748b; margin-top: 5px; text-align: center;">Modify price only for this sale</small>
+      </div>
+      <div id="scaleButtonContainer" style="display: flex; gap: 12px; margin-bottom: 12px;">
         <button id="readScaleBtn" class="custom-alert-btn" style="background: #10b981; flex: 1;">
           📡 Read Again
         </button>

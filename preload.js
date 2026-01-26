@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('api', {
   // Reports
   getSalesReport: (startDate, endDate) => ipcRenderer.invoke('reports:sales', startDate, endDate),
   getInventoryReport: () => ipcRenderer.invoke('reports:inventory'),
+  getAnalyticsData: (startDate, endDate) => ipcRenderer.invoke('reports:analytics', startDate, endDate),
   
   // Users
   isSetupRequired: () => ipcRenderer.invoke('users:isSetupRequired'),
@@ -69,6 +70,7 @@ contextBridge.exposeInMainWorld('api', {
   // Subcategories
   getAllSubcategories: () => ipcRenderer.invoke('subcategories:getAll'),
   getSubcategoriesByCategoryId: (categoryId) => ipcRenderer.invoke('subcategories:getByCategoryId', categoryId),
+  getSubcategoriesByParentId: (parentId) => ipcRenderer.invoke('subcategories:getByParentId', parentId),
   getSubcategoryById: (id) => ipcRenderer.invoke('subcategories:getById', id),
   addSubcategory: (subcategory) => ipcRenderer.invoke('subcategories:add', subcategory),
   updateSubcategory: (id, subcategory) => ipcRenderer.invoke('subcategories:update', id, subcategory),
@@ -81,7 +83,9 @@ contextBridge.exposeInMainWorld('api', {
   
   // Printer
   openCashDrawer: () => ipcRenderer.invoke('printer:openDrawer'),
+  printReceipt: (receiptData) => ipcRenderer.invoke('printer:printReceipt', receiptData),
   printBarcodeLabel: (barcodeData) => ipcRenderer.invoke('printer:printBarcode', barcodeData),
+  getPrinterList: () => ipcRenderer.invoke('printer:getList'),
   
   // Scale
   listScalePorts: () => ipcRenderer.invoke('scale:listPorts'),

@@ -159,20 +159,26 @@ class POSDatabase {
       CREATE TABLE IF NOT EXISTS subcategories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         category_id INTEGER NOT NULL,
+        parent_id INTEGER,
         name TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE,
-        UNIQUE(category_id, name)
+        FOREIGN KEY (parent_id) REFERENCES subcategories(id) ON DELETE CASCADE,
+        UNIQUE(category_id, parent_id, name)
       );
 
       CREATE TABLE IF NOT EXISTS system_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         store_name TEXT DEFAULT 'SUPERMARKET POS',
         store_logo TEXT,
+        owner_name TEXT,
+        nie_number TEXT,
+        company_address TEXT,
         currency_symbol TEXT DEFAULT '€',
         currency_code TEXT DEFAULT 'EUR',
         tax_rate REAL DEFAULT 0.19,
         receipt_footer TEXT DEFAULT 'Vielen Dank für Ihren Einkauf!',
+        printer_name TEXT,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     `);
@@ -209,6 +215,16 @@ class POSDatabase {
       }
     }
 
+    // Add printer_name column to system_settings table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN printer_name TEXT').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding printer_name column:', error);
+      }
+    }
+
     // Add subcategory column to products table if it doesn't exist
     try {
       this.db.prepare('ALTER TABLE products ADD COLUMN subcategory TEXT').run();
@@ -226,6 +242,87 @@ class POSDatabase {
       // Column already exists, ignore error
       if (!error.message.includes('duplicate column name')) {
         console.error('Error adding image column:', error);
+      }
+    }
+
+    // Add parent_id column to subcategories table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE subcategories ADD COLUMN parent_id INTEGER REFERENCES subcategories(id) ON DELETE CASCADE').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding parent_id column:', error);
+      }
+    }
+
+    // Add company information columns to system_settings table if they don't exist
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN owner_name TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding owner_name column:', error);
+      }
+    }
+
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN nie_number TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding nie_number column:', error);
+      }
+    }
+
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN company_address TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding company_address column:', error);
+      }
+    }
+
+    // Add unit_type column to products table if it doesn't exist (weight or quantity)
+    try {
+      this.db.prepare('ALTER TABLE products ADD COLUMN unit_type TEXT DEFAULT "weight"').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding unit_type column:', error);
+      }
+    }
+
+    // Add weight_unit column to products table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE products ADD COLUMN weight_unit TEXT DEFAULT "kg"').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding weight_unit column:', error);
+      }
+    }
+
+    // Add quantity_unit column to products table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE products ADD COLUMN quantity_unit TEXT DEFAULT "piece"').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding quantity_unit column:', error);
+      }
+    }
+
+    // Add weight_amount column to products table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE products ADD COLUMN weight_amount TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding weight_amount column:', error);
+      }
+    }
+
+    // Add quantity_amount column to products table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE products ADD COLUMN quantity_amount TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding quantity_amount column:', error);
       }
     }
 
@@ -283,8 +380,8 @@ class POSDatabase {
   addProduct(product) {
     const stmt = this.db.prepare(`
       INSERT INTO products (barcode, name, description, category, subcategory, price, regular_price, sale_price, 
-                           discount_percent, cost, tax_rate, stock, min_stock, image)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           discount_percent, cost, tax_rate, stock, min_stock, image, unit_type, weight_unit, quantity_unit, weight_amount, quantity_amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const result = stmt.run(
       product.barcode,
@@ -300,7 +397,12 @@ class POSDatabase {
       product.tax_rate || 0.19,
       product.stock || 0,
       product.min_stock || 5,
-      product.image || null
+      product.image || null,
+      product.unit_type || 'weight',
+      product.weight_unit || 'kg',
+      product.quantity_unit || 'piece',
+      product.weight_amount || null,
+      product.quantity_amount || null
     );
     return { id: result.lastInsertRowid, ...product };
   }
@@ -310,7 +412,9 @@ class POSDatabase {
       UPDATE products 
       SET barcode = ?, name = ?, description = ?, category = ?, subcategory = ?,
           price = ?, regular_price = ?, sale_price = ?, discount_percent = ?,
-          cost = ?, tax_rate = ?, stock = ?, min_stock = ?, image = ?, updated_at = CURRENT_TIMESTAMP
+          cost = ?, tax_rate = ?, stock = ?, min_stock = ?, image = ?,
+          unit_type = ?, weight_unit = ?, quantity_unit = ?, weight_amount = ?, quantity_amount = ?,
+          updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `);
     stmt.run(
@@ -328,6 +432,11 @@ class POSDatabase {
       product.stock || 0,
       product.min_stock || 5,
       product.image || null,
+      product.unit_type || 'weight',
+      product.weight_unit || 'kg',
+      product.quantity_unit || 'piece',
+      product.weight_amount || null,
+      product.quantity_amount || null,
       id
     );
     return { id, ...product };
@@ -911,20 +1020,28 @@ class POSDatabase {
       UPDATE system_settings 
       SET store_name = ?, 
           store_logo = ?,
+          owner_name = ?,
+          nie_number = ?,
+          company_address = ?,
           currency_symbol = ?, 
           currency_code = ?,
           tax_rate = ?,
           receipt_footer = ?,
+          printer_name = ?,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
     `);
     stmt.run(
       settings.storeName,
       settings.storeLogo || null,
+      settings.ownerName || null,
+      settings.nieNumber || null,
+      settings.companyAddress || null,
       settings.currencySymbol,
       settings.currencyCode,
       settings.taxRate,
-      settings.receiptFooter
+      settings.receiptFooter,
+      settings.printerName || null
     );
     return this.getSystemSettings();
   }
@@ -989,7 +1106,11 @@ class POSDatabase {
   }
 
   getSubcategoriesByCategoryId(categoryId) {
-    return this.db.prepare('SELECT * FROM subcategories WHERE category_id = ? ORDER BY name').all(categoryId);
+    return this.db.prepare('SELECT * FROM subcategories WHERE category_id = ? AND parent_id IS NULL ORDER BY name').all(categoryId);
+  }
+
+  getSubcategoriesByParentId(parentId) {
+    return this.db.prepare('SELECT * FROM subcategories WHERE parent_id = ? ORDER BY name').all(parentId);
   }
 
   getSubcategoryById(id) {
@@ -998,20 +1119,20 @@ class POSDatabase {
 
   addSubcategory(subcategory) {
     const stmt = this.db.prepare(`
-      INSERT INTO subcategories (category_id, name)
-      VALUES (?, ?)
+      INSERT INTO subcategories (category_id, parent_id, name)
+      VALUES (?, ?, ?)
     `);
-    const result = stmt.run(subcategory.categoryId, subcategory.name);
+    const result = stmt.run(subcategory.categoryId, subcategory.parentId || null, subcategory.name);
     return { success: true, id: result.lastInsertRowid };
   }
 
   updateSubcategory(id, subcategory) {
     const stmt = this.db.prepare(`
       UPDATE subcategories 
-      SET category_id = ?, name = ?
+      SET category_id = ?, parent_id = ?, name = ?
       WHERE id = ?
     `);
-    stmt.run(subcategory.categoryId, subcategory.name, id);
+    stmt.run(subcategory.categoryId, subcategory.parentId || null, subcategory.name, id);
     return { success: true };
   }
 
@@ -1019,6 +1140,127 @@ class POSDatabase {
     const stmt = this.db.prepare('DELETE FROM subcategories WHERE id = ?');
     stmt.run(id);
     return { success: true };
+  }
+
+  // Analytics operations
+  getAnalyticsData(startDate, endDate) {
+    // Sales trends by date
+    const salesTrends = this.db.prepare(`
+      SELECT 
+        DATE(sale_date) as date,
+        COUNT(*) as transaction_count,
+        SUM(total) as total_sales,
+        SUM(total - tax) as net_sales,
+        SUM(tax) as total_tax
+      FROM sales
+      WHERE DATE(sale_date) BETWEEN ? AND ?
+      GROUP BY DATE(sale_date)
+      ORDER BY date
+    `).all(startDate, endDate);
+
+    // Peak hours analysis
+    const peakHours = this.db.prepare(`
+      SELECT 
+        CAST(strftime('%H', sale_date) AS INTEGER) as hour,
+        COUNT(*) as transaction_count,
+        SUM(total) as total_sales,
+        ROUND(AVG(total), 2) as avg_transaction
+      FROM sales
+      WHERE DATE(sale_date) BETWEEN ? AND ?
+      GROUP BY hour
+      ORDER BY hour
+    `).all(startDate, endDate);
+
+    // Top products by revenue
+    const topProducts = this.db.prepare(`
+      SELECT 
+        si.product_id,
+        si.product_name,
+        p.category,
+        SUM(si.quantity) as total_quantity,
+        SUM(si.subtotal) as total_revenue,
+        p.cost,
+        (SUM(si.subtotal) - (SUM(si.quantity) * COALESCE(p.cost, 0))) as total_profit,
+        ROUND(((SUM(si.subtotal) - (SUM(si.quantity) * COALESCE(p.cost, 0))) / SUM(si.subtotal) * 100), 2) as profit_margin_percent
+      FROM sale_items si
+      LEFT JOIN products p ON si.product_id = p.id
+      JOIN sales s ON si.sale_id = s.id
+      WHERE DATE(s.sale_date) BETWEEN ? AND ?
+      GROUP BY si.product_id, si.product_name, p.category, p.cost
+      ORDER BY total_revenue DESC
+      LIMIT 20
+    `).all(startDate, endDate);
+
+    // Profit by category
+    const categoryProfit = this.db.prepare(`
+      SELECT 
+        COALESCE(p.category, 'Uncategorized') as category,
+        SUM(si.subtotal) as total_revenue,
+        SUM(si.quantity * COALESCE(p.cost, 0)) as total_cost,
+        (SUM(si.subtotal) - SUM(si.quantity * COALESCE(p.cost, 0))) as total_profit,
+        ROUND(((SUM(si.subtotal) - SUM(si.quantity * COALESCE(p.cost, 0))) / SUM(si.subtotal) * 100), 2) as profit_margin_percent
+      FROM sale_items si
+      LEFT JOIN products p ON si.product_id = p.id
+      JOIN sales s ON si.sale_id = s.id
+      WHERE DATE(s.sale_date) BETWEEN ? AND ?
+      GROUP BY p.category
+      ORDER BY total_profit DESC
+    `).all(startDate, endDate);
+
+    // Payment method breakdown
+    const paymentMethods = this.db.prepare(`
+      SELECT 
+        payment_method,
+        COUNT(*) as transaction_count,
+        SUM(total) as total_sales,
+        ROUND(AVG(total), 2) as avg_transaction
+      FROM sales
+      WHERE DATE(sale_date) BETWEEN ? AND ?
+      GROUP BY payment_method
+    `).all(startDate, endDate);
+
+    // Summary statistics
+    const summary = this.db.prepare(`
+      SELECT 
+        COUNT(*) as total_transactions,
+        SUM(total) as total_revenue,
+        SUM(total - tax) as net_revenue,
+        SUM(tax) as total_tax,
+        ROUND(AVG(total), 2) as avg_transaction,
+        MAX(total) as max_transaction,
+        MIN(total) as min_transaction
+      FROM sales
+      WHERE DATE(sale_date) BETWEEN ? AND ?
+    `).get(startDate, endDate);
+
+    // Calculate total profit
+    const profitData = this.db.prepare(`
+      SELECT 
+        SUM(si.subtotal) as total_revenue,
+        SUM(si.quantity * COALESCE(p.cost, 0)) as total_cost
+      FROM sale_items si
+      LEFT JOIN products p ON si.product_id = p.id
+      JOIN sales s ON si.sale_id = s.id
+      WHERE DATE(s.sale_date) BETWEEN ? AND ?
+    `).get(startDate, endDate);
+
+    const totalProfit = (profitData.total_revenue || 0) - (profitData.total_cost || 0);
+    const profitMargin = profitData.total_revenue > 0 
+      ? ((totalProfit / profitData.total_revenue) * 100).toFixed(2)
+      : 0;
+
+    return {
+      salesTrends,
+      peakHours,
+      topProducts,
+      categoryProfit,
+      paymentMethods,
+      summary: {
+        ...summary,
+        total_profit: totalProfit,
+        profit_margin: profitMargin
+      }
+    };
   }
 }
 
