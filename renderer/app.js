@@ -9,6 +9,7 @@ let currentLogoData = ''; // Current logo data
 let scaleConnected = false; // Scale connection status
 let scalePort = null; // Currently connected scale port
 let lastSale = null; // Store last sale for reprinting
+let lastSalePaymentMethod = null; // Track payment method for drawer-open-on-print
 let isWeightModalOpen = false; // Flag to prevent multiple modal opens
 
 // Role-based permissions - Only admin can manage users and system settings
@@ -1650,11 +1651,7 @@ async function completeSale() {
   
   try {
     const sale = await window.api.createSale(saleData);
-    
-    // If cash payment, open cash drawer
-    if (paymentMethod === 'cash') {
-      await openCashDrawer();
-    }
+    lastSalePaymentMethod = paymentMethod;
     
     // Show receipt
     showReceipt(sale);
@@ -1784,11 +1781,6 @@ function showReceipt(sale) {
   
   // Store sale for manual reprint
   lastSale = sale;
-  
-  // Auto-print receipt directly to thermal printer (no dialog)
-  setTimeout(async () => {
-    await printReceiptToThermalPrinter(sale);
-  }, 300);
 }
 
 // ============== LOAN FUNCTIONS ==============
@@ -4037,7 +4029,18 @@ function setupModalHandlers() {
       
       isPrinting = true;
       console.log('Reprinting receipt...');
-      await printReceiptToThermalPrinter(lastSale);
+      const printed = await printReceiptToThermalPrinter(lastSale);
+
+      // Old POS behavior: open drawer when printing for cash sales
+      const paymentMethod = (lastSalePaymentMethod || lastSale?.payment_method || '').toString().toLowerCase();
+      if (paymentMethod === 'cash') {
+        if (printed) {
+          await openCashDrawer();
+        } else {
+          // Try drawer anyway; show error if it fails
+          await openCashDrawer();
+        }
+      }
       
       // Reset flag after 2 seconds
       setTimeout(() => {
@@ -4947,15 +4950,6 @@ async function printReceiptToThermalPrinter(sale) {
       systemSettings = await window.api.getSystemSettings();
     }
     
-    const printerName = systemSettings?.printer_name;
-    
-    // If no printer configured, use fallback
-    if (!printerName) {
-      console.log('No thermal printer configured, using fallback print...');
-      printReceiptFallback(sale);
-      return;
-    }
-    
     const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
     const ownerName = systemSettings?.owner_name || '';
     const nieNumber = systemSettings?.nie_number || '';
@@ -4992,13 +4986,16 @@ async function printReceiptToThermalPrinter(sale) {
       // Fallback to standard printing
       console.log('Falling back to standard print...');
       printReceiptFallback(sale);
+      return false;
     } else {
       console.log('Receipt printed successfully to thermal printer');
+      return true;
     }
   } catch (error) {
     console.error('Error printing receipt:', error);
     // Fallback to standard printing
     printReceiptFallback(sale);
+    return false;
   }
 }
 
@@ -5209,13 +5206,33 @@ async function detectPrinters() {
       printerListDiv.innerHTML = '<p style="font-weight: bold; margin-top: 10px;">Available Printers:</p>';
       const ul = document.createElement('ul');
       ul.style.marginLeft = '20px';
-      
-      result.printers.forEach(printer => {
+
+      // Prefer real printer drivers over virtual printers
+      const printers = result.printers.filter(p => !/pdf|xps|onenote|fax/i.test(p));
+
+      // Auto-select a best match to help customers (still shows the list below)
+      if (printers.length > 0) {
+        const best =
+          printers.find(p => /TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) ||
+          printers[0];
+        selectPrinter(best);
+      }
+
+      (printers.length ? printers : result.printers).forEach((printer) => {
         const li = document.createElement('li');
-        li.innerHTML = `<a href="#" style="color: #667eea; text-decoration: underline;" onclick="selectPrinter('${printer.replace(/'/g, "\\'")}'); return false;">${printer}</a>`;
+        const a = document.createElement('a');
+        a.href = '#';
+        a.style.color = '#667eea';
+        a.style.textDecoration = 'underline';
+        a.textContent = printer;
+        a.addEventListener('click', (e) => {
+          e.preventDefault();
+          selectPrinter(printer);
+        });
+        li.appendChild(a);
         ul.appendChild(li);
       });
-      
+
       printerListDiv.appendChild(ul);
     } else {
       printerListDiv.innerHTML = '<p style="color: #e74c3c;">No printers detected. Enter printer name manually.</p>';

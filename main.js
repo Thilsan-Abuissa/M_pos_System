@@ -19,6 +19,151 @@ let db;
 let scalePort = null;
 let scaleParser = null;
 
+function pickBestScalePort(ports) {
+  if (!Array.isArray(ports) || ports.length === 0) return null;
+
+  const scored = ports
+    .map((port) => {
+      const manufacturer = (port.manufacturer || '').toString();
+      const pnpId = (port.pnpId || '').toString();
+      const pathVal = (port.path || '').toString();
+
+      const manufacturerLower = manufacturer.toLowerCase();
+      const pnpIdLower = pnpId.toLowerCase();
+      const pathLower = pathVal.toLowerCase();
+
+      let score = 0;
+
+      // Strong signals for USB-serial adapters commonly used by scales
+      if (/ch340|usb.*serial|ftdi|silicon/i.test(manufacturer)) score += 200;
+      if (pnpIdLower.includes('usb')) score += 150;
+      if (pnpIdLower.includes('vid_')) score += 50;
+      if (port.vendorId || port.productId) score += 30;
+
+      // Port name patterns
+      if (/^com\d+$/i.test(pathVal)) score += 20;
+      if (/ttyusb|ttyacm|cu\.usbserial/i.test(pathLower)) score += 20;
+
+      // Penalize built-in motherboard COM ports
+      if (pnpIdLower.includes('acpi') || pnpIdLower.includes('pci')) score -= 200;
+      if (pathLower === 'com1') score -= 120;
+
+      // De-prioritize ports with no identifying info
+      if (!manufacturer && !pnpId && !(port.vendorId || port.productId)) score -= 30;
+
+      return { port, score };
+    })
+    // Keep only likely serial ports
+    .filter(({ port }) => {
+      const manufacturer = (port.manufacturer || '').toString();
+      const pnpId = (port.pnpId || '').toString();
+      const pathVal = (port.path || '').toString();
+      return (
+        /CH340|USB.*Serial|FTDI|Silicon/i.test(manufacturer) ||
+        /USB/i.test(pnpId) ||
+        /ttyUSB|ttyACM|cu\.usbserial|^COM\d+$/i.test(pathVal)
+      );
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored.length > 0 ? scored[0].port : null;
+}
+
+async function sendRawFileToPrinterWindows(printerName, filePath) {
+  const fs = require('fs');
+  const { exec } = require('child_process');
+  const { promisify } = require('util');
+  const execPromise = promisify(exec);
+
+  const tempPs1 = path.join(app.getPath('temp'), `raw_print_${Date.now()}_${Math.random().toString(16).slice(2)}.ps1`);
+  const safePrinterName = (printerName || '').toString().replace(/"/g, '""');
+  const safeFilePath = (filePath || '').toString().replace(/"/g, '""');
+
+  const script = `param(
+  [Parameter(Mandatory=$true)][string]$PrinterName,
+  [Parameter(Mandatory=$true)][string]$FilePath
+)
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public class RawPrinterHelper {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+  public class DOCINFOA {
+    [MarshalAs(UnmanagedType.LPStr)] public string pDocName;
+    [MarshalAs(UnmanagedType.LPStr)] public string pOutputFile;
+    [MarshalAs(UnmanagedType.LPStr)] public string pDataType;
+  }
+
+  [DllImport("winspool.Drv", EntryPoint = "OpenPrinterA", SetLastError = true, CharSet = CharSet.Ansi, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+  public static extern bool OpenPrinter(string szPrinter, out IntPtr hPrinter, IntPtr pd);
+
+  [DllImport("winspool.Drv", EntryPoint = "ClosePrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+  public static extern bool ClosePrinter(IntPtr hPrinter);
+
+  [DllImport("winspool.Drv", EntryPoint = "StartDocPrinterA", SetLastError = true, CharSet = CharSet.Ansi, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+  public static extern bool StartDocPrinter(IntPtr hPrinter, int level, [In, MarshalAs(UnmanagedType.LPStruct)] DOCINFOA di);
+
+  [DllImport("winspool.Drv", EntryPoint = "EndDocPrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+  public static extern bool EndDocPrinter(IntPtr hPrinter);
+
+  [DllImport("winspool.Drv", EntryPoint = "StartPagePrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+  public static extern bool StartPagePrinter(IntPtr hPrinter);
+
+  [DllImport("winspool.Drv", EntryPoint = "EndPagePrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+  public static extern bool EndPagePrinter(IntPtr hPrinter);
+
+  [DllImport("winspool.Drv", EntryPoint = "WritePrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+  public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
+
+  public static bool SendBytesToPrinter(string printerName, byte[] bytes) {
+    IntPtr hPrinter;
+    DOCINFOA di = new DOCINFOA();
+    di.pDocName = "RAW ESC/POS";
+    di.pDataType = "RAW";
+
+    if (!OpenPrinter(printerName, out hPrinter, IntPtr.Zero)) return false;
+    bool ok = false;
+    try {
+      if (!StartDocPrinter(hPrinter, 1, di)) return false;
+      if (!StartPagePrinter(hPrinter)) return false;
+
+      int dwWritten = 0;
+      IntPtr unmanagedBytes = Marshal.AllocCoTaskMem(bytes.Length);
+      Marshal.Copy(bytes, 0, unmanagedBytes, bytes.Length);
+      ok = WritePrinter(hPrinter, unmanagedBytes, bytes.Length, out dwWritten);
+      Marshal.FreeCoTaskMem(unmanagedBytes);
+
+      EndPagePrinter(hPrinter);
+      EndDocPrinter(hPrinter);
+      return ok;
+    } finally {
+      ClosePrinter(hPrinter);
+    }
+  }
+}
+"@
+
+$bytes = [System.IO.File]::ReadAllBytes($FilePath)
+$ok = [RawPrinterHelper]::SendBytesToPrinter($PrinterName, $bytes)
+if (-not $ok) {
+  throw "Failed to send raw data to printer: $PrinterName"
+}
+`;
+
+  fs.writeFileSync(tempPs1, script, 'utf8');
+  try {
+    await execPromise(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tempPs1}" -PrinterName "${safePrinterName}" -FilePath "${safeFilePath}"`);
+  } finally {
+    try {
+      if (fs.existsSync(tempPs1)) fs.unlinkSync(tempPs1);
+    } catch (e) {
+      // ignore cleanup errors
+    }
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     fullscreen: true,
@@ -95,14 +240,10 @@ app.whenReady().then(() => {
     setTimeout(async () => {
       try {
         const ports = await SerialPort.list();
-        // Look for USB scale (common vendor IDs for scales)
-        const scalePorts = ports.filter(port => 
-          port.manufacturer?.match(/CH340|USB.*Serial|FTDI|Silicon/i) ||
-          port.path?.match(/ttyUSB|ttyACM|cu\.usbserial|COM/i)
-        );
+        const bestPort = pickBestScalePort(ports);
         
-        if (scalePorts.length > 0) {
-          const scalePortPath = scalePorts[0].path;
+        if (bestPort) {
+          const scalePortPath = bestPort.path;
           console.log('Auto-connecting to scale on:', scalePortPath);
           
           scalePort = new SerialPort({
@@ -113,7 +254,8 @@ app.whenReady().then(() => {
             parity: 'none'
           });
           
-          scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\r\n' }));
+          // Use '\n' to tolerate devices that send either '\n' or '\r\n'
+          scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\n' }));
           console.log('Scale auto-connected successfully');
         } else {
           console.log('No USB scale detected');
@@ -336,34 +478,13 @@ ipcMain.handle('printer:openDrawer', async () => {
 
     // For Windows, we'll write directly to the printer port
     if (process.platform === 'win32') {
-      // Try multiple methods to open cash drawer on Windows
       try {
-        // Method 1: Write directly to printer using LPT or USB port
-        // Create a temporary raw file with the ESC/POS command
         const tempFile = path.join(app.getPath('temp'), 'drawer_cmd.prn');
         fs.writeFileSync(tempFile, drawerCommand);
-        
-        // Send to printer using copy command
-        try {
-          await execPromise(`copy /B "${tempFile}" "\\\\?\\${printerName}"`);
-          fs.unlinkSync(tempFile);
-          console.log('Cash drawer opened via printer:', printerName);
-          return { success: true, message: 'Cash drawer opened' };
-        } catch (error1) {
-          // Try alternative method using print command
-          try {
-            const tempFile2 = path.join(app.getPath('temp'), 'drawer_cmd2.prn');
-            fs.writeFileSync(tempFile2, drawerCommand);
-            await execPromise(`print /D:"${printerName}" "${tempFile2}"`);
-            fs.unlinkSync(tempFile);
-            fs.unlinkSync(tempFile2);
-            console.log('Cash drawer opened via printer (method 2):', printerName);
-            return { success: true, message: 'Cash drawer opened' };
-          } catch (error2) {
-            fs.unlinkSync(tempFile);
-            throw error2;
-          }
-        }
+        await sendRawFileToPrinterWindows(printerName, tempFile);
+        fs.unlinkSync(tempFile);
+        console.log('Cash drawer opened via printer:', printerName);
+        return { success: true, message: 'Cash drawer opened' };
       } catch (error) {
         console.error('Failed to open drawer:', error);
         return { success: false, error: 'Failed to communicate with printer: ' + error.message };
@@ -586,20 +707,17 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     
     if (process.platform === 'win32') {
       try {
-        await execPromise(`copy /B "${tempFile}" "\\\\?\\${printerName}"`);
+        await sendRawFileToPrinterWindows(printerName, tempFile);
         fs.unlinkSync(tempFile);
         console.log('Receipt printed successfully');
         return { success: true };
       } catch (error) {
         try {
-          await execPromise(`print /D:"${printerName}" "${tempFile}"`);
-          fs.unlinkSync(tempFile);
-          console.log('Receipt printed successfully (method 2)');
-          return { success: true };
-        } catch (error2) {
-          fs.unlinkSync(tempFile);
-          throw error2;
+          if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+        } catch (cleanupError) {
+          // ignore cleanup errors
         }
+        throw error;
       }
     } else {
       // macOS/Linux
@@ -769,7 +887,7 @@ ipcMain.handle('scale:connect', async (event, portPath) => {
       parity: 'none'
     });
 
-    scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\r\n' }));
+    scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\n' }));
 
     return { success: true, message: 'Scale connected successfully' };
   } catch (error) {
@@ -793,13 +911,10 @@ ipcMain.handle('scale:readWeight', async () => {
     console.log('Scale not connected, attempting auto-connect...');
     try {
       const ports = await SerialPort.list();
-      const scalePorts = ports.filter(port => 
-        port.manufacturer?.match(/CH340|USB.*Serial|FTDI|Silicon/i) ||
-        port.path?.match(/ttyUSB|ttyACM|cu\.usbserial|COM/i)
-      );
+      const bestPort = pickBestScalePort(ports);
       
-      if (scalePorts.length > 0) {
-        const scalePortPath = scalePorts[0].path;
+      if (bestPort) {
+        const scalePortPath = bestPort.path;
         console.log('Found scale on:', scalePortPath);
         
         // Close existing port if any
@@ -831,7 +946,7 @@ ipcMain.handle('scale:readWeight', async () => {
           lock: false // Don't lock the port exclusively
         });
         
-        scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\r\n' }));
+        scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\n' }));
         console.log('Scale connected successfully');
         isConnecting = false;
         // Wait a moment for connection to stabilize
