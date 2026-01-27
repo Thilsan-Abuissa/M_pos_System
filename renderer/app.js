@@ -1005,6 +1005,98 @@ function promptForWeight(productId) {
   const scaleButtonContainer = document.getElementById('scaleButtonContainer');
   const weightModeBtn = document.getElementById('weightModeBtn');
   const quantityModeBtn = document.getElementById('quantityModeBtn');
+
+  // Auto-read loop state (keeps weight updated while modal is open)
+  let autoReadTimer = null;
+  let autoReadInFlight = false;
+
+  // Display unit for weight mode
+  let weightUnit = 'kg'; // 'kg' | 'g'
+
+  // Unit price used to derive totals when weight/qty changes.
+  // When the user edits the total price field, we update this.
+  let lockedUnitPrice = product.price;
+
+  function getEnteredUnitPrice() {
+    const rawText = (priceInput.value || '').toString().trim();
+    if (!rawText) return NaN;
+    const normalized = rawText.replace(',', '.');
+    const priceNum = parseFloat(normalized);
+    return Number.isFinite(priceNum) ? priceNum : NaN;
+  }
+
+  function getEnteredTotalPrice() {
+    const rawText = (priceInput.value || '').toString().trim();
+    if (!rawText) return NaN;
+    const normalized = rawText.replace(',', '.');
+    const totalNum = parseFloat(normalized);
+    return Number.isFinite(totalNum) ? totalNum : NaN;
+  }
+
+  function setTotalPriceInput(total) {
+    if (!Number.isFinite(total) || total <= 0) return;
+    if (document.activeElement === priceInput) return; // don't fight typing
+    priceInput.value = total.toFixed(2);
+  }
+
+  function updateDisplayedTotal() {
+    if (isWeightBased) {
+      const weightKg = getEnteredWeightKg();
+      if (!Number.isFinite(weightKg) || weightKg <= 0) {
+        productPriceEl.textContent = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/kg`;
+        return;
+      }
+      const derivedTotal = lockedUnitPrice * weightKg;
+
+      // Keep total price input synced when weight changes (unless user is typing)
+      setTotalPriceInput(derivedTotal);
+
+      productPriceEl.innerHTML = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}${derivedTotal.toFixed(2)}</strong>`;
+      return;
+    }
+
+    const rawQtyText = (weightInput.value || '').toString().trim();
+    const qty = parseFloat(rawQtyText.replace(',', '.'));
+    if (!Number.isFinite(qty) || qty <= 0) {
+      productPriceEl.textContent = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/piece`;
+      return;
+    }
+    const derivedTotal = lockedUnitPrice * qty;
+
+    // Keep total price input synced when quantity changes (unless user is typing)
+    setTotalPriceInput(derivedTotal);
+
+    productPriceEl.innerHTML = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/piece<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}${derivedTotal.toFixed(2)}</strong>`;
+  }
+
+  function getEnteredWeightKg() {
+    const rawText = (weightInput.value || '').toString().trim();
+    if (!rawText) return NaN;
+
+    const normalizedText = rawText.replace(/\s+/g, '');
+    const unitMatch = normalizedText.match(/(kg|g)$/i);
+    const unit = unitMatch ? unitMatch[1].toLowerCase() : null;
+
+    const numericPart = unit ? normalizedText.slice(0, -unit.length) : normalizedText;
+    const hasDecimal = /[\.,]/.test(numericPart);
+    const rawValue = parseFloat(numericPart.replace(',', '.'));
+    if (!Number.isFinite(rawValue)) return NaN;
+
+    // If the user explicitly typed a unit, honor it.
+    if (unit === 'kg') return rawValue;
+    if (unit === 'g') return rawValue / 1000;
+
+    // If user typed a decimal, assume kilograms.
+    if (hasDecimal) return rawValue;
+
+    // If UI is in grams, convert grams -> kg.
+    if (weightUnit === 'g') return rawValue / 1000;
+
+    // Heuristic: large whole numbers are likely grams (e.g. 500 = 500g).
+    if (rawValue >= 100) return rawValue / 1000;
+
+    return rawValue;
+  }
   
   productNameEl.textContent = product.name;
   priceInput.value = product.price.toFixed(2); // Set default price
@@ -1013,22 +1105,24 @@ function promptForWeight(productId) {
   // Function to update UI based on mode
   function updateModeUI() {
     if (isWeightBased) {
+      lockedUnitPrice = product.price;
       modalTitle.textContent = 'Enter Weight';
-      weightInputLabel.textContent = 'Weight (kg)';
+      weightInputLabel.textContent = weightUnit === 'g' ? 'Weight (g)' : 'Weight (kg)';
       weightInput.placeholder = 'Enter weight';
-      priceInputLabel.textContent = `Price per kg (${currencySymbol})`;
-      priceInput.placeholder = 'Price per kg';
+      priceInputLabel.textContent = `Total Price (${currencySymbol})`;
+      priceInput.placeholder = 'Total price';
       productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/kg`;
       scaleButtonContainer.style.display = 'flex';
       weightModeBtn.style.background = '#6E8FAF';
       quantityModeBtn.style.background = '#94a3b8';
       weightInput.value = '';
     } else {
+      lockedUnitPrice = product.price;
       modalTitle.textContent = 'Enter Quantity';
       weightInputLabel.textContent = 'Quantity (pieces)';
       weightInput.placeholder = 'Enter quantity';
-      priceInputLabel.textContent = `Price per piece (${currencySymbol})`;
-      priceInput.placeholder = 'Price per piece';
+      priceInputLabel.textContent = `Total Price (${currencySymbol})`;
+      priceInput.placeholder = 'Total price';
       productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/piece`;
       scaleButtonContainer.style.display = 'none';
       weightModeBtn.style.background = '#94a3b8';
@@ -1036,6 +1130,129 @@ function promptForWeight(productId) {
       weightInput.value = '1';
     }
     // Don't auto-focus - let user click when ready
+
+    // Refresh total display (quantity mode defaults to 1)
+    updateDisplayedTotal();
+  }
+
+  function setWeightDisplayFromKg(weightKg) {
+    if (!Number.isFinite(weightKg) || weightKg <= 0) return;
+
+    if (weightKg < 1) {
+      weightUnit = 'g';
+      const grams = Math.round(weightKg * 1000);
+      weightInputLabel.textContent = 'Weight (g)';
+      weightInput.value = '';
+      weightInput.value = String(grams);
+      weightInput.placeholder = `${grams} g`;
+    } else {
+      weightUnit = 'kg';
+      const kgText = weightKg.toFixed(3);
+      weightInputLabel.textContent = 'Weight (kg)';
+      weightInput.value = '';
+      weightInput.value = kgText;
+      weightInput.placeholder = `${kgText} kg`;
+    }
+
+    updateDisplayedTotal();
+  }
+
+  function handleManualWeightInput() {
+    if (!isWeightBased) return;
+
+    const rawText = (weightInput.value || '').toString().trim();
+    if (!rawText) return;
+
+    const normalizedText = rawText.replace(/\s+/g, '');
+    const unitMatch = normalizedText.match(/(kg|g)$/i);
+    const unit = unitMatch ? unitMatch[1].toLowerCase() : null;
+    const numericPart = unit ? normalizedText.slice(0, -unit.length) : normalizedText;
+
+    const hasDecimal = /[\.,]/.test(numericPart);
+    const rawValue = parseFloat(numericPart.replace(',', '.'));
+    if (!Number.isFinite(rawValue) || rawValue <= 0) return;
+
+    // If user explicitly types a unit, reflect it in the label.
+    if (unit === 'g') {
+      if (weightUnit !== 'g') {
+        weightUnit = 'g';
+        weightInputLabel.textContent = 'Weight (g)';
+      }
+    } else if (unit === 'kg') {
+      if (weightUnit !== 'kg') {
+        weightUnit = 'kg';
+        weightInputLabel.textContent = 'Weight (kg)';
+      }
+    } else if (!hasDecimal && rawValue >= 100) {
+      // Heuristic: big whole numbers like 500 are likely grams.
+      if (weightUnit !== 'g') {
+        weightUnit = 'g';
+        weightInputLabel.textContent = 'Weight (g)';
+      }
+    } else {
+      if (weightUnit !== 'kg') {
+        weightUnit = 'kg';
+        weightInputLabel.textContent = 'Weight (kg)';
+      }
+    }
+
+    updateDisplayedTotal();
+  }
+
+  function handleManualQuantityInput() {
+    if (isWeightBased) return;
+    updateDisplayedTotal();
+  }
+
+  function handleManualPriceInput() {
+    if (isWeightBased) {
+      const weightKg = getEnteredWeightKg();
+      if (!Number.isFinite(weightKg) || weightKg <= 0) return;
+      const total = getEnteredTotalPrice();
+      if (!Number.isFinite(total) || total <= 0) return;
+      lockedUnitPrice = total / weightKg;
+      updateDisplayedTotal();
+      return;
+    }
+
+    const rawQtyText = (weightInput.value || '').toString().trim();
+    const qty = parseFloat(rawQtyText.replace(',', '.'));
+    if (!Number.isFinite(qty) || qty <= 0) return;
+    const total = getEnteredTotalPrice();
+    if (!Number.isFinite(total) || total <= 0) return;
+    lockedUnitPrice = total / qty;
+    updateDisplayedTotal();
+  }
+
+  function stopScaleAutoRead() {
+    if (autoReadTimer) {
+      clearInterval(autoReadTimer);
+      autoReadTimer = null;
+    }
+  }
+
+  function startScaleAutoRead() {
+    if (!isWeightBased) return;
+    if (autoReadTimer) return;
+
+    // Poll the scale periodically to keep the field updated.
+    autoReadTimer = setInterval(async () => {
+      if (!isWeightModalOpen || !isWeightBased) return;
+      if (autoReadInFlight) return;
+      if (document.activeElement === weightInput) return; // don't fight manual typing
+
+      autoReadInFlight = true;
+      try {
+        const weightResult = await window.api.readScaleWeight();
+        if (weightResult && weightResult.success && typeof weightResult.weight === 'number' && weightResult.weight > 0) {
+          setWeightDisplayFromKg(weightResult.weight);
+        }
+      } catch (e) {
+        // Silent during auto-read; manual entry remains available
+      } finally {
+        autoReadInFlight = false;
+      }
+    }, 700);
   }
   
   // Initial UI setup
@@ -1044,20 +1261,34 @@ function promptForWeight(productId) {
   // Toggle button handlers
   weightModeBtn.onclick = () => {
     isWeightBased = true;
+    weightUnit = 'kg';
     updateModeUI();
+
+    weightInput.removeEventListener('input', handleManualQuantityInput);
+    weightInput.addEventListener('input', handleManualWeightInput);
     if (scaleConnected) {
       readWeightFromScale();
     }
+    startScaleAutoRead();
   };
   
   quantityModeBtn.onclick = () => {
     isWeightBased = false;
     updateModeUI();
+    weightInput.removeEventListener('input', handleManualWeightInput);
+    weightInput.addEventListener('input', handleManualQuantityInput);
+    stopScaleAutoRead();
   };
   
   // Automatically read from scale when modal opens (only for weight-based products)
   if (isWeightBased) {
     readWeightFromScale();
+    startScaleAutoRead();
+    weightInput.addEventListener('input', handleManualWeightInput);
+    priceInput.addEventListener('input', handleManualPriceInput);
+  } else {
+    weightInput.addEventListener('input', handleManualQuantityInput);
+    priceInput.addEventListener('input', handleManualPriceInput);
   }
   // Don't auto-focus for quantity products - let user click when ready
   
@@ -1077,14 +1308,8 @@ function promptForWeight(productId) {
       console.log('Weight result:', weightResult);
       
       if (weightResult.success) {
-        const weight = weightResult.weight.toFixed(3); // 3 decimals for precision
-        const totalPrice = (product.price * weightResult.weight).toFixed(2);
-        // Clear the input first, then set the new value
-        weightInput.value = '';
-        weightInput.value = weight;
-        weightInput.placeholder = `${weight} kg`;
-        productPriceEl.innerHTML = `${currencySymbol}${product.price.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}${totalPrice}</strong>`;
-        console.log('Weight read successfully:', weight, 'kg, Total:', totalPrice);
+        setWeightDisplayFromKg(weightResult.weight);
+        console.log('Weight read successfully:', weightResult.weight, 'kg');
         // Select the text so user can easily replace it
         weightInput.select();
         okBtn.focus(); // Focus on Add to Cart button
@@ -1122,7 +1347,7 @@ function promptForWeight(productId) {
     isSubmitting = true;
     
     const weight = weightInput.value.trim(); // Trim whitespace
-    const customPrice = priceInput.value.trim(); // Trim whitespace
+    const customPrice = priceInput.value.trim(); // Trim whitespace (TOTAL price)
     console.log('=== HANDLE OK CLICKED ===');
     console.log('weightInput element:', weightInput);
     console.log('weightInput.value (raw):', weight, 'type:', typeof weight, 'length:', weight.length);
@@ -1137,17 +1362,19 @@ function promptForWeight(productId) {
       return;
     }
     
-    const weightNum = parseFloat(weight);
-    console.log('>>> PARSED weightNum:', weightNum, 'type:', typeof weightNum);
-    if (isNaN(weightNum) || weightNum <= 0) {
+    const amountNum = isWeightBased ? getEnteredWeightKg() : parseFloat(weight);
+    console.log('>>> PARSED amountNum:', amountNum, 'type:', typeof amountNum);
+    if (isNaN(amountNum) || amountNum <= 0) {
       console.log('Invalid value');
       const fieldName = isWeightBased ? 'weight' : 'quantity';
       showAlert(`Please enter a valid ${fieldName}`, 'error', `Invalid ${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`);
       isSubmitting = false;
       return;
     }
+
+
     
-    if (weightNum > product.stock) {
+    if (amountNum > product.stock) {
       console.log('Not enough stock');
       const unit = isWeightBased ? 'kg' : 'pieces';
       showAlert(`Only ${product.stock} ${unit} available in stock`, 'warning', 'Stock Limit');
@@ -1155,22 +1382,29 @@ function promptForWeight(productId) {
       return;
     }
     
-    // Validate custom price
-    const priceNum = parseFloat(customPrice);
-    if (isNaN(priceNum) || priceNum <= 0) {
-      showAlert('Please enter a valid price', 'error', 'Invalid Price');
+    // Validate total price and derive unit price
+    const totalPriceNum = parseFloat(customPrice.replace(',', '.'));
+    if (isNaN(totalPriceNum) || totalPriceNum <= 0) {
+      showAlert('Please enter a valid total price', 'error', 'Invalid Price');
+      isSubmitting = false;
+      return;
+    }
+
+    const unitPriceNum = totalPriceNum / amountNum;
+    if (!Number.isFinite(unitPriceNum) || unitPriceNum <= 0) {
+      showAlert('Please enter a valid total price', 'error', 'Invalid Price');
       isSubmitting = false;
       return;
     }
     
-    console.log('>>> CALLING addToCart with weight:', weightNum, 'price:', priceNum);
+    console.log('>>> CALLING addToCart with amount:', amountNum, 'unit price:', unitPriceNum, 'isWeightBased:', isWeightBased);
     console.log('isSubmitting flag:', isSubmitting);
     
     // Close modal first
     modal.style.display = 'none';
     
     // Call addToCart
-    addToCart(productId, weightNum, priceNum, isWeightBased);
+    addToCart(productId, amountNum, unitPriceNum, isWeightBased);
     
     // Cleanup immediately
     cleanup();
@@ -1192,7 +1426,11 @@ function promptForWeight(productId) {
     okBtn.removeEventListener('click', handleOk);
     cancelBtn.removeEventListener('click', handleCancel);
     weightInput.removeEventListener('keypress', handleEnter);
+    weightInput.removeEventListener('input', handleManualWeightInput);
+    weightInput.removeEventListener('input', handleManualQuantityInput);
+    priceInput.removeEventListener('input', handleManualPriceInput);
     scaleBtn.removeEventListener('click', handleScaleRead);
+    stopScaleAutoRead();
     isWeightModalOpen = false; // Reset flag on cleanup
   };
   

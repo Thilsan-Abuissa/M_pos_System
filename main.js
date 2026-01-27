@@ -19,6 +19,154 @@ let db;
 let scalePort = null;
 let scaleParser = null;
 
+function parseWeightFromScalePayload(payload) {
+  try {
+    const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload || '');
+
+    // Detect units before stripping text
+    const hasKg = /kg/i.test(text);
+    // 'kg' contains 'g', so only treat as grams if NOT kg
+    const hasG = !hasKg && /\bg\b/i.test(text);
+
+    // Normalize: remove common prefixes, units, and whitespace/control chars
+    let clean = text
+      .replace(/\u0000/g, '')
+      .replace(/ST,GS,/gi, '')
+      .replace(/kg/gi, '')
+      .replace(/g/gi, '')
+      .replace(/[\r\n\t]/g, '')
+      .replace(/\s+/g, '');
+
+    // Extract first numeric value (allow comma decimals)
+    const match = clean.match(/([+-]?\d+(?:[\.,]\d+)?)/);
+    if (!match) return null;
+
+    const normalized = match[1].replace(',', '.');
+    const rawValue = Math.abs(parseFloat(normalized));
+    if (!Number.isFinite(rawValue)) return null;
+
+    // Convert to kilograms when needed.
+    // GRAM ZFOC commonly outputs in kg, but some outputs are grams (e.g. 500 => 500g).
+    let weightKg = rawValue;
+    if (hasG) {
+      weightKg = rawValue / 1000;
+    } else if (!hasKg) {
+      // Heuristic: if there's no unit and the number is large, it's likely grams.
+      // This avoids showing 500 kg when the scale is actually 500 g.
+      if (rawValue > 100) weightKg = rawValue / 1000;
+    }
+
+    // Validate weight is reasonable (0.001 kg to 100 kg)
+    if (weightKg >= 0.001 && weightKg <= 100) return weightKg;
+    if (weightKg === 0) return 0;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function openScalePort(portPath, options) {
+  if (!SerialPort || !ReadlineParser) {
+    throw new Error('Serial port modules not available');
+  }
+
+  const baudRate = options?.baudRate ?? 9600;
+  const dataBits = options?.dataBits ?? 8;
+  const stopBits = options?.stopBits ?? 1;
+  const parity = options?.parity ?? 'none';
+  const lock = options?.lock ?? false;
+
+  const port = new SerialPort({
+    path: portPath,
+    baudRate,
+    dataBits,
+    stopBits,
+    parity,
+    lock
+  });
+
+  // Keep a parser around for devices that do send newlines, but don't rely on it.
+  const parser = port.pipe(new ReadlineParser({ delimiter: '\n' }));
+
+  await new Promise((resolve, reject) => {
+    if (port.isOpen) return resolve();
+    port.once('open', resolve);
+    port.once('error', reject);
+  });
+
+  return { port, parser };
+}
+
+async function closeScalePort(port) {
+  if (!port) return;
+  await new Promise((resolve) => {
+    try {
+      if (port.isOpen) {
+        port.close(() => resolve());
+      } else {
+        resolve();
+      }
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function readWeightFromOpenPortOnce(port, timeoutMs) {
+  return await new Promise((resolve) => {
+    let done = false;
+    const chunks = [];
+
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+      try {
+        port.removeListener('data', onData);
+      } catch {
+        // ignore
+      }
+      resolve(result);
+    };
+
+    const onData = (data) => {
+      chunks.push(data);
+      const combined = Buffer.concat(chunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))));
+      const weight = parseWeightFromScalePayload(combined);
+      if (weight === null) return;
+      if (weight === 0) {
+        finish({ success: false, message: 'Scale shows 0. Please place item on scale.' });
+      } else {
+        finish({ success: true, weight });
+      }
+    };
+
+    port.on('data', onData);
+    const timeout = setTimeout(() => finish({ success: false, message: 'Timeout reading from scale' }), timeoutMs);
+
+    // Try multiple commands that some scales might respond to
+    try {
+      port.write('P\r\n');
+      setTimeout(() => {
+        try {
+          port.write('W\r\n');
+        } catch {
+          // ignore
+        }
+      }, 600);
+      setTimeout(() => {
+        try {
+          port.write(Buffer.from([0x05])); // ENQ (some devices)
+        } catch {
+          // ignore
+        }
+      }, 1200);
+    } catch {
+      // ignore
+    }
+  });
+}
+
 function pickBestScalePort(ports) {
   if (!Array.isArray(ports) || ports.length === 0) return null;
 
@@ -901,15 +1049,9 @@ ipcMain.handle('scale:connect', async (event, portPath) => {
       scalePort.close();
     }
 
-    scalePort = new SerialPort({
-      path: portPath,
-      baudRate: 9600,
-      dataBits: 8,
-      stopBits: 1,
-      parity: 'none'
-    });
-
-    scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\n' }));
+    const opened = await openScalePort(portPath, { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none', lock: false });
+    scalePort = opened.port;
+    scaleParser = opened.parser;
 
     return { success: true, message: 'Scale connected successfully' };
   } catch (error) {
@@ -959,20 +1101,58 @@ ipcMain.handle('scale:readWeight', async () => {
           }
         }
         
-        scalePort = new SerialPort({
-          path: scalePortPath,
-          baudRate: 9600,
-          dataBits: 8,
-          stopBits: 1,
-          parity: 'none',
-          lock: false // Don't lock the port exclusively
-        });
-        
-        scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\n' }));
-        console.log('Scale connected successfully');
+        // Try common serial configurations used by RS232 scales.
+        // Many GRAM/RS232 setups are 9600 8N1, but some are 4800/2400 or 7E1.
+        const configsToTry = [
+          { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' },
+          { baudRate: 4800, dataBits: 8, stopBits: 1, parity: 'none' },
+          { baudRate: 2400, dataBits: 8, stopBits: 1, parity: 'none' },
+          { baudRate: 19200, dataBits: 8, stopBits: 1, parity: 'none' },
+          { baudRate: 9600, dataBits: 7, stopBits: 1, parity: 'even' },
+          { baudRate: 4800, dataBits: 7, stopBits: 1, parity: 'even' },
+          { baudRate: 2400, dataBits: 7, stopBits: 1, parity: 'even' },
+          { baudRate: 9600, dataBits: 7, stopBits: 2, parity: 'even' }
+        ];
+        let lastError = null;
+
+        for (const cfg of configsToTry) {
+          try {
+            const opened = await openScalePort(scalePortPath, { ...cfg, lock: false });
+            scalePort = opened.port;
+            scaleParser = opened.parser;
+            console.log('Scale connected successfully using:', cfg);
+
+            // Quick probe read to validate we can parse data
+            const probe = await readWeightFromOpenPortOnce(scalePort, 2000);
+            if (probe && probe.success) {
+              isConnecting = false;
+              return probe;
+            }
+
+            // Some scales may be on but show 0; still treat as connected
+            if (probe && typeof probe.message === 'string' && probe.message.includes('0')) {
+              isConnecting = false;
+              return probe;
+            }
+
+            // No usable data; close and try next baud
+            await closeScalePort(scalePort);
+            scalePort = null;
+            scaleParser = null;
+          } catch (e) {
+            lastError = e;
+            try {
+              await closeScalePort(scalePort);
+            } catch {
+              // ignore
+            }
+            scalePort = null;
+            scaleParser = null;
+          }
+        }
+
         isConnecting = false;
-        // Wait a moment for connection to stabilize
-        await new Promise(resolve => setTimeout(resolve, 500));
+        return { success: false, message: 'Failed to connect/read from scale' + (lastError ? (': ' + lastError.message) : '') };
       } else {
         isConnecting = false;
         return { success: false, message: 'No scale found. Please connect USB scale.' };
@@ -983,73 +1163,14 @@ ipcMain.handle('scale:readWeight', async () => {
       return { success: false, message: 'Failed to connect to scale: ' + error.message };
     }
   }
-  
-  return new Promise((resolve, reject) => {
-    if (!scalePort || !scalePort.isOpen) {
-      resolve({ success: false, message: 'Scale not connected' });
-      return;
-    }
 
-    let timeout = setTimeout(() => {
-      resolve({ success: false, message: 'Timeout reading from scale' });
-    }, 10000); // Increased to 10 seconds to allow more time for scale response
+  if (!scalePort || !scalePort.isOpen) {
+    return { success: false, message: 'Scale not connected' };
+  }
 
-    const dataHandler = (data) => {
-      clearTimeout(timeout);
-      scaleParser.removeListener('data', dataHandler);
-      
-      console.log('Raw scale data:', data);
-      
-      // Parse weight from scale data
-      // GRAM ZFOC can send various formats:
-      // "  0.500 kg", "0.500", "ST,GS,+0.500kg", etc.
-      
-      // Remove common prefixes and suffixes
-      let cleanData = data.replace(/ST,GS,/g, '').replace(/kg/gi, '').replace(/\s+/g, '');
-      
-      // Extract number (handle both positive and negative)
-      const match = cleanData.match(/([+-]?\d+\.?\d*)/);
-      if (match) {
-        const weight = Math.abs(parseFloat(match[1])); // Use absolute value
-        
-        // Validate weight is reasonable (0.001 kg to 100 kg)
-        if (weight >= 0.001 && weight <= 100) {
-          console.log('Parsed weight:', weight);
-          resolve({ success: true, weight: weight });
-        } else if (weight === 0) {
-          resolve({ success: false, message: 'Scale shows 0. Please place item on scale.' });
-        } else {
-          resolve({ success: false, message: 'Weight out of range: ' + weight });
-        }
-      } else {
-        resolve({ success: false, message: 'Could not parse weight data: ' + data });
-      }
-    };
-
-    scaleParser.on('data', dataHandler);
-
-    // Try multiple commands that GRAM scales might respond to
-    try {
-      scalePort.write('P\r\n'); // Request weight
-      
-      // Some scales respond without needing a command
-      // If no response after 1 second, try alternative command
-      setTimeout(() => {
-        if (scalePort && scalePort.isOpen) {
-          try {
-            scalePort.write('W\r\n'); // Alternative weight request
-          } catch (e) {
-            console.error('Error sending alternative command:', e);
-          }
-        }
-      }, 1000);
-      
-    } catch (error) {
-      clearTimeout(timeout);
-      scaleParser.removeListener('data', dataHandler);
-      resolve({ success: false, message: 'Error writing to scale' });
-    }
-  });
+  // Read raw bytes directly; works even if the device doesn't send newlines.
+  const result = await readWeightFromOpenPortOnce(scalePort, 5000);
+  return result;
 });
 
 // Disconnect scale

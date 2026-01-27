@@ -1477,20 +1477,17 @@
       
       <div style="margin: 20px 0;">
         <label id="weightInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Quantity (pieces)</label>
-        <input type="number" id="weightInput" 
+        <input type="text" id="weightInput" inputmode="decimal" autocomplete="off"
                style="width: 100%; padding: 15px; font-size: 24px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;" 
                placeholder="Enter quantity" 
-               step="0.01" 
-               min="0.01"
                autofocus>
       </div>
       <div style="margin: 20px 0;">
         <label id="priceInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Price per piece (€)</label>
-        <input type="number" id="weightPriceInput" 
+         <input type="text" id="weightPriceInput" inputmode="decimal" autocomplete="off"
                style="width: 100%; padding: 15px; font-size: 20px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;" 
                placeholder="Price per piece" 
-               step="0.01" 
-               min="0.01">
+           >
         <small style="display: block; color: #64748b; margin-top: 5px; text-align: center;">Modify price only for this sale</small>
       </div>
       <div id="scaleButtonContainer" style="display: flex; gap: 12px; margin-bottom: 12px;">
