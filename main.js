@@ -628,6 +628,7 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     const { exec } = require('child_process');
     const { promisify } = require('util');
     const execPromise = promisify(exec);
+    const iconv = require('iconv-lite');
 
     // Format receipt for thermal printer (ESC/POS)
     const ESC = '\x1B';
@@ -637,6 +638,9 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     
     // Initialize printer
     receipt += ESC + '@'; // Initialize
+    // Select character code table that supports € and Western European characters.
+    // ESC t n => n=16 is commonly WPC1252 on ESC/POS printers.
+    receipt += ESC + 't' + '\x10';
     receipt += ESC + 'a' + '\x01'; // Center align
     
     // Store name (bold, large)
@@ -681,15 +685,31 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     receipt += '--------------------------------\n';
     
     // Totals
-    receipt += `Subtotal:`.padEnd(20) + `${receiptData.currency}${receiptData.subtotal.toFixed(2)}`.padStart(12) + '\n';
-    receipt += `Tax:`.padEnd(20) + `${receiptData.currency}${receiptData.tax.toFixed(2)}`.padStart(12) + '\n';
+    receipt += `Subtotal (Base):`.padEnd(20) + `${receiptData.currency}${receiptData.subtotal.toFixed(2)}`.padStart(12) + '\n';
+
+    // IVA breakdown (if provided)
+    if (Array.isArray(receiptData.taxBreakdown) && receiptData.taxBreakdown.length > 0) {
+      receiptData.taxBreakdown.forEach(row => {
+        const rate = (row && typeof row.rate === 'number') ? row.rate : 0;
+        const base = (row && typeof row.base === 'number') ? row.base : 0;
+        const tax = (row && typeof row.tax === 'number') ? row.tax : 0;
+        const total = (row && typeof row.total === 'number') ? row.total : 0;
+
+        receipt += `IVA ${rate}%\n`;
+        receipt += `Base: ${receiptData.currency}${base.toFixed(2)}\n`;
+        receipt += `Cuota: ${receiptData.currency}${tax.toFixed(2)}\n`;
+        receipt += `Total: ${receiptData.currency}${total.toFixed(2)}\n`;
+      });
+    }
+
+    receipt += `Total Tax:`.padEnd(20) + `${receiptData.currency}${receiptData.tax.toFixed(2)}`.padStart(12) + '\n';
     
     // Total (bold)
     receipt += ESC + 'E' + '\x01'; // Bold on
     receipt += `TOTAL:`.padEnd(20) + `${receiptData.currency}${receiptData.total.toFixed(2)}`.padStart(12) + '\n';
     receipt += ESC + 'E' + '\x00'; // Bold off
     
-    receipt += `Payment: ${receiptData.paymentMethod.toUpperCase()}\n`;
+    receipt += `Payment Method:`.padEnd(20) + `${receiptData.paymentMethod.toUpperCase()}`.padStart(12) + '\n';
     receipt += '--------------------------------\n';
     
     // Footer
@@ -703,7 +723,9 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     
     // Write to temp file and send to printer
     const tempFile = path.join(app.getPath('temp'), 'receipt_' + Date.now() + '.prn');
-    fs.writeFileSync(tempFile, receipt);
+    // Write as single-byte encoded buffer (NOT UTF-8) so the printer receives the intended codepage bytes.
+    const receiptBuffer = iconv.encode(receipt, 'cp1252');
+    fs.writeFileSync(tempFile, receiptBuffer);
     
     if (process.platform === 'win32') {
       try {

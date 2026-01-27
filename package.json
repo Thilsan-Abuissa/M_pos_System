@@ -27,6 +27,7 @@
   "dependencies": {
     "@serialport/parser-readline": "^13.0.0",
     "better-sqlite3": "^11.10.0",
+    "iconv-lite": "^0.6.3",
     "serialport": "^13.0.0"
   },
   "build": {

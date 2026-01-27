@@ -4041,6 +4041,9 @@ function setupModalHandlers() {
           await openCashDrawer();
         }
       }
+
+      // Close receipt modal after print action
+      closeModal('receiptModal');
       
       // Reset flag after 2 seconds
       setTimeout(() => {
@@ -4956,6 +4959,38 @@ async function printReceiptToThermalPrinter(sale) {
     const companyAddress = systemSettings?.company_address || '';
     const currencySymbol = systemSettings?.currency_symbol || '$';
     const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
+
+    // Calculate tax breakdown by rate (to match the on-screen receipt)
+    const taxBreakdown = {};
+    (sale.items || []).forEach(item => {
+      const product = allProducts.find(p => p.id === item.product_id);
+      if (!product) return;
+      const category = allCategories.find(c => c.name === product.category);
+      const taxRate = category ? category.tax_rate : 0;
+      const taxRatePercent = Math.round(taxRate * 100);
+
+      const basePrice = item.subtotal / (1 + taxRate);
+      const taxAmount = item.subtotal - basePrice;
+
+      if (!taxBreakdown[taxRatePercent]) {
+        taxBreakdown[taxRatePercent] = { base: 0, tax: 0, total: 0 };
+      }
+
+      taxBreakdown[taxRatePercent].base += basePrice;
+      taxBreakdown[taxRatePercent].tax += taxAmount;
+      taxBreakdown[taxRatePercent].total += item.subtotal;
+    });
+
+    const taxBreakdownRows = Object.keys(taxBreakdown)
+      .map(r => parseInt(r, 10))
+      .filter(r => Number.isFinite(r))
+      .sort((a, b) => a - b)
+      .map(rate => ({
+        rate,
+        base: taxBreakdown[rate].base,
+        tax: taxBreakdown[rate].tax,
+        total: taxBreakdown[rate].total
+      }));
     
     const receiptData = {
       storeName: storeName,
@@ -4972,6 +5007,7 @@ async function printReceiptToThermalPrinter(sale) {
       subtotal: sale.subtotal,
       tax: sale.tax,
       total: sale.total,
+      taxBreakdown: taxBreakdownRows,
       paymentMethod: sale.payment_method,
       currency: currencySymbol,
       footer: receiptFooter,
