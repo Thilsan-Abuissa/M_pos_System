@@ -1043,7 +1043,10 @@ function promptForWeight(productId) {
     if (isWeightBased) {
       const weightKg = getEnteredWeightKg();
       if (!Number.isFinite(weightKg) || weightKg <= 0) {
-        productPriceEl.textContent = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/kg`;
+        if (document.activeElement !== priceInput) {
+          priceInput.value = '0.00';
+        }
+        productPriceEl.innerHTML = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}0.00</strong>`;
         return;
       }
       const derivedTotal = lockedUnitPrice * weightKg;
@@ -1099,7 +1102,6 @@ function promptForWeight(productId) {
   }
   
   productNameEl.textContent = product.name;
-  priceInput.value = product.price.toFixed(2); // Set default price
   modal.style.display = 'flex';
   
   // Function to update UI based on mode
@@ -1111,7 +1113,10 @@ function promptForWeight(productId) {
       weightInput.placeholder = 'Enter weight';
       priceInputLabel.textContent = `Total Price (${currencySymbol})`;
       priceInput.placeholder = 'Total price';
-      productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/kg`;
+      if (document.activeElement !== priceInput) {
+        priceInput.value = '0.00';
+      }
+      productPriceEl.innerHTML = `${currencySymbol}${product.price.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}0.00</strong>`;
       scaleButtonContainer.style.display = 'flex';
       weightModeBtn.style.background = '#6E8FAF';
       quantityModeBtn.style.background = '#94a3b8';
@@ -1315,11 +1320,16 @@ function promptForWeight(productId) {
         okBtn.focus(); // Focus on Add to Cart button
       } else {
         console.error('Failed to read weight:', weightResult.message);
-        weightInput.placeholder = 'Enter weight manually';
+        const msg = (weightResult && weightResult.message) ? String(weightResult.message) : '';
+        weightInput.placeholder = msg ? msg : 'Enter weight manually';
         
         // Show specific error message only for zero weight
-        if (weightResult.message.includes('0')) {
+        if (msg.includes('0')) {
           showAlert('Scale shows 0 kg. Please place the product on the scale.', 'info', 'No Weight');
+        }
+        // Show connection-related errors
+        if (/no scale found|not connected|failed to connect|connect usb scale/i.test(msg)) {
+          showAlert(msg, 'warning', 'Scale');
         }
         // Timeout and other errors - no popup, just set placeholder
       }

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, screen } = require('electron');
 const path = require('path');
 const Database = require('./database');
 
@@ -18,6 +18,58 @@ let customerDisplayWindow;
 let db;
 let scalePort = null;
 let scaleParser = null;
+
+// Track scale state for streaming (some scales output continuously)
+let scaleState = {
+  portPath: null,
+  config: null,
+  lastWeightKg: null,
+  lastRawText: '',
+  lastUpdatedAt: 0,
+  lastError: null
+};
+
+function truncateForUi(text, maxLen) {
+  const s = (text || '').toString();
+  if (s.length <= maxLen) return s;
+  return s.slice(0, Math.max(0, maxLen - 1)) + '…';
+}
+
+function attachScaleStreaming(port) {
+  if (!port) return;
+  if (port.__scaleStreamingAttached) return;
+  port.__scaleStreamingAttached = true;
+
+  port.on('data', (data) => {
+    try {
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+      const text = buf.toString('utf8');
+      // Keep a rolling window of recent raw text
+      const combined = (scaleState.lastRawText || '') + text;
+      scaleState.lastRawText = combined.slice(-800);
+      scaleState.lastUpdatedAt = Date.now();
+
+      const weight = parseWeightFromScalePayload(scaleState.lastRawText);
+      if (typeof weight === 'number') {
+        scaleState.lastWeightKg = weight;
+      }
+    } catch {
+      // ignore
+    }
+  });
+
+  port.on('error', (err) => {
+    scaleState.lastError = err ? String(err.message || err) : 'Unknown scale error';
+  });
+
+  port.on('close', () => {
+    // Keep last known values, but mark as disconnected
+    if (scalePort === port) {
+      scalePort = null;
+      scaleParser = null;
+    }
+  });
+}
 
 function parseWeightFromScalePayload(payload) {
   try {
@@ -76,13 +128,19 @@ async function openScalePort(portPath, options) {
   const parity = options?.parity ?? 'none';
   const lock = options?.lock ?? false;
 
+  // Some USB-RS232 bridges / scales require DTR/RTS asserted.
+  const dtr = options?.dtr ?? true;
+  const rts = options?.rts ?? true;
+
   const port = new SerialPort({
     path: portPath,
     baudRate,
     dataBits,
     stopBits,
     parity,
-    lock
+    lock,
+    // Ensure we don't miss continuous streams due to buffering
+    highWaterMark: 64 * 1024
   });
 
   // Keep a parser around for devices that do send newlines, but don't rely on it.
@@ -93,6 +151,18 @@ async function openScalePort(portPath, options) {
     port.once('open', resolve);
     port.once('error', reject);
   });
+
+  // Best-effort modem control lines
+  try {
+    if (typeof port.set === 'function') {
+      port.set({ dtr, rts }, () => {});
+    }
+  } catch {
+    // ignore
+  }
+
+  // Attach streaming listener so we can capture continuous output
+  attachScaleStreaming(port);
 
   return { port, parser };
 }
@@ -142,33 +212,51 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
     };
 
     port.on('data', onData);
-    const timeout = setTimeout(() => finish({ success: false, message: 'Timeout reading from scale' }), timeoutMs);
+    const timeout = setTimeout(() => {
+      const raw = Buffer.concat(chunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(String(c))))).toString('utf8');
+      finish({
+        success: false,
+        message: 'Timeout reading from scale',
+        rawSample: truncateForUi(raw.replace(/[\r\n\t\0]/g, ' '), 120),
+        bytesReceived: chunks.reduce((acc, c) => acc + (Buffer.isBuffer(c) ? c.length : Buffer.byteLength(String(c))), 0)
+      });
+    }, timeoutMs);
 
-    // Try multiple commands that some scales might respond to
-    try {
-      port.write('P\r\n');
+    // If the scale is streaming continuously, we may get data without commands.
+    // After a short delay, try common poll commands for scales that require it.
+    const tryWrites = () => {
+      try {
+        port.write('P\r\n');
+      } catch {
+        // ignore
+      }
       setTimeout(() => {
         try {
           port.write('W\r\n');
         } catch {
           // ignore
         }
-      }, 600);
+      }, 350);
       setTimeout(() => {
         try {
           port.write(Buffer.from([0x05])); // ENQ (some devices)
         } catch {
           // ignore
         }
-      }, 1200);
-    } catch {
-      // ignore
-    }
+      }, 700);
+    };
+
+    setTimeout(tryWrites, 250);
   });
 }
 
 function pickBestScalePort(ports) {
-  if (!Array.isArray(ports) || ports.length === 0) return null;
+  const ranked = rankScalePorts(ports);
+  return ranked.length > 0 ? ranked[0] : null;
+}
+
+function rankScalePorts(ports) {
+  if (!Array.isArray(ports) || ports.length === 0) return [];
 
   const scored = ports
     .map((port) => {
@@ -176,21 +264,20 @@ function pickBestScalePort(ports) {
       const pnpId = (port.pnpId || '').toString();
       const pathVal = (port.path || '').toString();
 
-      const manufacturerLower = manufacturer.toLowerCase();
       const pnpIdLower = pnpId.toLowerCase();
       const pathLower = pathVal.toLowerCase();
 
       let score = 0;
 
       // Strong signals for USB-serial adapters commonly used by scales
-      if (/ch340|usb.*serial|ftdi|silicon/i.test(manufacturer)) score += 200;
+      if (/ch340|usb.*serial|ftdi|silicon|prolific|cp210/i.test(manufacturer)) score += 200;
       if (pnpIdLower.includes('usb')) score += 150;
       if (pnpIdLower.includes('vid_')) score += 50;
       if (port.vendorId || port.productId) score += 30;
 
       // Port name patterns
-      if (/^com\d+$/i.test(pathVal)) score += 20;
-      if (/ttyusb|ttyacm|cu\.usbserial/i.test(pathLower)) score += 20;
+      if (/^com\d+$/i.test(pathVal)) score += 25;
+      if (/ttyusb|ttyacm|cu\.usbserial|cu\.wchusbserial/i.test(pathLower)) score += 25;
 
       // Penalize built-in motherboard COM ports
       if (pnpIdLower.includes('acpi') || pnpIdLower.includes('pci')) score -= 200;
@@ -207,14 +294,14 @@ function pickBestScalePort(ports) {
       const pnpId = (port.pnpId || '').toString();
       const pathVal = (port.path || '').toString();
       return (
-        /CH340|USB.*Serial|FTDI|Silicon/i.test(manufacturer) ||
+        /CH340|USB.*Serial|FTDI|Silicon|Prolific|CP210/i.test(manufacturer) ||
         /USB/i.test(pnpId) ||
-        /ttyUSB|ttyACM|cu\.usbserial|^COM\d+$/i.test(pathVal)
+        /ttyUSB|ttyACM|cu\.usbserial|cu\.wchusbserial|^COM\d+$/i.test(pathVal)
       );
     })
     .sort((a, b) => b.score - a.score);
 
-  return scored.length > 0 ? scored[0].port : null;
+  return scored.map((s) => s.port);
 }
 
 async function sendRawFileToPrinterWindows(printerName, filePath) {
@@ -350,11 +437,26 @@ function createCustomerDisplay() {
     return;
   }
 
+  // If there is a second display, open the customer display there and fill it.
+  const displays = screen?.getAllDisplays?.() || [];
+  const targetDisplay = displays.length > 1 ? displays[1] : (screen?.getPrimaryDisplay?.() || null);
+  const targetBounds = targetDisplay?.bounds;
+  const initialWindowOpts = targetBounds
+    ? {
+        x: targetBounds.x,
+        y: targetBounds.y,
+        width: targetBounds.width,
+        height: targetBounds.height
+      }
+    : {
+        width: 800,
+        height: 600,
+        minWidth: 600,
+        minHeight: 400
+      };
+
   customerDisplayWindow = new BrowserWindow({
-    width: 800,
-    height: 600,
-    minWidth: 600,
-    minHeight: 400,
+    ...initialWindowOpts,
     title: 'Customer Display',
     webPreferences: {
       nodeIntegration: true,
@@ -365,6 +467,12 @@ function createCustomerDisplay() {
 
   customerDisplayWindow.loadFile('renderer/customer-display.html');
   customerDisplayWindow.setMenuBarVisibility(false);
+
+  // Ensure it fills the chosen display.
+  if (targetBounds) {
+    customerDisplayWindow.setBounds(targetBounds);
+    customerDisplayWindow.maximize();
+  }
 
   customerDisplayWindow.on('closed', () => {
     customerDisplayWindow = null;
@@ -393,17 +501,14 @@ app.whenReady().then(() => {
         if (bestPort) {
           const scalePortPath = bestPort.path;
           console.log('Auto-connecting to scale on:', scalePortPath);
-          
-          scalePort = new SerialPort({
-            path: scalePortPath,
-            baudRate: 9600,
-            dataBits: 8,
-            stopBits: 1,
-            parity: 'none'
-          });
-          
-          // Use '\n' to tolerate devices that send either '\n' or '\r\n'
-          scaleParser = scalePort.pipe(new ReadlineParser({ delimiter: '\n' }));
+
+          const cfg = { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none', lock: false };
+          const opened = await openScalePort(scalePortPath, cfg);
+          scalePort = opened.port;
+          scaleParser = opened.parser;
+          scaleState.portPath = scalePortPath;
+          scaleState.config = cfg;
+          scaleState.lastError = null;
           console.log('Scale auto-connected successfully');
         } else {
           console.log('No USB scale detected');
@@ -1053,6 +1158,10 @@ ipcMain.handle('scale:connect', async (event, portPath) => {
     scalePort = opened.port;
     scaleParser = opened.parser;
 
+    scaleState.portPath = portPath;
+    scaleState.config = { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' };
+    scaleState.lastError = null;
+
     return { success: true, message: 'Scale connected successfully' };
   } catch (error) {
     console.error('Error connecting to scale:', error);
@@ -1062,10 +1171,32 @@ ipcMain.handle('scale:connect', async (event, portPath) => {
 
 // Read weight from scale
 let isConnecting = false; // Prevent multiple simultaneous connections
+let lastScaleAutoScanAt = 0;
+let lastScaleAutoScanResult = null;
 
 ipcMain.handle('scale:readWeight', async () => {
+  // If we recently received streaming data, return immediately.
+  if (scalePort && scalePort.isOpen && typeof scaleState.lastWeightKg === 'number') {
+    const ageMs = Date.now() - (scaleState.lastUpdatedAt || 0);
+    if (ageMs >= 0 && ageMs <= 1500 && scaleState.lastWeightKg > 0) {
+      return {
+        success: true,
+        weight: scaleState.lastWeightKg,
+        portPath: scaleState.portPath,
+        config: scaleState.config,
+        source: 'stream'
+      };
+    }
+  }
+
   // Auto-connect to scale if not connected
   if (SerialPort && ReadlineParser && (!scalePort || !scalePort.isOpen)) {
+    // Avoid hammering SerialPort.list() when the UI polls frequently.
+    const now = Date.now();
+    if (lastScaleAutoScanResult && now - lastScaleAutoScanAt < 1500) {
+      return lastScaleAutoScanResult;
+    }
+
     if (isConnecting) {
       console.log('Already attempting to connect, waiting...');
       return { success: false, message: 'Connection in progress, please wait' };
@@ -1075,92 +1206,116 @@ ipcMain.handle('scale:readWeight', async () => {
     console.log('Scale not connected, attempting auto-connect...');
     try {
       const ports = await SerialPort.list();
-      const bestPort = pickBestScalePort(ports);
+      const rankedPorts = rankScalePorts(ports);
+      const candidates = rankedPorts.length > 0 ? rankedPorts : [];
       
-      if (bestPort) {
-        const scalePortPath = bestPort.path;
-        console.log('Found scale on:', scalePortPath);
-        
-        // Close existing port if any
-        if (scalePort) {
-          try {
-            if (scalePort.isOpen) {
-              await new Promise((resolve) => {
-                scalePort.close((err) => {
-                  if (err) console.log('Error closing old port:', err.message);
-                  resolve();
-                });
-              });
-            }
-            scalePort = null;
-            scaleParser = null;
-          } catch (e) {
-            console.log('Error closing old port:', e.message);
-            scalePort = null;
-            scaleParser = null;
-          }
-        }
+      if (candidates.length > 0) {
+        console.log('Scale candidates:', candidates.map(p => p.path).join(', '));
         
         // Try common serial configurations used by RS232 scales.
         // Many GRAM/RS232 setups are 9600 8N1, but some are 4800/2400 or 7E1.
         const configsToTry = [
           { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' },
+          { baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none' },
+          { baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none' },
           { baudRate: 4800, dataBits: 8, stopBits: 1, parity: 'none' },
           { baudRate: 2400, dataBits: 8, stopBits: 1, parity: 'none' },
           { baudRate: 19200, dataBits: 8, stopBits: 1, parity: 'none' },
+          { baudRate: 9600, dataBits: 8, stopBits: 2, parity: 'none' },
+          { baudRate: 4800, dataBits: 8, stopBits: 2, parity: 'none' },
           { baudRate: 9600, dataBits: 7, stopBits: 1, parity: 'even' },
           { baudRate: 4800, dataBits: 7, stopBits: 1, parity: 'even' },
           { baudRate: 2400, dataBits: 7, stopBits: 1, parity: 'even' },
-          { baudRate: 9600, dataBits: 7, stopBits: 2, parity: 'even' }
+          { baudRate: 9600, dataBits: 7, stopBits: 2, parity: 'even' },
+          { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'even' },
+          { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'odd' }
         ];
         let lastError = null;
 
-        for (const cfg of configsToTry) {
-          try {
-            const opened = await openScalePort(scalePortPath, { ...cfg, lock: false });
-            scalePort = opened.port;
-            scaleParser = opened.parser;
-            console.log('Scale connected successfully using:', cfg);
+        for (const candidatePort of candidates) {
+          const scalePortPath = candidatePort.path;
+          console.log('Trying scale port:', scalePortPath);
 
-            // Quick probe read to validate we can parse data
-            const probe = await readWeightFromOpenPortOnce(scalePort, 2000);
-            if (probe && probe.success) {
-              isConnecting = false;
-              return probe;
-            }
-
-            // Some scales may be on but show 0; still treat as connected
-            if (probe && typeof probe.message === 'string' && probe.message.includes('0')) {
-              isConnecting = false;
-              return probe;
-            }
-
-            // No usable data; close and try next baud
-            await closeScalePort(scalePort);
-            scalePort = null;
-            scaleParser = null;
-          } catch (e) {
-            lastError = e;
+          // Close existing port if any (per attempt)
+          if (scalePort) {
             try {
-              await closeScalePort(scalePort);
+              if (scalePort.isOpen) {
+                await new Promise((resolve) => {
+                  scalePort.close((err) => {
+                    if (err) console.log('Error closing old port:', err.message);
+                    resolve();
+                  });
+                });
+              }
             } catch {
               // ignore
             }
             scalePort = null;
             scaleParser = null;
           }
+
+          for (const cfg of configsToTry) {
+            try {
+              const opened = await openScalePort(scalePortPath, { ...cfg, lock: false });
+              scalePort = opened.port;
+              scaleParser = opened.parser;
+              console.log('Scale connected successfully using:', cfg, 'on', scalePortPath);
+
+              scaleState.portPath = scalePortPath;
+              scaleState.config = cfg;
+              scaleState.lastError = null;
+
+              // Quick probe read to validate we can parse data
+              // Give a bit of time for streaming scales to send a frame.
+              const probe = await readWeightFromOpenPortOnce(scalePort, 3000);
+              if (probe && probe.success) {
+                isConnecting = false;
+                lastScaleAutoScanAt = Date.now();
+                lastScaleAutoScanResult = { ...probe, portPath: scalePortPath, config: cfg, source: 'probe' };
+                return lastScaleAutoScanResult;
+              }
+
+              // Some scales may be on but show 0; still treat as connected
+              if (probe && typeof probe.message === 'string' && probe.message.includes('0')) {
+                isConnecting = false;
+                lastScaleAutoScanAt = Date.now();
+                lastScaleAutoScanResult = { ...probe, portPath: scalePortPath, config: cfg, source: 'probe' };
+                return lastScaleAutoScanResult;
+              }
+
+              // No usable data; close and try next config
+              await closeScalePort(scalePort);
+              scalePort = null;
+              scaleParser = null;
+            } catch (e) {
+              lastError = e;
+              try {
+                await closeScalePort(scalePort);
+              } catch {
+                // ignore
+              }
+              scalePort = null;
+              scaleParser = null;
+            }
+          }
         }
 
         isConnecting = false;
-        return { success: false, message: 'Failed to connect/read from scale' + (lastError ? (': ' + lastError.message) : '') };
+        lastScaleAutoScanAt = Date.now();
+        lastScaleAutoScanResult = { success: false, message: 'Failed to connect/read from scale' + (lastError ? (': ' + lastError.message) : '') };
+        return lastScaleAutoScanResult;
       } else {
         isConnecting = false;
-        return { success: false, message: 'No scale found. Please connect USB scale.' };
+        lastScaleAutoScanAt = Date.now();
+        lastScaleAutoScanResult = { success: false, message: 'No scale found. Please connect USB scale.' };
+        return lastScaleAutoScanResult;
       }
     } catch (error) {
       console.error('Error connecting to scale:', error);
       isConnecting = false;
-      return { success: false, message: 'Failed to connect to scale: ' + error.message };
+      lastScaleAutoScanAt = Date.now();
+      lastScaleAutoScanResult = { success: false, message: 'Failed to connect to scale: ' + error.message };
+      return lastScaleAutoScanResult;
     }
   }
 
@@ -1169,8 +1324,16 @@ ipcMain.handle('scale:readWeight', async () => {
   }
 
   // Read raw bytes directly; works even if the device doesn't send newlines.
-  const result = await readWeightFromOpenPortOnce(scalePort, 5000);
-  return result;
+  const result = await readWeightFromOpenPortOnce(scalePort, 6000);
+  if (!result.success) {
+    const details = [];
+    if (scaleState.portPath) details.push(`Port: ${scaleState.portPath}`);
+    if (scaleState.config && scaleState.config.baudRate) details.push(`Baud: ${scaleState.config.baudRate}`);
+    if (result.rawSample) details.push(`Raw: ${result.rawSample}`);
+    const suffix = details.length ? ` (${details.join(' | ')})` : '';
+    return { ...result, message: (result.message || 'Failed to read from scale') + suffix, portPath: scaleState.portPath, config: scaleState.config };
+  }
+  return { ...result, portPath: scaleState.portPath, config: scaleState.config, source: 'read' };
 });
 
 // Disconnect scale
@@ -1186,10 +1349,18 @@ ipcMain.handle('scale:disconnect', async () => {
     }
     scalePort = null;
     scaleParser = null;
+    scaleState.portPath = null;
+    scaleState.config = null;
+    scaleState.lastWeightKg = null;
+    scaleState.lastRawText = '';
+    scaleState.lastUpdatedAt = 0;
+    scaleState.lastError = null;
     return { success: true };
   } catch (error) {
     scalePort = null;
     scaleParser = null;
+    scaleState.portPath = null;
+    scaleState.config = null;
     return { success: false, message: error.message };
   }
 });
