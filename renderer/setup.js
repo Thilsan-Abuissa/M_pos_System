@@ -70,6 +70,7 @@ function setupVirtualKeyboard() {
   const keyboard = document.getElementById('virtualKeyboard');
   const closeKeyboardBtn = document.getElementById('closeKeyboard');
   const keyButtons = document.querySelectorAll('.key-btn');
+  let keyboardMode = 'text'; // 'text' | 'numeric'
   
   // Initialize keyboard in lowercase mode
   keyButtons.forEach(btn => {
@@ -78,12 +79,46 @@ function setupVirtualKeyboard() {
       btn.textContent = key.toLowerCase();
     }
   });
+
+  function isNumericKeyboardTarget(el) {
+    if (!el || el.tagName !== 'INPUT') return false;
+    const inputMode = (el.getAttribute('inputmode') || '').toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    return inputMode === 'numeric' || inputMode === 'decimal' || inputMode === 'tel' || type === 'number' || type === 'tel';
+  }
+
+  function setKeyboardMode(mode) {
+    keyboardMode = mode === 'numeric' ? 'numeric' : 'text';
+
+    keyButtons.forEach(btn => {
+      const key = btn.dataset.key;
+      const isNumberKey = btn.classList.contains('key-number');
+      const isBackspace = btn.classList.contains('key-backspace') || key === 'Backspace';
+      const isDone = btn.classList.contains('key-done') || key === 'Done';
+      const isSpace = btn.classList.contains('key-space') || key === ' ';
+      const isDecimal = key === '.';
+      const isLetterKey = !!(key && key.length === 1 && /[A-Z]/.test(key) && !isNumberKey);
+
+      const shouldShow = (keyboardMode === 'numeric')
+        ? (isNumberKey || isDecimal || isBackspace || isDone)
+        : (isLetterKey || isSpace || isBackspace || isDone);
+
+      btn.style.display = shouldShow ? '' : 'none';
+    });
+
+    // Hide empty rows to avoid gaps
+    document.querySelectorAll('#virtualKeyboard .keyboard-row').forEach(row => {
+      const hasVisibleButton = Array.from(row.querySelectorAll('.key-btn')).some(b => b.style.display !== 'none');
+      row.style.display = hasVisibleButton ? '' : 'none';
+    });
+  }
   
   // Show keyboard when text inputs are focused
   document.addEventListener('focusin', (e) => {
     if (e.target.tagName === 'INPUT' && 
         (e.target.type === 'text' || e.target.type === 'tel' || e.target.type === 'number')) {
       currentKeyboardInput = e.target;
+      setKeyboardMode(isNumericKeyboardTarget(e.target) ? 'numeric' : 'text');
       keyboard.classList.add('active');
     }
   });
@@ -107,6 +142,7 @@ function setupVirtualKeyboard() {
       } else {
         if (currentKeyboardInput) {
           const actualKey = btn.textContent === 'SPACE' ? ' ' : btn.textContent;
+          if (keyboardMode === 'numeric' && /[a-zA-Z]/.test(actualKey)) return;
           currentKeyboardInput.value += actualKey;
           currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
         }

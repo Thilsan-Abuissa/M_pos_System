@@ -4336,6 +4336,7 @@ function setupVirtualKeyboard() {
   const closeKeyboardBtn = document.getElementById('closeKeyboard');
   const keyButtons = document.querySelectorAll('.key-btn');
   let isShiftActive = false;
+  let keyboardMode = 'text'; // 'text' | 'numeric'
   
   // Initialize keyboard in lowercase mode
   function updateKeyboardCase() {
@@ -4360,6 +4361,56 @@ function setupVirtualKeyboard() {
   }
   
   updateKeyboardCase();
+
+  function isNumericKeyboardTarget(el) {
+    if (!el || el.tagName !== 'INPUT') return false;
+
+    const inputMode = (el.getAttribute('inputmode') || '').toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+
+    if (inputMode === 'numeric' || inputMode === 'decimal' || inputMode === 'tel') return true;
+    if (type === 'number' || type === 'tel') return true;
+
+    // Known numeric fields
+    if (el.id === 'weightInput' || el.id === 'weightPriceInput') return true;
+
+    return false;
+  }
+
+  function setKeyboardMode(mode) {
+    keyboardMode = mode === 'numeric' ? 'numeric' : 'text';
+
+    // Reset shift when switching modes
+    if (keyboardMode === 'numeric' && isShiftActive) {
+      isShiftActive = false;
+      updateKeyboardCase();
+    }
+
+    keyButtons.forEach(btn => {
+      const key = btn.dataset.key;
+      const isNumberKey = btn.classList.contains('key-number');
+      const isBackspace = btn.classList.contains('key-backspace') || key === 'Backspace';
+      const isDone = btn.classList.contains('key-done') || key === 'Done';
+      const isSpace = btn.classList.contains('key-space') || key === ' ';
+      const isShift = btn.classList.contains('key-shift') || key === 'Shift';
+      const isDecimal = key === '.';
+
+      // Letter keys are defined with uppercase A-Z in data-key.
+      const isLetterKey = !!(key && key.length === 1 && /[A-Z]/.test(key) && !isNumberKey);
+
+      const shouldShow = (keyboardMode === 'numeric')
+        ? (isNumberKey || isDecimal || isBackspace || isDone)
+        : (isLetterKey || isSpace || isShift || isBackspace || isDone);
+
+      btn.style.display = shouldShow ? '' : 'none';
+    });
+
+    // Hide empty rows to avoid big gaps
+    document.querySelectorAll('#virtualKeyboard .keyboard-row').forEach(row => {
+      const hasVisibleButton = Array.from(row.querySelectorAll('.key-btn')).some(b => b.style.display !== 'none');
+      row.style.display = hasVisibleButton ? '' : 'none';
+    });
+  }
   
   // Show keyboard when text inputs are focused (except barcode input)
   document.addEventListener('focusin', (e) => {
@@ -4368,10 +4419,12 @@ function setupVirtualKeyboard() {
         e.target.id !== 'barcodeInput' &&
         e.target.id !== 'paymentAmount') {
       currentKeyboardInput = e.target;
+      setKeyboardMode(isNumericKeyboardTarget(e.target) ? 'numeric' : 'text');
       keyboard.classList.add('active');
     }
     if (e.target.tagName === 'TEXTAREA') {
       currentKeyboardInput = e.target;
+      setKeyboardMode('text');
       keyboard.classList.add('active');
     }
   });
@@ -4401,6 +4454,8 @@ function setupVirtualKeyboard() {
         // Use the actual displayed text (respects shift state)
         const actualKey = btn.textContent === 'SPACE' ? ' ' : btn.textContent;
         if (currentKeyboardInput) {
+          // Extra guard: never inject letters into numeric mode.
+          if (keyboardMode === 'numeric' && /[a-zA-Z]/.test(actualKey)) return;
           currentKeyboardInput.value += actualKey;
           currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
         }
