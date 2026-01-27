@@ -1,6 +1,6 @@
 {
   "name": "supermarket-pos",
-  "version": "3.0.0",
+  "version": "4.0.5",
   "description": "Cross-platform Supermarket POS System",
   "main": "main.js",
   "scripts": {
@@ -8,7 +8,8 @@
     "dev": "electron . --dev",
     "postinstall": "electron-builder install-app-deps",
     "build:mac": "electron-builder --mac",
-    "build:win": "electron-builder --win --x64 --ia32",
+    "build:win": "electron-builder --win --x64",
+    "build:win:x64": "electron-builder --win --x64",
     "build:all": "electron-builder -mw"
   },
   "keywords": [
@@ -48,8 +49,7 @@
         {
           "target": "nsis",
           "arch": [
-            "x64",
-            "ia32"
+            "x64"
           ]
         }
       ],
@@ -61,8 +61,14 @@
       "database.js",
       "preload.js",
       "node_modules/**/*",
+      "!node_modules/@serialport/bindings-cpp/build/**",
       "!pos_system.db",
       "!pos_database.db"
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "node_modules/serialport/**",
+      "node_modules/@serialport/**"
     ],
     "nsis": {
       "oneClick": false,

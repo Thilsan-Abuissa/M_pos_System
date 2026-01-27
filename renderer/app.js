@@ -8,9 +8,64 @@ let systemSettings = null; // System settings
 let currentLogoData = ''; // Current logo data
 let scaleConnected = false; // Scale connection status
 let scalePort = null; // Currently connected scale port
+let scaleDebugLogs = []; // Store debug logs
+let scaleDebugVisible = false; // Debug panel visibility
 let lastSale = null; // Store last sale for reprinting
 let lastSalePaymentMethod = null; // Track payment method for drawer-open-on-print
 let isWeightModalOpen = false; // Flag to prevent multiple modal opens
+
+// Scale Debug Functions for Touchscreen
+function addScaleDebugLog(message, type = 'info') {
+  const timestamp = new Date().toLocaleTimeString();
+  const colors = {
+    info: '#0ff',
+    success: '#0f0',
+    error: '#f00',
+    warning: '#ff0'
+  };
+  scaleDebugLogs.push({ time: timestamp, message, type });
+  if (scaleDebugLogs.length > 100) scaleDebugLogs.shift();
+  updateScaleDebugPanel();
+  console.log(`[Scale Debug] ${message}`);
+}
+
+function updateScaleDebugPanel() {
+  const content = document.getElementById('scaleDebugContent');
+  if (!content) return;
+  const colors = {
+    info: '#0ff',
+    success: '#0f0',
+    error: '#f00',
+    warning: '#ff0'
+  };
+  content.innerHTML = scaleDebugLogs.map(log => 
+    `<div style="color: ${colors[log.type] || '#0ff'}; margin-bottom: 5px; word-break: break-all;">[${log.time}] ${log.message}</div>`
+  ).join('');
+  content.scrollTop = content.scrollHeight;
+}
+
+window.toggleScaleDebug = function() {
+  const panel = document.getElementById('scaleDebugPanel');
+  if (!panel) return;
+  scaleDebugVisible = !scaleDebugVisible;
+  panel.style.display = scaleDebugVisible ? 'block' : 'none';
+  if (scaleDebugVisible) {
+    addScaleDebugLog('🔍 Debug panel opened', 'info');
+    addScaleDebugLog('System ready for scale testing', 'success');
+  }
+};
+
+// Enable debug button - Always visible after 2 seconds
+document.addEventListener('DOMContentLoaded', () => {
+  // Optional: keep keyboard shortcut for staff/devs if the panel exists.
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.shiftKey && e.key === 'D') {
+      window.toggleScaleDebug();
+    }
+  });
+
+  addScaleDebugLog('⚡ Application started', 'info');
+});
 
 // Role-based permissions - Only admin can manage users and system settings
 const PERMISSIONS = {
@@ -1308,34 +1363,91 @@ function promptForWeight(productId) {
       scaleConnected = true; // Assume scale is available
       
       // Read weight from scale
+      addScaleDebugLog('🔄 Attempting to read weight from scale...', 'info');
       console.log('Reading weight from scale...');
       const weightResult = await window.api.readScaleWeight();
       console.log('Weight result:', weightResult);
+      addScaleDebugLog(`📊 Result: ${JSON.stringify(weightResult)}`, weightResult.success ? 'success' : 'error');
       
       if (weightResult.success) {
-        setWeightDisplayFromKg(weightResult.weight);
-        console.log('Weight read successfully:', weightResult.weight, 'kg');
+        if (weightResult.isZero || (typeof weightResult.weight === 'number' && weightResult.weight === 0)) {
+          // Connected, but no weight on the scale. Don't show a blocking popup.
+          weightInput.value = '';
+          weightInput.placeholder = 'Place item on scale, then tap Read Again';
+          addScaleDebugLog('ℹ️ Scale connected but shows 0. Waiting for item...', 'warning');
+        } else {
+          setWeightDisplayFromKg(weightResult.weight);
+          console.log('Weight read successfully:', weightResult.weight, 'kg');
+          addScaleDebugLog(`✅ Weight: ${weightResult.weight} kg from ${weightResult.portPath || 'unknown port'}`, 'success');
+        }
+        if (weightResult.config) {
+          addScaleDebugLog(`⚙️ Config: ${weightResult.config.baudRate} baud, ${weightResult.config.dataBits}${weightResult.config.parity.charAt(0).toUpperCase()}${weightResult.config.stopBits}`, 'info');
+        }
         // Select the text so user can easily replace it
-        weightInput.select();
+        if (weightInput.value) weightInput.select();
         okBtn.focus(); // Focus on Add to Cart button
       } else {
         console.error('Failed to read weight:', weightResult.message);
         const msg = (weightResult && weightResult.message) ? String(weightResult.message) : '';
         weightInput.placeholder = msg ? msg : 'Enter weight manually';
-        
-        // Show specific error message only for zero weight
-        if (msg.includes('0')) {
-          showAlert('Scale shows 0 kg. Please place the product on the scale.', 'info', 'No Weight');
+        addScaleDebugLog(`❌ Error: ${msg}`, 'error');
+
+        // If SerialPort failed to load, show the real underlying error details.
+        if (weightResult && weightResult.serialportAvailable === false) {
+          try {
+            const status = await window.api.getScaleModuleStatus();
+            addScaleDebugLog(`🧩 SerialPort available: ${status.serialportAvailable}`, status.serialportAvailable ? 'success' : 'error');
+            addScaleDebugLog(`🖥️ Runtime: ${status.platform}/${status.arch} | Electron ${status.versions?.electron} | Node ${status.versions?.node}`, 'info');
+            if (status.serialportError?.message) {
+              addScaleDebugLog(`⚠️ SerialPort load error: ${status.serialportError.message}`, 'warning');
+            }
+          } catch (e) {
+            addScaleDebugLog(`⚠️ Failed to fetch module status: ${e.message}`, 'warning');
+          }
         }
-        // Show connection-related errors
+        if (weightResult.portPath) {
+          addScaleDebugLog(`📍 Port: ${weightResult.portPath}`, 'info');
+        }
+        if (weightResult.portsScanned && weightResult.portsScanned.length > 0) {
+          addScaleDebugLog(`🔍 Scanned ports: ${weightResult.portsScanned.join(', ')}`, 'info');
+        }
+        if (weightResult.totalPorts !== undefined) {
+          addScaleDebugLog(`📊 Total ports found: ${weightResult.totalPorts}`, 'info');
+        }
+        if (weightResult.allPorts) {
+          addScaleDebugLog(`📋 All ports: ${weightResult.allPorts}`, 'info');
+        }
+        if (weightResult.diagnostics) {
+          addScaleDebugLog(`🔧 Diagnostics: ${weightResult.diagnostics}`, 'warning');
+        }
+        if (weightResult.rawSample) {
+          addScaleDebugLog(`📄 Raw data: ${weightResult.rawSample}`, 'warning');
+        }
+        if (weightResult.bytesReceived !== undefined) {
+          addScaleDebugLog(`📦 Bytes received: ${weightResult.bytesReceived}`, 'info');
+        }
+        
+        // Connected-but-silent case: avoid a scary "not connected" popup.
+        if (weightResult.connected === true) {
+          showAlert(msg || 'Scale connected, waiting for data...', 'info', 'Scale');
+          return;
+        }
+        // Show connection-related errors with helpful instructions
         if (/no scale found|not connected|failed to connect|connect usb scale/i.test(msg)) {
-          showAlert(msg, 'warning', 'Scale');
+          const helpfulMsg = msg + '\n\nTroubleshooting:\n' +
+            '1. Check USB cable is firmly connected\n' +
+            '2. Ensure scale is powered ON\n' +
+            '3. Check Device Manager (Windows) for COM port\n' +
+            '4. Install CH340/CH341 USB driver if needed\n' +
+            '5. Try a different USB port';
+          showAlert(helpfulMsg, 'warning', 'Scale');
         }
         // Timeout and other errors - no popup, just set placeholder
       }
     } catch (error) {
       console.error('Scale reading error:', error);
       weightInput.placeholder = 'Error - Enter weight manually';
+      addScaleDebugLog(`💥 Exception: ${error.message}`, 'error');
       showAlert('Error reading from scale: ' + error.message + '. Please enter weight manually.', 'error', 'Scale Error');
     }
     
