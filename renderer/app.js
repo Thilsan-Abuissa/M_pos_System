@@ -1065,8 +1065,15 @@ function promptForWeight(productId) {
   let autoReadTimer = null;
   let autoReadInFlight = false;
 
-  // Display unit for weight mode
-  let weightUnit = 'kg'; // 'kg' | 'g'
+  // Display unit for weight mode (always grams for this POS)
+  let weightUnit = 'g';
+
+  // Stability filter: only update UI when the reading is stable.
+  const stableHoldMs = 900;
+  const gramsEpsilon = 1; // 1g
+  let lastDisplayedScaleGrams = null;
+  let candidateScaleGrams = null;
+  let candidateSinceAt = 0;
 
   // Unit price used to derive totals when weight/qty changes.
   // When the user edits the total price field, we update this.
@@ -1144,16 +1151,8 @@ function promptForWeight(productId) {
     if (unit === 'kg') return rawValue;
     if (unit === 'g') return rawValue / 1000;
 
-    // If user typed a decimal, assume kilograms.
-    if (hasDecimal) return rawValue;
-
-    // If UI is in grams, convert grams -> kg.
-    if (weightUnit === 'g') return rawValue / 1000;
-
-    // Heuristic: large whole numbers are likely grams (e.g. 500 = 500g).
-    if (rawValue >= 100) return rawValue / 1000;
-
-    return rawValue;
+    // Default to grams for this POS (unless user explicitly typed kg).
+    return rawValue / 1000;
   }
   
   productNameEl.textContent = product.name;
@@ -1164,15 +1163,17 @@ function promptForWeight(productId) {
     if (isWeightBased) {
       lockedUnitPrice = product.price;
       modalTitle.textContent = 'Enter Weight';
-      weightInputLabel.textContent = weightUnit === 'g' ? 'Weight (g)' : 'Weight (kg)';
-      weightInput.placeholder = 'Enter weight';
+      weightUnit = 'g';
+      weightInputLabel.textContent = 'Weight (g)';
+      weightInput.placeholder = 'Place item on scale';
       priceInputLabel.textContent = `Total Price (${currencySymbol})`;
       priceInput.placeholder = 'Total price';
       if (document.activeElement !== priceInput) {
         priceInput.value = '0.00';
       }
       productPriceEl.innerHTML = `${currencySymbol}${product.price.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}0.00</strong>`;
-      scaleButtonContainer.style.display = 'flex';
+      // Live scale reading: hide the manual re-read button.
+      scaleButtonContainer.style.display = 'none';
       weightModeBtn.style.background = '#6E8FAF';
       quantityModeBtn.style.background = '#94a3b8';
       weightInput.value = '';
@@ -1197,65 +1198,24 @@ function promptForWeight(productId) {
 
   function setWeightDisplayFromKg(weightKg) {
     if (!Number.isFinite(weightKg) || weightKg <= 0) return;
-
-    if (weightKg < 1) {
-      weightUnit = 'g';
-      const grams = Math.round(weightKg * 1000);
-      weightInputLabel.textContent = 'Weight (g)';
-      weightInput.value = '';
-      weightInput.value = String(grams);
-      weightInput.placeholder = `${grams} g`;
-    } else {
-      weightUnit = 'kg';
-      const kgText = weightKg.toFixed(3);
-      weightInputLabel.textContent = 'Weight (kg)';
-      weightInput.value = '';
-      weightInput.value = kgText;
-      weightInput.placeholder = `${kgText} kg`;
-    }
+    // Always display grams.
+    const grams = Math.round(weightKg * 1000);
+    if (typeof lastDisplayedScaleGrams === 'number' && grams === lastDisplayedScaleGrams) return;
+    lastDisplayedScaleGrams = grams;
+    weightUnit = 'g';
+    weightInputLabel.textContent = 'Weight (g)';
+    weightInput.value = '';
+    weightInput.value = String(grams);
+    weightInput.placeholder = `${grams} g`;
 
     updateDisplayedTotal();
   }
 
   function handleManualWeightInput() {
     if (!isWeightBased) return;
-
-    const rawText = (weightInput.value || '').toString().trim();
-    if (!rawText) return;
-
-    const normalizedText = rawText.replace(/\s+/g, '');
-    const unitMatch = normalizedText.match(/(kg|g)$/i);
-    const unit = unitMatch ? unitMatch[1].toLowerCase() : null;
-    const numericPart = unit ? normalizedText.slice(0, -unit.length) : normalizedText;
-
-    const hasDecimal = /[\.,]/.test(numericPart);
-    const rawValue = parseFloat(numericPart.replace(',', '.'));
-    if (!Number.isFinite(rawValue) || rawValue <= 0) return;
-
-    // If user explicitly types a unit, reflect it in the label.
-    if (unit === 'g') {
-      if (weightUnit !== 'g') {
-        weightUnit = 'g';
-        weightInputLabel.textContent = 'Weight (g)';
-      }
-    } else if (unit === 'kg') {
-      if (weightUnit !== 'kg') {
-        weightUnit = 'kg';
-        weightInputLabel.textContent = 'Weight (kg)';
-      }
-    } else if (!hasDecimal && rawValue >= 100) {
-      // Heuristic: big whole numbers like 500 are likely grams.
-      if (weightUnit !== 'g') {
-        weightUnit = 'g';
-        weightInputLabel.textContent = 'Weight (g)';
-      }
-    } else {
-      if (weightUnit !== 'kg') {
-        weightUnit = 'kg';
-        weightInputLabel.textContent = 'Weight (kg)';
-      }
-    }
-
+    // Always grams in this POS. User can still type "1kg" and it will be converted.
+    weightUnit = 'g';
+    weightInputLabel.textContent = 'Weight (g)';
     updateDisplayedTotal();
   }
 
@@ -1304,31 +1264,63 @@ function promptForWeight(productId) {
       autoReadInFlight = true;
       try {
         const weightResult = await window.api.readScaleWeight();
-        if (weightResult && weightResult.success && typeof weightResult.weight === 'number' && weightResult.weight > 0) {
-          setWeightDisplayFromKg(weightResult.weight);
+        if (!weightResult || !weightResult.success) return;
+
+        // If item removed from the scale, reflect that (only when not typing).
+        if (weightResult.isZero || weightResult.weight === 0) {
+          if (document.activeElement !== weightInput) {
+            lastDisplayedScaleGrams = null;
+            candidateScaleGrams = null;
+            candidateSinceAt = 0;
+            weightInput.value = '';
+            weightInput.placeholder = 'Place item on scale';
+            updateDisplayedTotal();
+          }
+          return;
+        }
+
+        if (typeof weightResult.weight === 'number' && weightResult.weight > 0) {
+          const grams = Math.round(weightResult.weight * 1000);
+          const now = Date.now();
+
+          if (typeof candidateScaleGrams !== 'number' || Math.abs(grams - candidateScaleGrams) > gramsEpsilon) {
+            candidateScaleGrams = grams;
+            candidateSinceAt = now;
+            // Don't update UI yet; wait until stable
+            if (document.activeElement !== weightInput) {
+              weightInput.placeholder = 'Waiting for stable weight...';
+            }
+            return;
+          }
+
+          if (now - (candidateSinceAt || 0) >= stableHoldMs) {
+            setWeightDisplayFromKg(candidateScaleGrams / 1000);
+          }
         }
       } catch (e) {
         // Silent during auto-read; manual entry remains available
       } finally {
         autoReadInFlight = false;
       }
-    }, 700);
+    }, 250);
   }
   
   // Initial UI setup
   updateModeUI();
+
+  // Ensure the modal never shows a previous item's value.
+  lastDisplayedScaleGrams = null;
+  candidateScaleGrams = null;
+  candidateSinceAt = 0;
   
   // Toggle button handlers
   weightModeBtn.onclick = () => {
     isWeightBased = true;
-    weightUnit = 'kg';
+    weightUnit = 'g';
     updateModeUI();
 
     weightInput.removeEventListener('input', handleManualQuantityInput);
     weightInput.addEventListener('input', handleManualWeightInput);
-    if (scaleConnected) {
-      readWeightFromScale();
-    }
     startScaleAutoRead();
   };
   
@@ -1342,7 +1334,6 @@ function promptForWeight(productId) {
   
   // Automatically read from scale when modal opens (only for weight-based products)
   if (isWeightBased) {
-    readWeightFromScale();
     startScaleAutoRead();
     weightInput.addEventListener('input', handleManualWeightInput);
     priceInput.addEventListener('input', handleManualPriceInput);
@@ -1354,8 +1345,6 @@ function promptForWeight(productId) {
   
   // Function to read weight from scale
   async function readWeightFromScale() {
-    scaleBtn.disabled = true;
-    scaleBtn.textContent = '⌛ Reading...';
     weightInput.placeholder = 'Reading from scale...';
     
     try {
@@ -1373,7 +1362,7 @@ function promptForWeight(productId) {
         if (weightResult.isZero || (typeof weightResult.weight === 'number' && weightResult.weight === 0)) {
           // Connected, but no weight on the scale. Don't show a blocking popup.
           weightInput.value = '';
-          weightInput.placeholder = 'Place item on scale, then tap Read Again';
+          weightInput.placeholder = 'Place item on scale';
           addScaleDebugLog('ℹ️ Scale connected but shows 0. Waiting for item...', 'warning');
         } else {
           setWeightDisplayFromKg(weightResult.weight);
@@ -1383,9 +1372,7 @@ function promptForWeight(productId) {
         if (weightResult.config) {
           addScaleDebugLog(`⚙️ Config: ${weightResult.config.baudRate} baud, ${weightResult.config.dataBits}${weightResult.config.parity.charAt(0).toUpperCase()}${weightResult.config.stopBits}`, 'info');
         }
-        // Select the text so user can easily replace it
-        if (weightInput.value) weightInput.select();
-        okBtn.focus(); // Focus on Add to Cart button
+        // Avoid stealing focus while the cashier adjusts items on the scale.
       } else {
         console.error('Failed to read weight:', weightResult.message);
         const msg = (weightResult && weightResult.message) ? String(weightResult.message) : '';
@@ -1451,8 +1438,6 @@ function promptForWeight(productId) {
       showAlert('Error reading from scale: ' + error.message + '. Please enter weight manually.', 'error', 'Scale Error');
     }
     
-    scaleBtn.disabled = false;
-    scaleBtn.textContent = '🔄 Read Again';
   }
   
   // Prevent multiple submissions
