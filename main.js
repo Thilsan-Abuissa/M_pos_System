@@ -130,26 +130,87 @@ function parseWeightFromScalePayload(payload) {
     // Remove control characters (STX/ETX/etc) but keep printable text
     const text = textRaw.replace(/[\x00-\x1F\x7F]/g, '');
 
-    // Detect units before stripping text
-    const hasKg = /kg/i.test(text);
-    // 'kg' contains 'g', so only treat as grams if NOT kg
-    const hasG = !hasKg && /\bg\b/i.test(text);
+    // Prefer the number that is directly paired with a unit.
+    // Some scales include other numeric fields; picking the unit-paired number avoids
+    // occasional spikes like "10000" / "20000" from unrelated tokens.
+    let rawToken = null;
+    let unit = null;
 
-    // Normalize: remove common prefixes, units, and whitespace/control chars
-    let clean = text
-      .replace(/ST,GS,/gi, '')
-      .replace(/kg/gi, '')
-      .replace(/g/gi, '')
-      .replace(/\s+/g, '');
+    const parseNumericToken = (token) => {
+      if (!token) return null;
+      let normalized = String(token);
+      if (/^\d{1,3}(,\d{3})+(?:\.\d+)?$/.test(normalized)) {
+        normalized = normalized.replace(/,/g, '');
+      } else {
+        normalized = normalized.replace(',', '.');
+      }
+      const v = Math.abs(parseFloat(normalized));
+      return Number.isFinite(v) ? v : null;
+    };
 
-    // Extract first numeric value (allow comma decimals)
-    const match = clean.match(/([+-]?\d+(?:[\.,]\d+)?)/);
-    if (!match) return null;
+    const kgMatches = Array.from(text.matchAll(/([+-]?\d+(?:[\.,]\d+)?)\s*kg\b/gi));
+    if (kgMatches.length > 0) {
+      // Prefer the smallest *non-zero* kg token if present; otherwise 0; otherwise last.
+      let bestNonZero = null;
+      let bestNonZeroToken = null;
+      let sawZero = false;
+      for (const m of kgMatches) {
+        const v = parseNumericToken(m[1]);
+        if (v === null) continue;
+        if (v === 0) {
+          sawZero = true;
+          continue;
+        }
+        if (bestNonZero === null || v < bestNonZero) {
+          bestNonZero = v;
+          bestNonZeroToken = m[1];
+        }
+      }
+      rawToken = bestNonZeroToken || (sawZero ? '0' : kgMatches[kgMatches.length - 1][1]);
+      unit = 'kg';
+    } else {
+      const gMatches = Array.from(text.matchAll(/([+-]?\d+(?:[\.,]\d+)?)\s*g\b/gi));
+      if (gMatches.length > 0) {
+        // Prefer smallest *non-zero* (in kg terms) g token if present; otherwise 0; otherwise last.
+        let bestNonZeroKg = null;
+        let bestNonZeroToken = null;
+        let sawZero = false;
+        for (const m of gMatches) {
+          const vG = parseNumericToken(m[1]);
+          if (vG === null) continue;
+          if (vG === 0) {
+            sawZero = true;
+            continue;
+          }
+          const vKg = vG / 1000;
+          if (bestNonZeroKg === null || vKg < bestNonZeroKg) {
+            bestNonZeroKg = vKg;
+            bestNonZeroToken = m[1];
+          }
+        }
+        rawToken = bestNonZeroToken || (sawZero ? '0' : gMatches[gMatches.length - 1][1]);
+        unit = 'g';
+      }
+    }
+
+    if (!rawToken) {
+      // Fallback: remove common prefixes/units/whitespace and take the LAST numeric value.
+      // (Last tends to be the weight in many payloads.)
+      const clean = text
+        .replace(/ST,GS,/gi, '')
+        .replace(/kg/gi, '')
+        .replace(/g/gi, '')
+        .replace(/\s+/g, '');
+
+      const matches = Array.from(clean.matchAll(/([+-]?\d+(?:[\.,]\d+)?)/g));
+      if (matches.length === 0) return null;
+      rawToken = matches[matches.length - 1][1];
+    }
 
     // Normalize number formats:
     // - If it looks like thousands separators (1,234 or 12,345,678) remove commas.
     // - Else treat comma as decimal separator.
-    let normalized = match[1];
+    let normalized = rawToken;
     if (/^\d{1,3}(,\d{3})+(?:\.\d+)?$/.test(normalized)) {
       normalized = normalized.replace(/,/g, '');
     } else {
@@ -161,9 +222,9 @@ function parseWeightFromScalePayload(payload) {
     // Convert to kilograms when needed.
     // GRAM ZFOC commonly outputs in kg, but some outputs are grams (e.g. 500 => 500g).
     let weightKg = rawValue;
-    if (hasG) {
+    if (unit === 'g') {
       weightKg = rawValue / 1000;
-    } else if (!hasKg) {
+    } else if (unit !== 'kg') {
       // Heuristic: if there's no unit and the number is large, it's likely grams.
       // This avoids showing 500 kg when the scale is actually 500 g.
       if (rawValue > 100) weightKg = rawValue / 1000;
@@ -269,7 +330,13 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
       } catch {
         // ignore
       }
-      resolve(result);
+      // Always attach a timestamp so the renderer can ignore stale/cached reads.
+      const stamped = {
+        ...(result || {}),
+        lastUpdatedAt: typeof result?.lastUpdatedAt === 'number' ? result.lastUpdatedAt : Date.now(),
+        source: result?.source || 'once'
+      };
+      resolve(stamped);
     };
 
     const onData = (data) => {
@@ -1307,12 +1374,15 @@ ipcMain.handle('scale:readWeight', async () => {
   // If we recently received streaming data, return immediately.
   if (scalePort && scalePort.isOpen && typeof scaleState.lastWeightKg === 'number') {
     const ageMs = Date.now() - (scaleState.lastUpdatedAt || 0);
-    if (ageMs >= 0 && ageMs <= 1500 && scaleState.lastWeightKg > 0) {
+    if (ageMs >= 0 && ageMs <= 1500) {
       return {
         success: true,
         weight: scaleState.lastWeightKg,
+        isZero: scaleState.lastWeightKg === 0,
         portPath: scaleState.portPath,
         config: scaleState.config,
+        lastUpdatedAt: scaleState.lastUpdatedAt || 0,
+        ageMs,
         source: 'stream'
       };
     }

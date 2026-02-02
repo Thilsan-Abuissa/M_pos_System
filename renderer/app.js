@@ -1065,15 +1065,27 @@ function promptForWeight(productId) {
   let autoReadTimer = null;
   let autoReadInFlight = false;
 
-  // Display unit for weight mode (always grams for this POS)
-  let weightUnit = 'g';
+  // Some scales briefly output 0.000 between real readings.
+  // Hold the last non-zero weight and only show 0.000 when zero persists long enough.
+  // This prevents looping: real weight -> 0.000 -> real weight -> 0.000.
+  const ZERO_DEBOUNCE_MS = 2500;
+  let lastNonZeroScaleAt = 0;
+  let zeroCandidateSinceAt = null;
 
-  // Stability filter: only update UI when the reading is stable.
-  const stableHoldMs = 900;
-  const gramsEpsilon = 1; // 1g
+  // Some devices intermittently emit max-capacity values (10/20/30kg) while empty.
+  // Treat these as invalid while the scale is empty (prevents 10/20/30kg showing before adding).
+  let hasSeenNonSpikeNonZeroSinceOpen = false;
+
+  // Display unit for weight mode (always grams for this POS)
+  let weightUnit = 'kg';
+
+  // Live mode: always mirror the scale output (no "stable hold" gating).
+  // We still avoid showing stale cached values from a previous modal.
   let lastDisplayedScaleGrams = null;
-  let candidateScaleGrams = null;
-  let candidateSinceAt = 0;
+
+  // Prevent showing a previous item's cached weight when reopening the modal.
+  // The main process may return a recently cached value (source: 'stream') for up to ~1500ms.
+  const modalOpenedAt = Date.now();
 
   // Unit price used to derive totals when weight/qty changes.
   // When the user edits the total price field, we update this.
@@ -1143,7 +1155,6 @@ function promptForWeight(productId) {
     const unit = unitMatch ? unitMatch[1].toLowerCase() : null;
 
     const numericPart = unit ? normalizedText.slice(0, -unit.length) : normalizedText;
-    const hasDecimal = /[\.,]/.test(numericPart);
     const rawValue = parseFloat(numericPart.replace(',', '.'));
     if (!Number.isFinite(rawValue)) return NaN;
 
@@ -1151,8 +1162,8 @@ function promptForWeight(productId) {
     if (unit === 'kg') return rawValue;
     if (unit === 'g') return rawValue / 1000;
 
-    // Default to grams for this POS (unless user explicitly typed kg).
-    return rawValue / 1000;
+    // Default to kilograms to match the physical scale display.
+    return rawValue;
   }
   
   productNameEl.textContent = product.name;
@@ -1163,9 +1174,9 @@ function promptForWeight(productId) {
     if (isWeightBased) {
       lockedUnitPrice = product.price;
       modalTitle.textContent = 'Enter Weight';
-      weightUnit = 'g';
-      weightInputLabel.textContent = 'Weight (g)';
-      weightInput.placeholder = 'Place item on scale';
+      weightUnit = 'kg';
+      weightInputLabel.textContent = 'Weight (kg)';
+      weightInput.placeholder = '0.000 kg';
       priceInputLabel.textContent = `Total Price (${currencySymbol})`;
       priceInput.placeholder = 'Total price';
       if (document.activeElement !== priceInput) {
@@ -1176,7 +1187,7 @@ function promptForWeight(productId) {
       scaleButtonContainer.style.display = 'none';
       weightModeBtn.style.background = '#6E8FAF';
       quantityModeBtn.style.background = '#94a3b8';
-      weightInput.value = '';
+      weightInput.value = '0.000 kg';
     } else {
       lockedUnitPrice = product.price;
       modalTitle.textContent = 'Enter Quantity';
@@ -1197,25 +1208,27 @@ function promptForWeight(productId) {
   }
 
   function setWeightDisplayFromKg(weightKg) {
-    if (!Number.isFinite(weightKg) || weightKg <= 0) return;
-    // Always display grams.
+    if (!Number.isFinite(weightKg) || weightKg < 0) return;
+    // Display exactly like the physical scale: kilograms with 3 decimals.
     const grams = Math.round(weightKg * 1000);
     if (typeof lastDisplayedScaleGrams === 'number' && grams === lastDisplayedScaleGrams) return;
     lastDisplayedScaleGrams = grams;
-    weightUnit = 'g';
-    weightInputLabel.textContent = 'Weight (g)';
+
+    const kgText = (grams / 1000).toFixed(3);
+    weightUnit = 'kg';
+    weightInputLabel.textContent = 'Weight (kg)';
     weightInput.value = '';
-    weightInput.value = String(grams);
-    weightInput.placeholder = `${grams} g`;
+    weightInput.value = `${kgText} kg`;
+    weightInput.placeholder = `${kgText} kg`;
 
     updateDisplayedTotal();
   }
 
   function handleManualWeightInput() {
     if (!isWeightBased) return;
-    // Always grams in this POS. User can still type "1kg" and it will be converted.
-    weightUnit = 'g';
-    weightInputLabel.textContent = 'Weight (g)';
+    // Default to kilograms to match the physical scale.
+    weightUnit = 'kg';
+    weightInputLabel.textContent = 'Weight (kg)';
     updateDisplayedTotal();
   }
 
@@ -1266,35 +1279,64 @@ function promptForWeight(productId) {
         const weightResult = await window.api.readScaleWeight();
         if (!weightResult || !weightResult.success) return;
 
-        // If item removed from the scale, reflect that (only when not typing).
-        if (weightResult.isZero || weightResult.weight === 0) {
-          if (document.activeElement !== weightInput) {
-            lastDisplayedScaleGrams = null;
-            candidateScaleGrams = null;
-            candidateSinceAt = 0;
-            weightInput.value = '';
-            weightInput.placeholder = 'Place item on scale';
-            updateDisplayedTotal();
-          }
+        const now = Date.now();
+
+        // Ignore ANY weights from before the modal opened.
+        // This fixes: open product -> add/close -> open again -> old weight flashes.
+        if (
+          typeof weightResult.lastUpdatedAt === 'number' &&
+          weightResult.lastUpdatedAt > 0 &&
+          weightResult.lastUpdatedAt < modalOpenedAt
+        ) {
           return;
         }
 
-        if (typeof weightResult.weight === 'number' && weightResult.weight > 0) {
-          const grams = Math.round(weightResult.weight * 1000);
-          const now = Date.now();
+        if (typeof weightResult.weight === 'number') {
+          if (weightResult.weight > 0) {
+            const grams = Math.round(weightResult.weight * 1000);
+            const lastDisplayedGrams = typeof lastDisplayedScaleGrams === 'number' ? lastDisplayedScaleGrams : null;
 
-          if (typeof candidateScaleGrams !== 'number' || Math.abs(grams - candidateScaleGrams) > gramsEpsilon) {
-            candidateScaleGrams = grams;
-            candidateSinceAt = now;
-            // Don't update UI yet; wait until stable
-            if (document.activeElement !== weightInput) {
-              weightInput.placeholder = 'Waiting for stable weight...';
+            // If we're currently showing 0.000 and we suddenly get exactly 10/20/30kg,
+            // treat it as a capacity spike and ignore it (empty-scale glitch).
+            if (
+              (lastDisplayedGrams === null || lastDisplayedGrams === 0) &&
+              (grams === 10000 || grams === 20000 || grams === 30000)
+            ) {
+              // If you truly need to sell 10/20/30kg exact items, remove this guard.
+              return;
             }
+
+            // Mark that we've seen a real non-zero value (not a spike).
+            if (!(grams === 10000 || grams === 20000 || grams === 30000)) {
+              hasSeenNonSpikeNonZeroSinceOpen = true;
+            }
+
+            lastNonZeroScaleAt = now;
+            zeroCandidateSinceAt = null;
+            // Mirror the scale continuously.
+            setWeightDisplayFromKg(weightResult.weight);
             return;
           }
 
-          if (now - (candidateSinceAt || 0) >= stableHoldMs) {
-            setWeightDisplayFromKg(candidateScaleGrams / 1000);
+          // If item removed from the scale, reflect that.
+          // But debounce zero so we don't flicker when the scale glitches.
+          if (weightResult.weight === 0 || weightResult.isZero) {
+            // Don't reset hasSeenNonSpikeNonZeroSinceOpen here; keep it sticky for the modal.
+            const lastDisplayedWasNonZero =
+              typeof lastDisplayedScaleGrams === 'number' && lastDisplayedScaleGrams > 0;
+
+            // If we've shown a non-zero recently, treat zero as a glitch until it persists.
+            if (lastDisplayedWasNonZero) {
+              if (zeroCandidateSinceAt === null) zeroCandidateSinceAt = now;
+
+              // Require zero to be continuous for long enough, AND no non-zero seen recently.
+              if (now - zeroCandidateSinceAt < ZERO_DEBOUNCE_MS) return;
+              if (lastNonZeroScaleAt && now - lastNonZeroScaleAt < ZERO_DEBOUNCE_MS) return;
+            }
+
+            // Otherwise show 0 (or after debounce completes).
+            setWeightDisplayFromKg(0);
+            return;
           }
         }
       } catch (e) {
@@ -1302,7 +1344,7 @@ function promptForWeight(productId) {
       } finally {
         autoReadInFlight = false;
       }
-    }, 250);
+    }, 25);
   }
   
   // Initial UI setup
@@ -1310,13 +1352,11 @@ function promptForWeight(productId) {
 
   // Ensure the modal never shows a previous item's value.
   lastDisplayedScaleGrams = null;
-  candidateScaleGrams = null;
-  candidateSinceAt = 0;
   
   // Toggle button handlers
   weightModeBtn.onclick = () => {
     isWeightBased = true;
-    weightUnit = 'g';
+    weightUnit = 'kg';
     updateModeUI();
 
     weightInput.removeEventListener('input', handleManualQuantityInput);
