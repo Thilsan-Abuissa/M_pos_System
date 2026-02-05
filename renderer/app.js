@@ -1068,7 +1068,9 @@ function promptForWeight(productId) {
   // Some scales briefly output 0.000 between real readings.
   // Hold the last non-zero weight and only show 0.000 when zero persists long enough.
   // This prevents looping: real weight -> 0.000 -> real weight -> 0.000.
-  const ZERO_DEBOUNCE_MS = 2500;
+  // Keep this small so removing all items shows 0 quickly.
+  // Still non-zero to avoid flicker when the scale momentarily outputs 0 between frames.
+  const ZERO_DEBOUNCE_MS = 400;
   let lastNonZeroScaleAt = 0;
   let zeroCandidateSinceAt = null;
 
@@ -1344,7 +1346,7 @@ function promptForWeight(productId) {
       } finally {
         autoReadInFlight = false;
       }
-    }, 25);
+    }, 100);
   }
   
   // Initial UI setup

@@ -320,11 +320,33 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
   return await new Promise((resolve) => {
     let done = false;
     const chunks = [];
+    const timers = [];
+    let lastParsedWeight = null;
+    let settleTimer = null;
+    const settleMs = 80;
+
+    // Drop any previously buffered bytes so we don't parse an old frame (common cause of UI "jump back").
+    try {
+      if (port && typeof port.flush === 'function') {
+        port.flush(() => {});
+      }
+    } catch {
+      // ignore
+    }
+
+    const clearAllTimers = () => {
+      for (const t of timers) clearTimeout(t);
+      timers.length = 0;
+      if (settleTimer) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+    };
 
     const finish = (result) => {
       if (done) return;
       done = true;
-      clearTimeout(timeout);
+      clearAllTimers();
       try {
         port.removeListener('data', onData);
       } catch {
@@ -347,14 +369,20 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
       const weight = parseWeightFromScalePayload(combined);
       if (weight === null) return;
 
-      // Treat 0 as a valid read (connected), but let UI decide what to do.
-      if (weight === 0) {
-        finish({ success: true, weight: 0, isZero: true });
-        return;
-      }
+      // Record the most recently parsed weight, and wait a tiny window for any newer frame.
+      // This avoids "buffered" frames from reappearing after a change on the platform.
+      lastParsedWeight = weight;
 
-      console.log('[Scale Debug] Parsed weight:', weight, 'kg');
-      finish({ success: true, weight });
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => {
+        if (done) return;
+        if (lastParsedWeight === 0) {
+          finish({ success: true, weight: 0, isZero: true });
+          return;
+        }
+        console.log('[Scale Debug] Parsed weight (settled):', lastParsedWeight, 'kg');
+        finish({ success: true, weight: lastParsedWeight });
+      }, settleMs);
     };
 
     port.on('data', onData);
@@ -368,50 +396,41 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
         bytesReceived: chunks.reduce((acc, c) => acc + (Buffer.isBuffer(c) ? c.length : Buffer.byteLength(String(c))), 0)
       });
     }, timeoutMs);
+    timers.push(timeout);
 
     // If the scale is streaming continuously, we may get data without commands.
-    // After a short delay, try common poll commands for scales that require it.
-    const tryWrites = () => {
-      console.log('[Scale Debug] Sending poll commands...');
-      // Try ALL possible scale commands for maximum compatibility
-      const commands = [
-        { data: 'P\r\n', name: 'P\\r\\n', delay: 0 },
-        { data: 'P\r', name: 'P\\r', delay: 150 },
-        { data: 'P\n', name: 'P\\n', delay: 250 },
-        { data: 'W\r\n', name: 'W\\r\\n', delay: 400 },
-        { data: 'W\r', name: 'W\\r', delay: 550 },
-        { data: 'S\r\n', name: 'S\\r\\n', delay: 800 },
-        { data: 'SI\r\n', name: 'SI\\r\\n', delay: 950 },
-        { data: 'R\r\n', name: 'R\\r\\n', delay: 1200 },
-        { data: 'G\r\n', name: 'G\\r\\n', delay: 1600 },
-        { data: Buffer.from([0x05]), name: 'ENQ (0x05)', delay: 2000 },
-        { data: Buffer.from([0x06]), name: 'ACK (0x06)', delay: 2400 },
-        { data: Buffer.from([0x02, 0x45, 0x03]), name: 'STX E ETX', delay: 2600 },
-        { data: '\r\n', name: '\\r\\n only', delay: 2800 },
-        { data: '\r', name: '\\r only', delay: 2900 },
-        { data: '\n', name: '\\n only', delay: 3000 },
-        { data: 'PRINT\r\n', name: 'PRINT', delay: 3200 },
-        { data: Buffer.from([0x1B, 0x50]), name: 'ESC P', delay: 3600 }
-      ];
-      
-      commands.forEach((cmd) => {
-        setTimeout(() => {
-          try {
-            port.write(cmd.data);
-            try {
-              if (typeof port.drain === 'function') port.drain(() => {});
-            } catch {
-              // ignore
-            }
-            console.log(`[Scale Debug] Sent: ${cmd.name}`);
-          } catch (e) {
-            console.log(`[Scale Debug] Failed to send ${cmd.name}:`, e.message);
-          }
-        }, cmd.delay);
-      });
+    // After a very short delay, send a small set of common poll commands.
+    // Goal: show weight with minimal latency (< 1s) without flooding the device.
+    const safeWrite = (dataToWrite, name) => {
+      if (done) return;
+      try {
+        port.write(dataToWrite);
+        try {
+          if (typeof port.drain === 'function') port.drain(() => {});
+        } catch {
+          // ignore
+        }
+        console.log(`[Scale Debug] Sent: ${name}`);
+      } catch (e) {
+        console.log(`[Scale Debug] Failed to send ${name}:`, e.message);
+      }
     };
 
-    setTimeout(tryWrites, 500);
+    const scheduleWriteIfSilent = (delayMs, dataToWrite, name) => {
+      const t = setTimeout(() => {
+        if (done) return;
+        // If we already parsed a weight, don't send more poll commands (prevents backlog / old frames).
+        if (lastParsedWeight !== null) return;
+        safeWrite(dataToWrite, name);
+      }, delayMs);
+      timers.push(t);
+    };
+
+    scheduleWriteIfSilent(0, 'P\r\n', 'P\\r\\n');
+    scheduleWriteIfSilent(60, Buffer.from([0x05]), 'ENQ (0x05)');
+    scheduleWriteIfSilent(120, 'W\r\n', 'W\\r\\n');
+    scheduleWriteIfSilent(180, 'S\r\n', 'S\\r\\n');
+    scheduleWriteIfSilent(240, '\r\n', '\\r\\n only');
   });
 }
 
@@ -660,7 +679,8 @@ app.whenReady().then(() => {
   createWindow();
   
   // Auto-connect to scale if available
-  if (SerialPort && ReadlineParser) {
+  // ReadlineParser is optional; we can read raw bytes.
+  if (SerialPort) {
     setTimeout(async () => {
       try {
         const ports = await SerialPort.list();
@@ -1421,21 +1441,18 @@ ipcMain.handle('scale:readWeight', async () => {
         
         // Try common serial configurations used by RS232 scales.
         // Many GRAM/RS232 setups are 9600 8N1, but some are 4800/2400 or 7E1.
+        const preferredCfg = scaleState?.config && typeof scaleState.config.baudRate === 'number'
+          ? scaleState.config
+          : null;
+
+        // Keep this list short for speed; trying many baud/parity combos can add seconds.
+        // If needed, we can add more later, but 9600 8N1 + a couple of common fallbacks covers most GRAM/ZFOC setups.
         const configsToTry = [
+          ...(preferredCfg ? [preferredCfg] : []),
           { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' },
-          { baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none' },
-          { baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none' },
           { baudRate: 4800, dataBits: 8, stopBits: 1, parity: 'none' },
           { baudRate: 2400, dataBits: 8, stopBits: 1, parity: 'none' },
-          { baudRate: 19200, dataBits: 8, stopBits: 1, parity: 'none' },
-          { baudRate: 9600, dataBits: 8, stopBits: 2, parity: 'none' },
-          { baudRate: 4800, dataBits: 8, stopBits: 2, parity: 'none' },
-          { baudRate: 9600, dataBits: 7, stopBits: 1, parity: 'even' },
-          { baudRate: 4800, dataBits: 7, stopBits: 1, parity: 'even' },
-          { baudRate: 2400, dataBits: 7, stopBits: 1, parity: 'even' },
-          { baudRate: 9600, dataBits: 7, stopBits: 2, parity: 'even' },
-          { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'even' },
-          { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'odd' }
+          { baudRate: 9600, dataBits: 7, stopBits: 1, parity: 'even' }
         ];
         let lastError = null;
 
@@ -1475,7 +1492,7 @@ ipcMain.handle('scale:readWeight', async () => {
               // Quick probe read to validate we can parse data
               // Give a bit of time for streaming scales to send a frame.
               console.log('[Scale] Probing for weight data...');
-              const probe = await readWeightFromOpenPortOnce(scalePort, 60000);
+              const probe = await readWeightFromOpenPortOnce(scalePort, 1200);
               if (probe && probe.success) {
                 isConnecting = false;
                 lastScaleAutoScanAt = Date.now();
@@ -1554,7 +1571,7 @@ ipcMain.handle('scale:readWeight', async () => {
             scaleState.lastError = null;
             
             // Try to read
-            const probe = await readWeightFromOpenPortOnce(scalePort, 60000);
+            const probe = await readWeightFromOpenPortOnce(scalePort, 1200);
             if (probe && (probe.success || (probe.success && probe.isZero))) {
               isConnecting = false;
               lastScaleAutoScanAt = Date.now();
@@ -1616,7 +1633,7 @@ ipcMain.handle('scale:readWeight', async () => {
 
   // Read raw bytes directly; works even if the device doesn't send newlines.
   console.log('[Scale] Reading weight from', scaleState.portPath, 'using', scaleState.config);
-  const result = await readWeightFromOpenPortOnce(scalePort, 60000); // 60 seconds (1 minute) timeout for slow scales
+  const result = await readWeightFromOpenPortOnce(scalePort, 1000); // Target: fast UI response (~1s)
   if (!result.success) {
     const details = [];
     if (scaleState.portPath) details.push(`Port: ${scaleState.portPath}`);
