@@ -96,12 +96,13 @@ function setupVirtualKeyboard() {
       const isBackspace = btn.classList.contains('key-backspace') || key === 'Backspace';
       const isDone = btn.classList.contains('key-done') || key === 'Done';
       const isSpace = btn.classList.contains('key-space') || key === ' ';
+      const isSpecial = btn.classList.contains('key-special');
       const isDecimal = key === '.';
       const isLetterKey = !!(key && key.length === 1 && /[A-Z]/.test(key) && !isNumberKey);
 
       const shouldShow = (keyboardMode === 'numeric')
-        ? (isNumberKey || isDecimal || isBackspace || isDone)
-        : (isLetterKey || isSpace || isBackspace || isDone);
+        ? (isNumberKey || isDecimal || isBackspace || isDone || isSpecial)
+        : (isLetterKey || isSpace || isBackspace || isDone || isSpecial);
 
       btn.style.display = shouldShow ? '' : 'none';
     });

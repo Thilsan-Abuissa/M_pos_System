@@ -65,6 +65,8 @@ class POSDatabase {
         discount REAL DEFAULT 0,
         total REAL NOT NULL,
         payment_method TEXT,
+        payment_amount REAL DEFAULT 0,
+        change_amount REAL DEFAULT 0,
         cashier_id INTEGER,
         notes TEXT
       );
@@ -128,6 +130,9 @@ class POSDatabase {
         cash_sales REAL DEFAULT 0,
         card_sales REAL DEFAULT 0,
         loan_sales REAL DEFAULT 0,
+        total_sales_amount REAL DEFAULT 0,
+        total_expenses REAL DEFAULT 0,
+        expense_description TEXT,
         tax_7_base REAL DEFAULT 0,
         tax_7_amount REAL DEFAULT 0,
         tax_19_base REAL DEFAULT 0,
@@ -147,6 +152,21 @@ class POSDatabase {
       CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id);
       CREATE INDEX IF NOT EXISTS idx_z_reports_date ON z_reports(report_date);
       CREATE INDEX IF NOT EXISTS idx_z_reports_number ON z_reports(report_number);
+
+      CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        expense_date DATE NOT NULL,
+        category TEXT NOT NULL,
+        description TEXT NOT NULL,
+        amount REAL NOT NULL,
+        payment_method TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date);
+      CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
 
       CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,6 +234,16 @@ class POSDatabase {
         console.error('Error adding is_favorite column:', error);
       }
     }
+    
+    // Add split_payments column to sales table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE sales ADD COLUMN split_payments TEXT').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding split_payments column:', error);
+      }
+    }
 
     // Add printer_name column to system_settings table if it doesn't exist
     try {
@@ -222,6 +252,48 @@ class POSDatabase {
       // Column already exists, ignore error
       if (!error.message.includes('duplicate column name')) {
         console.error('Error adding printer_name column:', error);
+      }
+    }
+
+    // Add new columns to z_reports table if they don't exist
+    try {
+      this.db.prepare('ALTER TABLE z_reports ADD COLUMN total_sales_amount REAL DEFAULT 0').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding total_sales_amount column:', error);
+      }
+    }
+
+    try {
+      this.db.prepare('ALTER TABLE z_reports ADD COLUMN total_expenses REAL DEFAULT 0').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding total_expenses column:', error);
+      }
+    }
+
+    try {
+      this.db.prepare('ALTER TABLE z_reports ADD COLUMN expense_description TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding expense_description column:', error);
+      }
+    }
+
+    // Add payment_amount and change_amount columns to sales table if they don't exist
+    try {
+      this.db.prepare('ALTER TABLE sales ADD COLUMN payment_amount REAL DEFAULT 0').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding payment_amount column:', error);
+      }
+    }
+
+    try {
+      this.db.prepare('ALTER TABLE sales ADD COLUMN change_amount REAL DEFAULT 0').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding change_amount column:', error);
       }
     }
 
@@ -452,8 +524,8 @@ class POSDatabase {
     const transaction = this.db.transaction((sale) => {
       // Insert sale
       const saleStmt = this.db.prepare(`
-        INSERT INTO sales (subtotal, tax, discount, total, payment_method, cashier_id, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sales (subtotal, tax, discount, total, payment_method, payment_amount, change_amount, cashier_id, notes, split_payments)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const saleResult = saleStmt.run(
         sale.subtotal,
@@ -461,8 +533,11 @@ class POSDatabase {
         sale.discount || 0,
         sale.total,
         sale.paymentMethod || 'cash',
+        sale.paymentAmount || sale.total,
+        sale.changeAmount || 0,
         sale.cashierId || null,
-        sale.notes || null
+        sale.notes || null,
+        sale.splitPayments ? JSON.stringify(sale.splitPayments) : null
       );
       const saleId = saleResult.lastInsertRowid;
 
@@ -504,6 +579,14 @@ class POSDatabase {
     const sale = this.db.prepare('SELECT * FROM sales WHERE id = ?').get(id);
     if (sale) {
       sale.items = this.db.prepare('SELECT * FROM sale_items WHERE sale_id = ?').all(id);
+      // Parse split_payments JSON if exists
+      if (sale.split_payments) {
+        try {
+          sale.split_payments = JSON.parse(sale.split_payments);
+        } catch (e) {
+          sale.split_payments = null;
+        }
+      }
     }
     return sale;
   }
@@ -913,11 +996,12 @@ class POSDatabase {
           report_number, start_datetime, end_datetime, cashier_id, cashier_name,
           total_sales, total_returns, net_sales_count,
           gross_sales, total_returns_amount, net_sales,
-          cash_sales, card_sales, loan_sales,
+          cash_sales, card_sales, loan_sales, total_sales_amount,
+          total_expenses, expense_description,
           tax_7_base, tax_7_amount, tax_19_base, tax_19_amount, total_tax,
           expected_cash, actual_cash, cash_difference, notes
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         reportNumber,
         data.start_datetime,
@@ -933,6 +1017,9 @@ class POSDatabase {
         data.cash_sales || 0,
         data.card_sales || 0,
         data.loan_sales || 0,
+        data.total_sales_amount || 0,
+        data.total_expenses || 0,
+        data.expense_description || null,
         data.tax_7_base || 0,
         data.tax_7_amount || 0,
         data.tax_19_base || 0,
@@ -1260,6 +1347,84 @@ class POSDatabase {
         total_profit: totalProfit,
         profit_margin: profitMargin
       }
+    };
+  }
+
+  // Expense operations
+  createExpense(expenseData) {
+    const stmt = this.db.prepare(`
+      INSERT INTO expenses (expense_date, category, description, amount, payment_method, user_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const result = stmt.run(
+      expenseData.expenseDate,
+      expenseData.category,
+      expenseData.description,
+      expenseData.amount,
+      expenseData.paymentMethod,
+      expenseData.userId
+    );
+    return { id: result.lastInsertRowid, ...expenseData };
+  }
+
+  getExpenses(startDate, endDate) {
+    const stmt = this.db.prepare(`
+      SELECT e.*, u.full_name as user_name
+      FROM expenses e
+      LEFT JOIN users u ON e.user_id = u.id
+      WHERE DATE(e.expense_date) BETWEEN ? AND ?
+      ORDER BY e.expense_date DESC, e.created_at DESC
+    `);
+    return stmt.all(startDate, endDate);
+  }
+
+  getExpenseById(id) {
+    return this.db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+  }
+
+  updateExpense(id, expenseData) {
+    const stmt = this.db.prepare(`
+      UPDATE expenses
+      SET expense_date = ?, category = ?, description = ?, amount = ?, payment_method = ?
+      WHERE id = ?
+    `);
+    stmt.run(
+      expenseData.expenseDate,
+      expenseData.category,
+      expenseData.description,
+      expenseData.amount,
+      expenseData.paymentMethod,
+      id
+    );
+    return { id, ...expenseData };
+  }
+
+  deleteExpense(id) {
+    this.db.prepare('DELETE FROM expenses WHERE id = ?').run(id);
+    return { success: true };
+  }
+
+  getExpenseSummary(startDate, endDate) {
+    const summary = this.db.prepare(`
+      SELECT 
+        COUNT(*) as total_count,
+        SUM(amount) as total_amount,
+        AVG(amount) as avg_amount
+      FROM expenses
+      WHERE DATE(expense_date) BETWEEN ? AND ?
+    `).get(startDate, endDate);
+
+    const byCategory = this.db.prepare(`
+      SELECT category, SUM(amount) as total, COUNT(*) as count
+      FROM expenses
+      WHERE DATE(expense_date) BETWEEN ? AND ?
+      GROUP BY category
+      ORDER BY total DESC
+    `).all(startDate, endDate);
+
+    return {
+      ...summary,
+      by_category: byCategory
     };
   }
 }

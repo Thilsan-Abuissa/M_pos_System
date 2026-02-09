@@ -134,6 +134,10 @@
                       <span class="summary-label">Tax</span>
                       <span class="summary-value" id="cartTax">$0.00</span>
                     </div>
+                    <div class="change-section">
+                      <div class="change-label">Change</div>
+                      <div class="change-amount" id="changeAmount">$0.00</div>
+                    </div>
                   </div>
                   <div class="summary-right">
                     <div class="total-section">
@@ -145,9 +149,19 @@
                       <div class="payment-amount" id="paymentAmount">$0.00</div>
                       <input type="hidden" id="paymentInput" value="">
                     </div>
-                    <div class="change-section">
-                      <div class="change-label">Change</div>
-                      <div class="change-amount" id="changeAmount">$0.00</div>
+                    <!-- Drawer & Note Buttons -->
+                    <div style="display: flex; gap: 8px; align-items: stretch;">
+                      <button id="openDrawerBtn" class="open-drawer-btn" style="flex: 1; min-width: 0; height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <rect x="2" y="5" width="20" height="14" rx="2"/>
+                          <path d="M8 12h8"/>
+                        </svg>
+                        <span style="font-size: 13px;">DRAWER</span>
+                      </button>
+                      <button id="noteBtn" class="open-drawer-btn" style="flex: 1; min-width: 0; height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); border-color: #8b5cf6;">
+                        <span style="font-size: 20px;">📝</span>
+                        <span style="font-size: 13px;">NOTE</span>
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -158,21 +172,106 @@
                     <button class="numpad-btn" data-value="1">1</button>
                     <button class="numpad-btn" data-value="2">2</button>
                     <button class="numpad-btn" data-value="3">3</button>
-                    <button class="numpad-btn numpad-clear" data-value="clear">CLEAR</button>
+                    <button class="numpad-btn numpad-clear" data-value="clear" style="background-color: #dc2626; border-color: #dc2626; color: white; font-size: 15px;">CLEAR</button>
                     <button class="numpad-btn" data-value="4">4</button>
                     <button class="numpad-btn" data-value="5">5</button>
                     <button class="numpad-btn" data-value="6">6</button>
-                    <button class="numpad-btn numpad-cash" data-value="cash">CASH</button>
+                    <button id="ticketBtn" class="btn-ticket numpad-btn" style="background-color: #10b981; border-color: #10b981; color: white; font-size: 15px;">🎫 TICKET</button>
                     <button class="numpad-btn" data-value="7">7</button>
                     <button class="numpad-btn" data-value="8">8</button>
                     <button class="numpad-btn" data-value="9">9</button>
-                    <button class="numpad-btn numpad-card" data-value="card">CARD</button>
+                    <button id="paymentBtn" class="btn-payment numpad-btn" style="grid-row: span 2; background-color: #f59e0b; border-color: #f59e0b; color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                      <span style="font-size: 48px;">💳</span>
+                      <span style="font-size: 18px; font-weight: 700;">PAYMENT</span>
+                    </button>
                     <button class="numpad-btn numpad-dot" data-value=".">.</button>
                     <button class="numpad-btn" data-value="0">0</button>
                     <button class="numpad-btn" data-value="00">00</button>
-                    <button class="numpad-btn numpad-loan" data-value="loan">PACKING</button>
-                    <button id="checkoutBtn" class="btn-complete-sale numpad-btn" disabled style="grid-column: span 4;">COMPLETE SALE</button>
                   </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Payment Modal -->
+            <div id="paymentModal" class="payment-modal">
+              <div class="payment-modal-content">
+                <div class="payment-modal-header">
+                  <h2>Payment</h2>
+                  <button class="payment-modal-close" id="closePaymentModal">&times;</button>
+                </div>
+                <div class="payment-modal-body">
+                  <!-- Total Amount Display -->
+                  <div style="background: #f8fafc; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
+                    <div style="font-size: 14px; color: #64748b; margin-bottom: 5px;">Total Amount</div>
+                    <div id="paymentTotalAmount" style="font-size: 32px; font-weight: 700; color: #0f172a;">€0.00</div>
+                    <div id="paymentRemainingAmount" style="font-size: 18px; font-weight: 600; color: #dc2626; margin-top: 10px; display: none;">
+                      Remaining: <span id="remainingValue">€0.00</span>
+                    </div>
+                  </div>
+
+                  <!-- Payment Mode Toggle -->
+                  <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+                    <button id="singlePaymentModeBtn" class="payment-mode-btn active" style="flex: 1; padding: 12px; border: 2px solid #3b82f6; background: #3b82f6; color: white; border-radius: 8px; font-weight: 600; cursor: pointer;">
+                      Single Payment
+                    </button>
+                    <button id="splitPaymentModeBtn" class="payment-mode-btn" style="flex: 1; padding: 12px; border: 2px solid #cbd5e1; background: white; color: #64748b; border-radius: 8px; font-weight: 600; cursor: pointer;">
+                      Split Payment
+                    </button>
+                  </div>
+
+                  <!-- Single Payment Mode -->
+                  <div id="singlePaymentSection">
+                    <div class="payment-methods-grid">
+                      <button class="payment-method-btn payment-cash" data-value="cash">
+                        <span class="payment-icon">💵</span>
+                        <span class="payment-label">CASH</span>
+                      </button>
+                      <button class="payment-method-btn payment-card" data-value="card">
+                        <span class="payment-icon">💳</span>
+                        <span class="payment-label">CARD</span>
+                      </button>
+                      <button class="payment-method-btn payment-packing" data-value="loan">
+                        <span class="payment-icon">📦</span>
+                        <span class="payment-label">PACKING</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <!-- Split Payment Mode -->
+                  <div id="splitPaymentSection" style="display: none;">
+                    <div style="display: flex; flex-direction: column; gap: 15px;">
+                      <!-- Cash Split -->
+                      <div class="split-payment-row" style="background: #f8fafc; padding: 15px; border-radius: 8px;">
+                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+                          <label style="font-weight: 600; font-size: 16px; display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 24px;">💵</span>
+                            <span>Cash</span>
+                          </label>
+                        </div>
+                        <input type="text" inputmode="decimal" id="splitCashAmount" class="split-amount-input" placeholder="0.00" style="width: 100%; padding: 12px; font-size: 18px; border: 2px solid #cbd5e1; border-radius: 8px; text-align: right;">
+                      </div>
+
+                      <!-- Card Split -->
+                      <div class="split-payment-row" style="background: #f8fafc; padding: 15px; border-radius: 8px;">
+                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+                          <label style="font-weight: 600; font-size: 16px; display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 24px;">💳</span>
+                            <span>Card</span>
+                          </label>
+                        </div>
+                        <input type="text" inputmode="decimal" id="splitCardAmount" class="split-amount-input" placeholder="0.00" style="width: 100%; padding: 12px; font-size: 18px; border: 2px solid #cbd5e1; border-radius: 8px; text-align: right;">
+                      </div>
+
+                      <!-- Quick Split Buttons -->
+                      <div style="display: flex; gap: 10px; margin-top: 10px; margin-bottom: 20px;">
+                        <button id="clearSplitBtn" class="btn-secondary" style="width: 100%; padding: 10px; font-size: 14px;">
+                          Clear All
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <button id="checkoutBtn" class="btn-complete-sale-modal" disabled>COMPLETE SALE</button>
                 </div>
               </div>
             </div>
@@ -186,10 +285,6 @@
                   <div class="search-section">
                     <input type="text" id="productSearch" placeholder="Search Product..." autocomplete="off">
                   </div>
-                  
-                  <button class="drawer-btn-small" onclick="openCashDrawer()" title="Open Cash Drawer">
-                    <span class="drawer-icon">💵</span>
-                  </button>
                   
                   <div class="settings-dropdown">
                     <button class="settings-btn" id="settingsBtn">
@@ -208,6 +303,10 @@
                       <button class="settings-menu-item" data-view="sales">
                         <span class="menu-icon">💰</span>
                         <span class="menu-text">Sales</span>
+                      </button>
+                      <button class="settings-menu-item" data-view="expenses">
+                        <span class="menu-icon">💸</span>
+                        <span class="menu-text">Expenses</span>
                       </button>
                       <button class="settings-menu-item" data-view="reports">
                         <span class="menu-icon">📊</span>
@@ -280,9 +379,14 @@
                 <span class="settings-card-title">Sales</span>
                 <span class="settings-card-desc">View sales history</span>
               </button>
+              <button class="settings-card" data-view="expenses">
+                <span class="settings-card-icon">💸</span>
+                <span class="settings-card-title">Expenses</span>
+                <span class="settings-card-desc">Track daily expenses</span>
+              </button>
               <button class="settings-card" data-view="reports">
                 <span class="settings-card-icon">📊</span>
-                <span class="settings-card-title">Reports</span>
+                <span class="settings-card-title">Z Reports</span>
                 <span class="settings-card-desc">Generate business reports</span>
               </button>
               <button class="settings-card" data-view="analytics">
@@ -421,7 +525,6 @@
               <div class="report-tabs">
                 <button class="report-tab active" data-tab="z-reports">Z-Reports</button>
                 <button class="report-tab" data-tab="sales-reports">Sales Reports</button>
-                <button class="report-tab" data-tab="restaurant-reports">Restaurant Reports</button>
               </div>
 
               <!-- Z-Reports Tab -->
@@ -439,6 +542,8 @@
                         <th>Cash</th>
                         <th>Card</th>
                         <th>PACKING</th>
+                        <th>Total Amount</th>
+                        <th>Expenses</th>
                         <th>Total Tax</th>
                         <th>Actions</th>
                       </tr>
@@ -494,34 +599,76 @@
                 </div>
                 <div id="reportResults" class="report-results"></div>
               </div>
+            </div>
+          </div>
+        </div>
 
-              <!-- Restaurant Reports Tab -->
-              <div id="restaurant-reports" class="report-tab-content">
-                <div class="report-filters">
-                  <div class="filter-group">
-                    <label class="filter-label">📅 Select Month</label>
-                    <select id="restaurantReportMonth" class="filter-select">
-                      <option value="1">January</option>
-                      <option value="2">February</option>
-                      <option value="3">March</option>
-                      <option value="4">April</option>
-                      <option value="5">May</option>
-                      <option value="6">June</option>
-                      <option value="7">July</option>
-                      <option value="8">August</option>
-                      <option value="9">September</option>
-                      <option value="10">October</option>
-                      <option value="11">November</option>
-                      <option value="12">December</option>
-                    </select>
-                  </div>
-                  <div class="filter-group">
-                    <label class="filter-label">📅 Year</label>
-                    <select id="restaurantReportYear" class="filter-select"></select>
-                  </div>
-                  <button id="generateRestaurantReportBtn" class="btn-primary btn-large">🍽️ Generate Report</button>
+        <!-- Expenses View -->
+        <div id="expensesView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>💸 Expense Management</h2>
+                <button id="addExpenseBtn" class="btn-primary">➕ Add Expense</button>
+              </div>
+
+              <!-- Expense Filters -->
+              <div class="expense-filter-section" style="margin-bottom: 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 25px; border-radius: 15px; box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3);">
+                <h3 style="color: white; margin: 0 0 20px 0; font-size: 18px; font-weight: 600;">Filter Period</h3>
+                
+                <div class="filter-controls" style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 15px;">
+                  <button class="filter-btn active" data-period="today" style="background: white; color: #667eea; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease; box-shadow: 0 4px 10px rgba(0,0,0,0.1);">Today</button>
+                  <button class="filter-btn" data-period="week" style="background: rgba(255,255,255,0.2); color: white; border: 2px solid white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease;">This Week</button>
+                  <button class="filter-btn" data-period="month" style="background: rgba(255,255,255,0.2); color: white; border: 2px solid white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease;">This Month</button>
+                  <button class="filter-btn" data-period="year" style="background: rgba(255,255,255,0.2); color: white; border: 2px solid white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease;">This Year</button>
+                  <button class="filter-btn" data-period="custom" style="background: rgba(255,255,255,0.2); color: white; border: 2px solid white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease;">Custom Date</button>
                 </div>
-                <div id="restaurantReportResults" class="report-results"></div>
+                
+                <div id="customDateRange" style="display: none; gap: 12px; align-items: center; flex-wrap: wrap; background: rgba(255,255,255,0.15); padding: 15px; border-radius: 10px; backdrop-filter: blur(10px);">
+                  <input type="date" id="expenseStartDate" class="form-control" style="width: 160px; padding: 10px; border: 2px solid white; border-radius: 8px; background: white; font-weight: 500;">
+                  <span style="color: white; font-weight: 600; font-size: 16px;">to</span>
+                  <input type="date" id="expenseEndDate" class="form-control" style="width: 160px; padding: 10px; border: 2px solid white; border-radius: 8px; background: white; font-weight: 500;">
+                  <button id="applyDateFilter" class="btn-secondary" style="background: white; color: #667eea; border: none; padding: 10px 30px; border-radius: 8px; font-weight: 700; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.2); transition: all 0.3s ease;">Apply</button>
+                </div>
+              </div>
+
+              <!-- Expense Summary Cards -->
+              <div class="expense-summary" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px;">
+                <div class="summary-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); color: white; padding: 20px; border-radius: 10px; box-shadow: 0 8px 20px rgba(17, 153, 142, 0.3);">
+                  <div style="font-size: 14px; opacity: 0.9; font-weight: 600;">💰 Net Profit</div>
+                  <div id="netProfit" style="font-size: 32px; font-weight: bold; margin-top: 5px;">€0.00</div>
+                  <div style="font-size: 11px; opacity: 0.8; margin-top: 5px;">Sales - Expenses</div>
+                </div>
+                <div class="summary-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px;">
+                  <div style="font-size: 14px; opacity: 0.9;">Total Expenses</div>
+                  <div id="totalExpenseAmount" style="font-size: 28px; font-weight: bold; margin-top: 5px;">€0.00</div>
+                </div>
+                <div class="summary-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; padding: 20px; border-radius: 10px;">
+                  <div style="font-size: 14px; opacity: 0.9;">Number of Expenses</div>
+                  <div id="totalExpenseCount" style="font-size: 28px; font-weight: bold; margin-top: 5px;">0</div>
+                </div>
+                <div class="summary-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); color: white; padding: 20px; border-radius: 10px;">
+                  <div style="font-size: 14px; opacity: 0.9;">Average Expense</div>
+                  <div id="avgExpenseAmount" style="font-size: 28px; font-weight: bold; margin-top: 5px;">€0.00</div>
+                </div>
+              </div>
+
+              <!-- Expenses Table -->
+              <div class="table-container">
+                <table id="expensesTable">
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Category</th>
+                      <th>Description</th>
+                      <th>Amount</th>
+                      <th>Payment Method</th>
+                      <th>Added By</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="expensesTableBody"></tbody>
+                </table>
               </div>
             </div>
           </div>
@@ -1106,6 +1253,49 @@
     </div>
   </div>
 
+  <!-- Expense Modal -->
+  <div id="expenseModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="expenseModalTitle">Add Expense</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="expenseForm">
+        <input type="hidden" id="expenseId">
+        <div class="form-group">
+          <label>Expense Date *</label>
+          <input type="date" id="expenseDate" required>
+        </div>
+        <div class="form-group">
+          <label>Category *</label>
+          <input type="text" id="expenseCategory" required placeholder="Enter category name">
+        </div>
+        <div class="form-group">
+          <label>Description *</label>
+          <textarea id="expenseDescription" rows="3" required placeholder="Enter expense details"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Amount (€) *</label>
+          <input type="number" id="expenseAmount" step="0.01" min="0" required placeholder="0.00">
+        </div>
+        <div class="form-group">
+          <label>Payment Method *</label>
+          <select id="expensePaymentMethod" required>
+            <option value="">Select Payment Method</option>
+            <option value="Cash">Cash</option>
+            <option value="Card">Card</option>
+            <option value="Bank Transfer">Bank Transfer</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary">Save Expense</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Change Password Modal -->
   <div id="passwordModal" class="modal">
     <div class="modal-content">
@@ -1170,6 +1360,26 @@
         <div class="modal-footer">
           <button type="button" class="btn-secondary cancel-btn">Cancel</button>
           <button type="submit" class="btn-primary">Save to Parking</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Invoice Note Modal -->
+  <div id="noteModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Add Note to Invoice</h2>
+        <span class="close">&times;</span>
+      </div>
+      <form id="noteForm">
+        <div class="form-group">
+          <label>Invoice Note</label>
+          <textarea id="invoiceNote" rows="4" placeholder="Enter note to appear on invoice..." style="width: 100%; padding: 12px; font-size: 14px; border: 2px solid #cbd5e1; border-radius: 8px; resize: vertical;"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="submit" class="btn-primary">Save Note</button>
         </div>
       </form>
     </div>
@@ -1301,25 +1511,48 @@
           </div>
 
           <div class="z-report-section">
-            <h4>Payment Methods</h4>
+            <h4>Payment Methods (Total Collected)</h4>
             <div class="summary-grid">
               <div class="summary-item">
-                <span class="summary-label">Cash:</span>
+                <span class="summary-label">💵 Cash Sales:</span>
                 <span class="summary-value" id="zReportCash">€0.00</span>
               </div>
               <div class="summary-item">
-                <span class="summary-label">Card:</span>
+                <span class="summary-label">💳 Card Sales:</span>
                 <span class="summary-value" id="zReportCard">€0.00</span>
               </div>
               <div class="summary-item">
-                <span class="summary-label">PACKING:</span>
+                <span class="summary-label">📦 PACKING Sales:</span>
                 <span class="summary-value" id="zReportLoan">€0.00</span>
+              </div>
+              <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
+                <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
+                <span class="summary-value" style="font-weight: bold; font-size: 16px; color: #059669;" id="zReportTotalAmount">€0.00</span>
               </div>
             </div>
           </div>
 
           <div class="z-report-section">
-            <h4>Tax Breakdown (German VAT)</h4>
+            <h4>💸 Expenses (Money Spent Today)</h4>
+            <div class="summary-grid">
+              <div class="summary-item" style="grid-column: span 3;">
+                <span class="summary-label">Total Expenses:</span>
+                <span class="summary-value" style="color: #dc2626;" id="zReportTotalExpenses">€0.00</span>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Add Expense (Optional):</label>
+              <input type="number" step="0.01" id="zReportExpenseAmount" placeholder="0.00">
+              <small>Enter any money spent/paid out during the day</small>
+            </div>
+            <div class="form-group">
+              <label>Expense Description:</label>
+              <input type="text" id="zReportExpenseDescription" placeholder="e.g., Supplier payment, utilities, etc.">
+            </div>
+          </div>
+
+          <div class="z-report-section">
+            <h4>Tax Breakdown</h4>
             <div class="summary-grid">
               <div class="summary-item">
                 <span class="summary-label">7% Tax Base:</span>
@@ -1411,6 +1644,7 @@
         <button class="key-btn key-number" data-key="8">8</button>
         <button class="key-btn key-number" data-key="9">9</button>
         <button class="key-btn key-number" data-key="0">0</button>
+        <button class="key-btn key-backspace" data-key="Backspace">⌫</button>
       </div>
       <div class="keyboard-row">
         <button class="key-btn" data-key="Q">Q</button>
@@ -1423,20 +1657,17 @@
         <button class="key-btn" data-key="I">I</button>
         <button class="key-btn" data-key="O">O</button>
         <button class="key-btn" data-key="P">P</button>
-      </div>
-      <div class="keyboard-row">
         <button class="key-btn" data-key="A">A</button>
         <button class="key-btn" data-key="S">S</button>
         <button class="key-btn" data-key="D">D</button>
+      </div>
+      <div class="keyboard-row">
         <button class="key-btn" data-key="F">F</button>
         <button class="key-btn" data-key="G">G</button>
         <button class="key-btn" data-key="H">H</button>
         <button class="key-btn" data-key="J">J</button>
         <button class="key-btn" data-key="K">K</button>
         <button class="key-btn" data-key="L">L</button>
-      </div>
-      <div class="keyboard-row">
-        <button class="key-btn key-shift" data-key="Shift">⇧</button>
         <button class="key-btn" data-key="Z">Z</button>
         <button class="key-btn" data-key="X">X</button>
         <button class="key-btn" data-key="C">C</button>
@@ -1444,12 +1675,22 @@
         <button class="key-btn" data-key="B">B</button>
         <button class="key-btn" data-key="N">N</button>
         <button class="key-btn" data-key="M">M</button>
-        <button class="key-btn key-special" data-key="-">-</button>
-        <button class="key-btn key-special" data-key=".">.</button>
-        <button class="key-btn key-backspace" data-key="Backspace">⌫</button>
       </div>
       <div class="keyboard-row">
         <button class="key-btn key-special" data-key="@">@</button>
+        <button class="key-btn key-special" data-key="_">_</button>
+        <button class="key-btn key-special" data-key="/">/</button>
+        <button class="key-btn key-special" data-key=",">,</button>
+        <button class="key-btn key-special" data-key="#">#</button>
+        <button class="key-btn key-special" data-key="%">%</button>
+        <button class="key-btn key-special" data-key="&">&</button>
+        <button class="key-btn key-special" data-key="+">&plus;</button>
+        <button class="key-btn key-special" data-key="(">(</button>
+        <button class="key-btn key-special" data-key=")">)</button>
+        <button class="key-btn key-special" data-key="-">-</button>
+        <button class="key-btn key-special" data-key=".">.</button>
+      </div>
+      <div class="keyboard-row">
         <button class="key-btn key-space" data-key=" ">SPACE</button>
         <button class="key-btn key-done" data-key="Done">✓ DONE</button>
       </div>

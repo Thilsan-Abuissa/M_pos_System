@@ -4,6 +4,7 @@ let cart = [];
 let allProducts = [];
 let allCategories = [];
 let selectedPaymentMethod = null; // No default - must select payment method
+let paymentMode = 'single'; // 'single' or 'split'
 let systemSettings = null; // System settings
 let currentLogoData = ''; // Current logo data
 let scaleConnected = false; // Scale connection status
@@ -13,6 +14,7 @@ let scaleDebugVisible = false; // Debug panel visibility
 let lastSale = null; // Store last sale for reprinting
 let lastSalePaymentMethod = null; // Track payment method for drawer-open-on-print
 let isWeightModalOpen = false; // Flag to prevent multiple modal opens
+let currentInvoiceNote = ''; // Store note for current invoice
 
 // Scale Debug Functions for Touchscreen
 function addScaleDebugLog(message, type = 'info') {
@@ -69,9 +71,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Role-based permissions - Only admin can manage users and system settings
 const PERMISSIONS = {
-  cashier: ['checkout', 'products', 'sales', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
-  manager: ['checkout', 'products', 'sales', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
-  admin: ['checkout', 'products', 'sales', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'users', 'system', 'categories', 'settings']
+  cashier: ['checkout', 'products', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  manager: ['checkout', 'products', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  admin: ['checkout', 'products', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'users', 'system', 'categories', 'settings']
 };
 
 // Initialize app
@@ -265,6 +267,7 @@ function selectUser(user) {
     id: user.id,
     username: user.username,
     role: user.role,
+    full_name: user.full_name,
     name: user.full_name
   };
   
@@ -371,6 +374,9 @@ function loadViewData(view) {
       break;
     case 'reports':
       if (hasPermission('reports')) loadReportsView();
+      break;
+    case 'expenses':
+      loadExpensesView();
       break;
     case 'analytics':
       if (hasPermission('reports')) loadAnalyticsView();
@@ -613,23 +619,6 @@ function setupCheckoutHandlers() {
         updateCartSummary();
       } else if (value === 'enter') {
         // Enter does nothing for payment numpad
-      } else if (['cash', 'card', 'loan'].includes(value)) {
-        // Payment method selected
-        selectedPaymentMethod = value;
-        console.log('Payment method:', value);
-        // Enable Complete Sale button
-        const checkoutBtn = document.getElementById('checkoutBtn');
-        if (checkoutBtn) checkoutBtn.disabled = false;
-        // Highlight selected payment button
-        document.querySelectorAll('.numpad-btn').forEach(b => {
-          if (b.dataset.value === value) {
-            b.style.opacity = '1';
-            b.style.transform = 'scale(1.05)';
-          } else if (['cash', 'card', 'loan'].includes(b.dataset.value)) {
-            b.style.opacity = '0.8';
-            b.style.transform = 'scale(1)';
-          }
-        });
       } else {
         // Number or decimal - add to payment input
         const paymentInput = document.getElementById('paymentInput');
@@ -670,7 +659,284 @@ function setupCheckoutHandlers() {
   checkoutBtn.addEventListener('click', async () => {
     await completeSale();
   });
+
+  // Add TICKET button handler
+  const ticketBtn = document.getElementById('ticketBtn');
+  if (ticketBtn) {
+    ticketBtn.addEventListener('click', async () => {
+      if (ticketBtn.disabled || cart.length === 0) return;
+      await printTicket();
+    });
+  }
+
+  // Add NOTE button handler
+  const noteBtn = document.getElementById('noteBtn');
+  if (noteBtn) {
+    noteBtn.addEventListener('click', () => {
+      openNoteModal();
+    });
+  }
+
+  // Add PAYMENT button handler - opens modal
+  const paymentBtn = document.getElementById('paymentBtn');
+  if (paymentBtn) {
+    paymentBtn.addEventListener('click', () => {
+      if (paymentBtn.disabled || cart.length === 0) return;
+      openPaymentModal();
+    });
+  }
+
+  // Add Open Drawer button handler
+  const openDrawerBtn = document.getElementById('openDrawerBtn');
+  if (openDrawerBtn) {
+    openDrawerBtn.addEventListener('click', () => {
+      openCashDrawer();
+    });
+  }
+
+  // Payment modal handlers
+  setupPaymentModal();
 }
+
+function setupPaymentModal() {
+  const paymentModal = document.getElementById('paymentModal');
+  const closePaymentModal = document.getElementById('closePaymentModal');
+  const paymentMethodBtns = document.querySelectorAll('.payment-method-btn');
+  const checkoutBtnModal = document.querySelector('.btn-complete-sale-modal');
+  
+  // Payment mode toggle buttons
+  const singlePaymentModeBtn = document.getElementById('singlePaymentModeBtn');
+  const splitPaymentModeBtn = document.getElementById('splitPaymentModeBtn');
+  const singlePaymentSection = document.getElementById('singlePaymentSection');
+  const splitPaymentSection = document.getElementById('splitPaymentSection');
+  
+  // Split payment controls
+  const splitCashAmount = document.getElementById('splitCashAmount');
+  const splitCardAmount = document.getElementById('splitCardAmount');
+  const clearSplitBtn = document.getElementById('clearSplitBtn');
+
+  // Close modal button
+  if (closePaymentModal) {
+    closePaymentModal.addEventListener('click', () => {
+      closePaymentModalFunc();
+    });
+  }
+
+  // Close modal when clicking outside
+  if (paymentModal) {
+    paymentModal.addEventListener('click', (e) => {
+      if (e.target === paymentModal) {
+        closePaymentModalFunc();
+      }
+    });
+  }
+
+  // Payment mode toggle
+  if (singlePaymentModeBtn) {
+    singlePaymentModeBtn.addEventListener('click', () => {
+      singlePaymentModeBtn.classList.add('active');
+      singlePaymentModeBtn.style.background = '#3b82f6';
+      singlePaymentModeBtn.style.color = 'white';
+      singlePaymentModeBtn.style.borderColor = '#3b82f6';
+      
+      splitPaymentModeBtn.classList.remove('active');
+      splitPaymentModeBtn.style.background = 'white';
+      splitPaymentModeBtn.style.color = '#64748b';
+      splitPaymentModeBtn.style.borderColor = '#cbd5e1';
+      
+      singlePaymentSection.style.display = 'block';
+      splitPaymentSection.style.display = 'none';
+      
+      paymentMode = 'single';
+      updatePaymentModalValidation();
+    });
+  }
+
+  if (splitPaymentModeBtn) {
+    splitPaymentModeBtn.addEventListener('click', () => {
+      splitPaymentModeBtn.classList.add('active');
+      splitPaymentModeBtn.style.background = '#3b82f6';
+      splitPaymentModeBtn.style.color = 'white';
+      splitPaymentModeBtn.style.borderColor = '#3b82f6';
+      
+      singlePaymentModeBtn.classList.remove('active');
+      singlePaymentModeBtn.style.background = 'white';
+      singlePaymentModeBtn.style.color = '#64748b';
+      singlePaymentModeBtn.style.borderColor = '#cbd5e1';
+      
+      singlePaymentSection.style.display = 'none';
+      splitPaymentSection.style.display = 'block';
+      
+      paymentMode = 'split';
+      updatePaymentModalValidation();
+    });
+  }
+
+  // Split amount input handlers
+  if (splitCashAmount) {
+    splitCashAmount.addEventListener('input', updatePaymentModalValidation);
+  }
+
+  if (splitCardAmount) {
+    splitCardAmount.addEventListener('input', updatePaymentModalValidation);
+  }
+
+  // Clear split button
+  if (clearSplitBtn) {
+    clearSplitBtn.addEventListener('click', () => {
+      splitCashAmount.value = '';
+      splitCardAmount.value = '';
+      
+      updatePaymentModalValidation();
+    });
+  }
+
+  // Single payment method selection
+  paymentMethodBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const value = btn.dataset.value;
+      
+      // Remove selected class from all buttons
+      paymentMethodBtns.forEach(b => b.classList.remove('selected'));
+      
+      // Add selected class to clicked button
+      btn.classList.add('selected');
+      
+      // Set selected payment method
+      selectedPaymentMethod = value;
+      console.log('Payment method selected:', value);
+      
+      updatePaymentModalValidation();
+    });
+  });
+}
+
+function updatePaymentModalValidation() {
+  const checkoutBtnModal = document.querySelector('.btn-complete-sale-modal');
+  const paymentRemainingAmount = document.getElementById('paymentRemainingAmount');
+  const remainingValue = document.getElementById('remainingValue');
+  
+  if (!checkoutBtnModal) return;
+  
+  const total = calculateTotal();
+  
+  if (paymentMode === 'single') {
+    // Single payment mode - require one method selected
+    checkoutBtnModal.disabled = !selectedPaymentMethod;
+    if (paymentRemainingAmount) {
+      paymentRemainingAmount.style.display = 'none';
+    }
+  } else {
+    // Split payment mode - validate amounts
+    const splitCashAmount = document.getElementById('splitCashAmount');
+    const splitCardAmount = document.getElementById('splitCardAmount');
+    
+    let cashAmount = 0;
+    let cardAmount = 0;
+    
+    cashAmount = parseFloat(splitCashAmount.value) || 0;
+    cardAmount = parseFloat(splitCardAmount.value) || 0;
+    
+    const totalPaid = cashAmount + cardAmount;
+    const remaining = total - totalPaid;
+    
+    // Show remaining amount
+    if (paymentRemainingAmount && remainingValue) {
+      if (totalPaid > 0) {
+        paymentRemainingAmount.style.display = 'block';
+        remainingValue.textContent = '€' + remaining.toFixed(2);
+        
+        if (remaining > 0.01) {
+          remainingValue.style.color = '#dc2626'; // Red for remaining
+        } else if (remaining < -0.01) {
+          remainingValue.style.color = '#f59e0b'; // Orange for overpayment
+        } else {
+          remainingValue.style.color = '#059669'; // Green for exact
+        }
+      } else {
+        paymentRemainingAmount.style.display = 'none';
+      }
+    }
+    
+    // Enable checkout if at least one method is selected and total matches (within 1 cent tolerance)
+    const hasPayment = totalPaid > 0;
+    const amountValid = Math.abs(remaining) < 0.01;
+    
+    checkoutBtnModal.disabled = !(hasPayment && amountValid && totalPaid > 0);
+  }
+}
+
+function openPaymentModal() {
+  const paymentModal = document.getElementById('paymentModal');
+  const paymentTotalAmount = document.getElementById('paymentTotalAmount');
+  
+  if (paymentModal) {
+    paymentModal.classList.add('active');
+    
+    // Display total amount
+    const total = calculateTotal();
+    if (paymentTotalAmount) {
+      paymentTotalAmount.textContent = '€' + total.toFixed(2);
+    }
+    
+    // Reset single payment selections
+    document.querySelectorAll('.payment-method-btn').forEach(btn => {
+      btn.classList.remove('selected');
+    });
+    
+    // Reset split payment
+    const splitCashAmount = document.getElementById('splitCashAmount');
+    const splitCardAmount = document.getElementById('splitCardAmount');
+    
+    if (splitCashAmount) {
+      splitCashAmount.value = '';
+    }
+    if (splitCardAmount) {
+      splitCardAmount.value = '';
+    }
+    
+    // Reset to single payment mode
+    const singlePaymentModeBtn = document.getElementById('singlePaymentModeBtn');
+    const splitPaymentModeBtn = document.getElementById('splitPaymentModeBtn');
+    const singlePaymentSection = document.getElementById('singlePaymentSection');
+    const splitPaymentSection = document.getElementById('splitPaymentSection');
+    
+    if (singlePaymentModeBtn) {
+      singlePaymentModeBtn.classList.add('active');
+      singlePaymentModeBtn.style.background = '#3b82f6';
+      singlePaymentModeBtn.style.color = 'white';
+      singlePaymentModeBtn.style.borderColor = '#3b82f6';
+    }
+    
+    if (splitPaymentModeBtn) {
+      splitPaymentModeBtn.classList.remove('active');
+      splitPaymentModeBtn.style.background = 'white';
+      splitPaymentModeBtn.style.color = '#64748b';
+      splitPaymentModeBtn.style.borderColor = '#cbd5e1';
+    }
+    
+    if (singlePaymentSection) singlePaymentSection.style.display = 'block';
+    if (splitPaymentSection) splitPaymentSection.style.display = 'none';
+    
+    paymentMode = 'single';
+    
+    const checkoutBtnModal = document.querySelector('.btn-complete-sale-modal');
+    if (checkoutBtnModal) {
+      checkoutBtnModal.disabled = true;
+    }
+  }
+}
+
+function closePaymentModalFunc() {
+  const paymentModal = document.getElementById('paymentModal');
+  if (paymentModal) {
+    paymentModal.classList.remove('active');
+  }
+  // Reset payment method selection
+  selectedPaymentMethod = null;
+  paymentMode = 'single';
+}
+
 
 async function loadCheckoutView() {
   // Load system settings if not already loaded
@@ -1807,9 +2073,13 @@ function removeFromCart(cartItemId) {
 function setupInlineCartEditing() {
   const currencySymbol = systemSettings?.currency_symbol || '$';
   
+  console.log('Setting up inline cart editing...');
+  
   // Handle quantity editing - inline
   document.querySelectorAll('.editable-quantity').forEach(el => {
-    el.addEventListener('click', function() {
+    el.addEventListener('click', function(e) {
+      e.stopPropagation();
+      console.log('Quantity clicked');
       const cartItemId = parseInt(this.dataset.cartItemId);
       const cartItem = cart.find(item => item.cartItemId === cartItemId);
       if (!cartItem) return;
@@ -1846,7 +2116,19 @@ function setupInlineCartEditing() {
         updateCartSummary();
       };
       
-      input.addEventListener('blur', saveValue);
+      input.addEventListener('blur', (e) => {
+        // Check if blur is caused by clicking on virtual keyboard
+        setTimeout(() => {
+          const activeEl = document.activeElement;
+          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
+          if (!isKeyboardClick) {
+            saveValue();
+          } else {
+            // Refocus the input if keyboard was clicked
+            input.focus();
+          }
+        }, 100);
+      });
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') saveValue();
         if (e.key === 'Escape') updateCartDisplay();
@@ -1856,7 +2138,9 @@ function setupInlineCartEditing() {
   
   // Handle price editing - inline
   document.querySelectorAll('.editable-price').forEach(el => {
-    el.addEventListener('click', function() {
+    el.addEventListener('click', function(e) {
+      e.stopPropagation();
+      console.log('Price clicked');
       const cartItemId = parseInt(this.dataset.cartItemId);
       const cartItem = cart.find(item => item.cartItemId === cartItemId);
       if (!cartItem) return;
@@ -1887,12 +2171,131 @@ function setupInlineCartEditing() {
         updateCartSummary();
       };
       
-      input.addEventListener('blur', saveValue);
+      input.addEventListener('blur', (e) => {
+        setTimeout(() => {
+          const activeEl = document.activeElement;
+          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
+          if (!isKeyboardClick) {
+            saveValue();
+          } else {
+            input.focus();
+          }
+        }, 100);
+      });
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') saveValue();
         if (e.key === 'Escape') updateCartDisplay();
       });
     });
+  });
+
+  // Handle item name editing - inline
+  document.querySelectorAll('.editable-name').forEach(el => {
+    el.addEventListener('click', function(e) {
+      e.stopPropagation();
+      console.log('Name clicked');
+      const cartItemId = parseInt(this.dataset.cartItemId);
+      const cartItem = cart.find(item => item.cartItemId === cartItemId);
+      if (!cartItem) return;
+      
+      const currentValue = cartItem.productName;
+      
+      // Replace with input
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = currentValue;
+      input.style.cssText = 'width: 100%; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+      
+      this.textContent = '';
+      this.appendChild(input);
+      input.focus();
+      input.select();
+      
+      const saveValue = () => {
+        const newValue = input.value.trim();
+        if (newValue.length > 0) {
+          cartItem.productName = newValue;
+        }
+        updateCartDisplay();
+      };
+      
+      input.addEventListener('blur', (e) => {
+        setTimeout(() => {
+          const activeEl = document.activeElement;
+          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
+          if (!isKeyboardClick) {
+            saveValue();
+          } else {
+            input.focus();
+          }
+        }, 100);
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') saveValue();
+        if (e.key === 'Escape') updateCartDisplay();
+      });
+    });
+  });
+
+  // Handle discount editing - inline
+  document.querySelectorAll('.editable-discount').forEach(el => {
+    el.addEventListener('click', function(e) {
+      e.stopPropagation();
+      console.log('Discount clicked');
+      const cartItemId = parseInt(this.dataset.cartItemId);
+      const cartItem = cart.find(item => item.cartItemId === cartItemId);
+      if (!cartItem) return;
+      
+      const currentValue = (cartItem.discount || 0).toFixed(2);
+      
+      // Replace with input
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = '0.01';
+      input.min = '0';
+      input.max = cartItem.subtotal.toFixed(2);
+      input.value = currentValue;
+      input.style.cssText = 'width: 80px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+      
+      this.textContent = '';
+      this.appendChild(input);
+      input.focus();
+      input.select();
+      
+      const saveValue = () => {
+        const newValue = parseFloat(input.value);
+        if (!isNaN(newValue) && newValue >= 0 && newValue <= cartItem.subtotal) {
+          cartItem.discount = newValue;
+        } else if (newValue > cartItem.subtotal) {
+          alert('Discount cannot be greater than item subtotal');
+        }
+        updateCartDisplay();
+        updateCartSummary();
+      };
+      
+      input.addEventListener('blur', (e) => {
+        setTimeout(() => {
+          const activeEl = document.activeElement;
+          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
+          if (!isKeyboardClick) {
+            saveValue();
+          } else {
+            input.focus();
+          }
+        }, 100);
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') saveValue();
+        if (e.key === 'Escape') updateCartDisplay();
+      });
+    });
+  });
+  
+  console.log('Cart editing handlers attached:', {
+    quantity: document.querySelectorAll('.editable-quantity').length,
+    price: document.querySelectorAll('.editable-price').length,
+    name: document.querySelectorAll('.editable-name').length,
+    discount: document.querySelectorAll('.editable-discount').length
   });
 }
 
@@ -1901,6 +2304,8 @@ function updateCartDisplay() {
   const cartTableBody = document.getElementById('cartTableBody');
   console.log('cartTableBody element:', cartTableBody);
   const checkoutBtn = document.getElementById('checkoutBtn');
+  const ticketBtn = document.getElementById('ticketBtn');
+  const paymentBtn = document.getElementById('paymentBtn');
   const currencySymbol = systemSettings?.currency_symbol || '$';
   
   // Reset payment method selection and button highlighting
@@ -1916,14 +2321,38 @@ function updateCartDisplay() {
     console.log('Cart is empty, showing empty message');
     cartTableBody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 40px; color: #a0aec0;">Cart is empty</td></tr>';
     checkoutBtn.disabled = true;
+    // Disable TICKET and PAYMENT buttons when cart is empty
+    if (ticketBtn) {
+      ticketBtn.disabled = true;
+      ticketBtn.style.opacity = '0.5';
+      ticketBtn.style.cursor = 'not-allowed';
+    }
+    if (paymentBtn) {
+      paymentBtn.disabled = true;
+      paymentBtn.style.opacity = '0.5';
+      paymentBtn.style.cursor = 'not-allowed';
+    }
   } else {
     console.log('Cart has items, rendering...');
+    // Enable TICKET and PAYMENT buttons when cart has items
+    if (ticketBtn) {
+      ticketBtn.disabled = false;
+      ticketBtn.style.opacity = '1';
+      ticketBtn.style.cursor = 'pointer';
+    }
+    if (paymentBtn) {
+      paymentBtn.disabled = false;
+      paymentBtn.style.opacity = '1';
+      paymentBtn.style.cursor = 'pointer';
+    }
     cartTableBody.innerHTML = cart.map(item => {
       const unit = item.isWeightBased ? 'kg' : 'pc';
       const unitLabel = item.isWeightBased ? '/kg' : '/pc';
+      const discount = item.discount || 0;
+      const finalTotal = item.subtotal - discount;
       return `
       <tr>
-        <td>${item.productName}</td>
+        <td class="editable-name" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${item.productName}</td>
         <td class="editable-price" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${currencySymbol}${item.unitPrice.toFixed(2)}${unitLabel}</td>
         <td>
           <div style="display: flex; align-items: center; gap: 8px; justify-content: center;">
@@ -1931,8 +2360,8 @@ function updateCartDisplay() {
             <button onclick="removeFromCart(${item.cartItemId})" style="background: #fc8181; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">×</button>
           </div>
         </td>
-        <td>${currencySymbol}0.00</td>
-        <td style="font-weight: 800; color: #6E8FAF;">${currencySymbol}${item.subtotal.toFixed(2)}</td>
+        <td class="editable-discount" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${currencySymbol}${discount.toFixed(2)}</td>
+        <td style="font-weight: 800; color: #6E8FAF;">${currencySymbol}${finalTotal.toFixed(2)}</td>
       </tr>
     `;
     }).join('');
@@ -1948,13 +2377,25 @@ function updateCartDisplay() {
   updateCustomerDisplayData();
 }
 
+function calculateTotal() {
+  const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  const totalDiscount = cart.reduce((sum, item) => sum + (item.discount || 0), 0);
+  return subtotalBeforeDiscount - totalDiscount;
+}
+
 function updateCartSummary() {
   // Update summary
   const currencySymbol = systemSettings?.currency_symbol || '$';
   
   // Product prices already include tax - we need to extract the tax amount
   // Total = sum of all product prices (tax-included)
-  const total = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  
+  // Calculate total discount from all items
+  const totalDiscount = cart.reduce((sum, item) => sum + (item.discount || 0), 0);
+  
+  // Final total after discounts
+  const total = subtotalBeforeDiscount - totalDiscount;
   
   // Calculate base price (before tax) and tax amount for each product
   let totalBasePrice = 0;
@@ -1962,17 +2403,16 @@ function updateCartSummary() {
   
   cart.forEach(item => {
     const taxRate = item.taxRate || 0;
+    const itemFinalPrice = item.subtotal - (item.discount || 0);
     // Reverse calculation: Base = Total / (1 + tax_rate)
-    const basePrice = item.subtotal / (1 + taxRate);
-    const taxAmount = item.subtotal - basePrice;
+    const basePrice = itemFinalPrice / (1 + taxRate);
+    const taxAmount = itemFinalPrice - basePrice;
     
     totalBasePrice += basePrice;
     totalTaxAmount += taxAmount;
   });
   
   updateCustomerDisplayData();
-
-  const discount = 0; // Could implement discount logic
   
   // Get payment amount from payment input field or default to total
   const paymentInput = document.getElementById('paymentInput');
@@ -1982,18 +2422,129 @@ function updateCartSummary() {
   
   document.getElementById('cartSubtotal').textContent = `${currencySymbol}${totalBasePrice.toFixed(2)}`;
   document.getElementById('cartTax').textContent = `${currencySymbol}${totalTaxAmount.toFixed(2)}`;
-  document.getElementById('cartDiscount').textContent = `${currencySymbol}${discount.toFixed(2)}`;
+  document.getElementById('cartDiscount').textContent = `${currencySymbol}${totalDiscount.toFixed(2)}`;
   document.getElementById('cartTotal').textContent = `${currencySymbol}${total.toFixed(2)}`;
   document.getElementById('paymentAmount').textContent = `${currencySymbol}${paymentAmount.toFixed(2)}`;
   document.getElementById('changeAmount').textContent = `${currencySymbol}${change.toFixed(2)}`;
 }
 
+// Print ticket without payment (for quotation/estimation purposes)
+async function printTicket() {
+  if (cart.length === 0) {
+    showAlert('Cart is empty. Add items before printing a ticket.', 'warning', 'Empty Cart');
+    return;
+  }
+
+  // Load system settings if not loaded
+  if (!systemSettings) {
+    systemSettings = await window.api.getSystemSettings();
+  }
+
+  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const ownerName = systemSettings?.owner_name || '';
+  const nieNumber = systemSettings?.nie_number || '';
+  const companyAddress = systemSettings?.company_address || '';
+
+  // Calculate totals from cart
+  let subtotal = 0;
+  let tax = 0;
+  let total = 0;
+
+  const taxBreakdown = {};
+
+  cart.forEach(item => {
+    const taxRate = item.taxRate || 0;
+    const basePrice = item.subtotal / (1 + taxRate);
+    const taxAmount = item.subtotal - basePrice;
+    
+    subtotal += basePrice;
+    tax += taxAmount;
+    total += item.subtotal;
+
+    // Track tax breakdown
+    const taxRatePercent = Math.round(taxRate * 100);
+    if (!taxBreakdown[taxRatePercent]) {
+      taxBreakdown[taxRatePercent] = {
+        base: 0,
+        tax: 0,
+        total: 0
+      };
+    }
+    taxBreakdown[taxRatePercent].base += basePrice;
+    taxBreakdown[taxRatePercent].tax += taxAmount;
+    taxBreakdown[taxRatePercent].total += item.subtotal;
+  });
+
+  // Generate tax breakdown HTML
+  const taxBreakdownHtml = Object.keys(taxBreakdown).sort().map(rate => `
+    <div class="receipt-item" style="font-size: 12px; padding: 2px 0;">
+      <span>IVA ${rate}%</span>
+      <span>Base: ${currencySymbol}${taxBreakdown[rate].base.toFixed(2)}</span>
+      <span>Cuota: ${currencySymbol}${taxBreakdown[rate].tax.toFixed(2)}</span>
+      <span>Total: ${currencySymbol}${taxBreakdown[rate].total.toFixed(2)}</span>
+    </div>
+  `).join('');
+
+  // Create ticket data for thermal printer
+  const taxBreakdownRows = Object.keys(taxBreakdown)
+    .map(r => parseInt(r, 10))
+    .filter(r => Number.isFinite(r))
+    .sort((a, b) => a - b)
+    .map(rate => ({
+      rate,
+      base: taxBreakdown[rate].base,
+      tax: taxBreakdown[rate].tax,
+      total: taxBreakdown[rate].total
+    }));
+
+  const ticketData = {
+    storeName: storeName,
+    ownerName: ownerName,
+    nieNumber: nieNumber,
+    companyAddress: companyAddress,
+    receiptId: 'TICKET',
+    date: new Date().toLocaleString(),
+    items: cart.map(item => ({
+      name: item.name,
+      quantity: item.quantity,
+      subtotal: item.subtotal
+    })),
+    subtotal: subtotal,
+    tax: tax,
+    total: total,
+    taxBreakdown: taxBreakdownRows,
+    paymentMethod: 'UNPAID',
+    currency: currencySymbol,
+    footer: 'TICKET - NOT PAID',
+    cashier: currentUser.full_name
+  };
+
+  try {
+    console.log('Printing ticket to thermal printer...');
+    const result = await window.api.printReceipt(ticketData);
+    
+    if (result.success) {
+      showAlert('Ticket printed successfully!', 'success', 'Ticket Printed');
+    } else {
+      console.error('Thermal print error:', result.error);
+      showAlert('Failed to print ticket: ' + result.error, 'error', 'Print Error');
+    }
+  } catch (error) {
+    console.error('Error printing ticket:', error);
+    showAlert('Error printing ticket: ' + error.message, 'error', 'Print Error');
+  }
+}
+
 async function completeSale() {
   if (cart.length === 0) return;
   
-  if (!selectedPaymentMethod) {
-    alert('Please select a payment method: CASH, CARD, or PACKING');
-    return;
+  // Validate payment based on mode
+  if (paymentMode === 'single') {
+    if (!selectedPaymentMethod) {
+      alert('Please select a payment method: CASH, CARD, or PACKING');
+      return;
+    }
   }
   
   // Load system settings if not loaded
@@ -2018,7 +2569,50 @@ async function completeSale() {
   });
   
   const discount = 0;
-  const paymentMethod = selectedPaymentMethod;
+  
+  // Determine payment method and amounts
+  let paymentMethod = selectedPaymentMethod;
+  let paymentAmount = total;
+  let changeAmount = 0;
+  let splitPayments = null;
+  
+  if (paymentMode === 'split') {
+    // Get split payment amounts
+    const splitCashAmount = document.getElementById('splitCashAmount');
+    const splitCardAmount = document.getElementById('splitCardAmount');
+    
+    const cashAmount = parseFloat(splitCashAmount.value) || 0;
+    const cardAmount = parseFloat(splitCardAmount.value) || 0;
+    
+    if (cashAmount === 0 && cardAmount === 0) {
+      alert('Please enter payment amounts');
+      return;
+    }
+    
+    const totalPaid = cashAmount + cardAmount;
+    if (Math.abs(totalPaid - total) > 0.01) {
+      alert('Payment amounts must equal the total');
+      return;
+    }
+    
+    // Store split payment details
+    splitPayments = {
+      cash: cashAmount,
+      card: cardAmount
+    };
+    
+    // Set payment method as 'split' for database
+    paymentMethod = 'split';
+    paymentAmount = totalPaid;
+    changeAmount = 0; // No change in split payments
+  } else {
+    // Single payment mode
+    // Calculate payment amount and change
+    const paymentInput = document.getElementById('paymentInput');
+    const paymentAmountText = paymentInput ? paymentInput.value : '';
+    paymentAmount = paymentAmountText ? parseFloat(paymentAmountText) : total;
+    changeAmount = paymentMethod === 'cash' ? Math.max(0, paymentAmount - total) : 0;
+  }
   
   // If loan is selected, open loan customer info modal
   if (paymentMethod === 'loan') {
@@ -2032,13 +2626,20 @@ async function completeSale() {
     discount,
     total,
     paymentMethod,
+    paymentAmount,
+    changeAmount,
     cashierId: currentUser.id,
-    items: cart
+    items: cart,
+    splitPayments: splitPayments, // Include split payment details
+    notes: currentInvoiceNote || null // Include invoice note
   };
   
   try {
     const sale = await window.api.createSale(saleData);
     lastSalePaymentMethod = paymentMethod;
+    
+    // Close payment modal
+    closePaymentModalFunc();
     
     // Show receipt
     showReceipt(sale);
@@ -2046,12 +2647,16 @@ async function completeSale() {
     // Clear cart
     cart = [];
     
+    // Clear invoice note
+    currentInvoiceNote = '';
+    
     // Clear payment input
     const paymentInput = document.getElementById('paymentInput');
     if (paymentInput) paymentInput.value = '';
     
     // Reset payment method selection
     selectedPaymentMethod = null;
+    paymentMode = 'single';
     document.querySelectorAll('.numpad-btn').forEach(b => {
       if (['cash', 'card', 'loan'].includes(b.dataset.value)) {
         b.style.opacity = '0.8';
@@ -2152,11 +2757,47 @@ function showReceipt(sale) {
         <span>TOTAL:</span>
         <span>${currencySymbol}${sale.total.toFixed(2)}</span>
       </div>
-      <div class="receipt-item">
-        <span>Payment Method:</span>
-        <span>${sale.payment_method.toUpperCase()}</span>
-      </div>
+      ${sale.payment_method === 'split' && sale.split_payments ? `
+        <div class="receipt-item" style="border-top: 1px solid #000; padding-top: 8px; margin-top: 8px;">
+          <span>Payment Method:</span>
+          <span>SPLIT</span>
+        </div>
+        ${sale.split_payments.cash > 0 ? `
+          <div class="receipt-item">
+            <span>💵 Cash:</span>
+            <span>${currencySymbol}${sale.split_payments.cash.toFixed(2)}</span>
+          </div>
+        ` : ''}
+        ${sale.split_payments.card > 0 ? `
+          <div class="receipt-item">
+            <span>💳 Card:</span>
+            <span>${currencySymbol}${sale.split_payments.card.toFixed(2)}</span>
+          </div>
+        ` : ''}
+      ` : `
+        <div class="receipt-item">
+          <span>Payment Method:</span>
+          <span>${sale.payment_method.toUpperCase()}</span>
+        </div>
+        ${sale.payment_method === 'cash' && sale.payment_amount ? `
+          <div class="receipt-item">
+            <span>Payment:</span>
+            <span>${currencySymbol}${(sale.payment_amount || 0).toFixed(2)}</span>
+          </div>
+          <div class="receipt-item" style="font-weight: bold;">
+            <span>Change:</span>
+            <span>${currencySymbol}${(sale.change_amount || 0).toFixed(2)}</span>
+          </div>
+        ` : ''}
+      `}
     </div>
+    
+    ${sale.notes ? `
+      <div class="receipt-note" style="border-top: 2px dashed #ccc; padding-top: 12px; margin-top: 12px;">
+        <div style="font-weight: bold; font-size: 14px; margin-bottom: 5px;">NOTE:</div>
+        <div style="font-size: 13px; white-space: pre-wrap;">${sale.notes}</div>
+      </div>
+    ` : ''}
     
     <div class="receipt-footer">
       <p>${receiptFooter}</p>
@@ -2179,6 +2820,24 @@ function openLoanModal(total, subtotal, tax) {
   modal.dataset.total = total;
   modal.dataset.subtotal = subtotal;
   modal.dataset.tax = tax;
+}
+
+// ============== NOTE FUNCTIONS ==============
+function openNoteModal() {
+  const modal = document.getElementById('noteModal');
+  const noteInput = document.getElementById('invoiceNote');
+  
+  // Load current note if exists
+  if (noteInput) {
+    noteInput.value = currentInvoiceNote || '';
+  }
+  
+  modal.classList.add('active');
+  
+  // Focus on textarea
+  setTimeout(() => {
+    if (noteInput) noteInput.focus();
+  }, 100);
 }
 
 async function completeLoanSale(customerType, customerName, customerPhone, restaurantName, restaurantNie, notes) {
@@ -4347,6 +5006,23 @@ function setupLoanHandlers() {
     document.getElementById('restaurantFields').style.display = 'none';
     document.getElementById('restaurantNieField').style.display = 'none';
   });
+
+  // Note form submit
+  document.getElementById('noteForm')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const noteInput = document.getElementById('invoiceNote');
+    
+    // Save the note
+    currentInvoiceNote = noteInput.value.trim();
+    
+    // Close modal
+    closeModal('noteModal');
+    
+    // Show confirmation if note was added
+    if (currentInvoiceNote) {
+      showAlert('Note added to invoice', 'success');
+    }
+  });
   
   // Search loan button
   document.getElementById('searchLoanBtn')?.addEventListener('click', () => {
@@ -4378,9 +5054,13 @@ function setupLoanHandlers() {
 function setupModalHandlers() {
   // Close buttons
   document.querySelectorAll('.close, .cancel-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       const modal = e.target.closest('.modal');
       if (modal) {
+        // If closing the receipt modal, open cash drawer first
+        if (modal.id === 'receiptModal') {
+          await openCashDrawer();
+        }
         closeModal(modal.id);
       }
     });
@@ -4542,14 +5222,15 @@ function setupVirtualKeyboard() {
       const isDone = btn.classList.contains('key-done') || key === 'Done';
       const isSpace = btn.classList.contains('key-space') || key === ' ';
       const isShift = btn.classList.contains('key-shift') || key === 'Shift';
+      const isSpecial = btn.classList.contains('key-special');
       const isDecimal = key === '.';
 
       // Letter keys are defined with uppercase A-Z in data-key.
       const isLetterKey = !!(key && key.length === 1 && /[A-Z]/.test(key) && !isNumberKey);
 
       const shouldShow = (keyboardMode === 'numeric')
-        ? (isNumberKey || isDecimal || isBackspace || isDone)
-        : (isLetterKey || isSpace || isShift || isBackspace || isDone);
+        ? (isNumberKey || isDecimal || isBackspace || isDone || isSpecial)
+        : (isLetterKey || isSpace || isShift || isBackspace || isDone || isSpecial);
 
       btn.style.display = shouldShow ? '' : 'none';
     });
@@ -4594,6 +5275,15 @@ function setupVirtualKeyboard() {
       } else if (key === 'Done') {
         if (currentKeyboardInput) {
           currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+          // Trigger Enter key event to save edits
+          const enterEvent = new KeyboardEvent('keydown', {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true
+          });
+          currentKeyboardInput.dispatchEvent(enterEvent);
         }
         keyboard.classList.remove('active');
         currentKeyboardInput = null;
@@ -4867,6 +5557,14 @@ function setupZReportHandlers() {
       calculateCashDifference();
     });
   }
+  
+  // Add expense amount listener to update display
+  const expenseAmountInput = document.getElementById('zReportExpenseAmount');
+  if (expenseAmountInput) {
+    expenseAmountInput.addEventListener('input', () => {
+      updateExpenseDisplay();
+    });
+  }
 }
 
 async function loadZReportsView() {
@@ -4886,7 +5584,7 @@ function displayZReports(zReports) {
   tbody.innerHTML = '';
   
   if (!zReports || zReports.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; padding: 20px; color: #94a3b8;">No Z-reports found</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" style="text-align: center; padding: 20px; color: #94a3b8;">No Z-reports found</td></tr>';
     return;
   }
   
@@ -4904,6 +5602,8 @@ function displayZReports(zReports) {
       <td>${currencySymbol}${report.cash_sales.toFixed(2)}</td>
       <td>${currencySymbol}${report.card_sales.toFixed(2)}</td>
       <td>${currencySymbol}${report.loan_sales.toFixed(2)}</td>
+      <td style="font-weight: bold; color: #059669;">${currencySymbol}${(report.total_sales_amount || 0).toFixed(2)}</td>
+      <td style="color: #dc2626;">${currencySymbol}${(report.total_expenses || 0).toFixed(2)}</td>
       <td>${currencySymbol}${report.total_tax.toFixed(2)}</td>
       <td>
         <button class="btn-action" onclick="viewZReportDetails(${report.id})" title="View Details">👁️</button>
@@ -4958,9 +5658,9 @@ async function openZReportModal() {
     const netSales = grossSales - totalReturnsAmount;
     
     // Calculate payment methods
-    const cashSales = sales.filter(s => s.payment_method === 'Cash').reduce((sum, s) => sum + s.total, 0);
-    const cardSales = sales.filter(s => s.payment_method === 'Card').reduce((sum, s) => sum + s.total, 0);
-    const loanSales = sales.filter(s => s.payment_method === 'Loan').reduce((sum, s) => sum + s.total, 0);
+    const cashSales = sales.filter(s => s.payment_method?.toLowerCase() === 'cash').reduce((sum, s) => sum + s.total, 0);
+    const cardSales = sales.filter(s => s.payment_method?.toLowerCase() === 'card').reduce((sum, s) => sum + s.total, 0);
+    const loanSales = sales.filter(s => s.payment_method?.toLowerCase() === 'loan').reduce((sum, s) => sum + s.total, 0);
     
     // Calculate tax breakdown (7% and 19%)
     let tax7Base = 0;
@@ -4990,15 +5690,21 @@ async function openZReportModal() {
     const totalTax = tax7Amount + tax19Amount;
     
     // Cash reconciliation - cash sales minus cash refunds
-    const cashReturns = returns.filter(r => r.refund_method === 'Cash').reduce((sum, r) => sum + r.total, 0);
+    const cashReturns = returns.filter(r => r.refund_method?.toLowerCase() === 'cash').reduce((sum, r) => sum + r.total, 0);
     const expectedCash = cashSales - cashReturns;
+    
+    // Ensure currentUser is properly set
+    if (!currentUser || !currentUser.id || !currentUser.full_name) {
+      showAlert('User information is missing. Please log in again.', 'error', 'Error');
+      return;
+    }
     
     // Store report data
     currentZReportData = {
       start_datetime: startDateTime,
       end_datetime: endDateTime,
       cashier_id: currentUser.id,
-      cashier_name: currentUser.full_name,
+      cashier_name: currentUser.full_name || 'Unknown',
       total_sales: totalSales,
       total_returns: totalReturns,
       net_sales_count: netSalesCount,
@@ -5031,6 +5737,15 @@ async function openZReportModal() {
     document.getElementById('zReportCash').textContent = `${currencySymbol}${cashSales.toFixed(2)}`;
     document.getElementById('zReportCard').textContent = `${currencySymbol}${cardSales.toFixed(2)}`;
     document.getElementById('zReportLoan').textContent = `${currencySymbol}${loanSales.toFixed(2)}`;
+    
+    // Calculate and display total sales amount
+    const totalSalesAmount = cashSales + cardSales + loanSales;
+    document.getElementById('zReportTotalAmount').textContent = `${currencySymbol}${totalSalesAmount.toFixed(2)}`;
+    
+    // Initialize expenses to 0
+    document.getElementById('zReportTotalExpenses').textContent = `${currencySymbol}0.00`;
+    document.getElementById('zReportExpenseAmount').value = '';
+    document.getElementById('zReportExpenseDescription').value = '';
     
     document.getElementById('zReportTax7Base').textContent = `${currencySymbol}${tax7Base.toFixed(2)}`;
     document.getElementById('zReportTax7Amount').textContent = `${currencySymbol}${tax7Amount.toFixed(2)}`;
@@ -5068,6 +5783,18 @@ function calculateCashDifference() {
   differenceInput.style.color = difference < 0 ? 'red' : (difference > 0 ? 'green' : 'black');
 }
 
+function updateExpenseDisplay() {
+  const expenseInput = document.getElementById('zReportExpenseAmount');
+  const expenseDisplay = document.getElementById('zReportTotalExpenses');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  
+  if (!expenseInput || !expenseDisplay) return;
+  
+  const expenseAmount = parseFloat(expenseInput.value) || 0;
+  expenseDisplay.textContent = `${currencySymbol}${expenseAmount.toFixed(2)}`;
+  expenseDisplay.style.color = expenseAmount > 0 ? '#dc2626' : '#94a3b8';
+}
+
 async function completeZReport() {
   if (!currentZReportData) {
     showAlert('No report data available', 'error', 'Error');
@@ -5082,11 +5809,21 @@ async function completeZReport() {
   
   const cashDifference = actualCash - currentZReportData.expected_cash;
   
+  // Get expense information
+  const expenseAmount = parseFloat(document.getElementById('zReportExpenseAmount').value) || 0;
+  const expenseDescription = document.getElementById('zReportExpenseDescription').value || '';
+  
+  // Calculate total sales amount
+  const totalSalesAmount = currentZReportData.cash_sales + currentZReportData.card_sales + currentZReportData.loan_sales;
+  
   const reportData = {
     ...currentZReportData,
     report_number: `Z${Date.now()}`,
     actual_cash: actualCash,
     cash_difference: cashDifference,
+    total_sales_amount: totalSalesAmount,
+    total_expenses: expenseAmount,
+    expense_description: expenseDescription,
     notes: document.getElementById('zReportNotes').value || null
   };
   
@@ -5172,22 +5909,42 @@ async function viewZReportDetails(reportId) {
         <h4>Payment Methods</h4>
         <div class="summary-grid">
           <div class="summary-item">
-            <span class="summary-label">Cash:</span>
+            <span class="summary-label">💵 Cash:</span>
             <span class="summary-value">${currencySymbol}${report.cash_sales.toFixed(2)}</span>
           </div>
           <div class="summary-item">
-            <span class="summary-label">Card:</span>
+            <span class="summary-label">💳 Card:</span>
             <span class="summary-value">${currencySymbol}${report.card_sales.toFixed(2)}</span>
           </div>
           <div class="summary-item">
-            <span class="summary-label">Loan:</span>
+            <span class="summary-label">📦 Loan:</span>
             <span class="summary-value">${currencySymbol}${report.loan_sales.toFixed(2)}</span>
+          </div>
+          <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
+            <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
+            <span class="summary-value" style="font-weight: bold; font-size: 16px; color: #059669;">${currencySymbol}${(report.total_sales_amount || 0).toFixed(2)}</span>
           </div>
         </div>
       </div>
 
       <div class="z-report-section">
-        <h4>Tax Breakdown (German VAT)</h4>
+        <h4>💸 Expenses (Money Spent)</h4>
+        <div class="summary-grid">
+          <div class="summary-item">
+            <span class="summary-label">Total Expenses:</span>
+            <span class="summary-value" style="color: #dc2626;">${currencySymbol}${(report.total_expenses || 0).toFixed(2)}</span>
+          </div>
+          ${report.expense_description ? `
+            <div class="summary-item" style="grid-column: span 3;">
+              <span class="summary-label">Description:</span>
+              <span class="summary-value">${report.expense_description}</span>
+            </div>
+          ` : ''}
+        </div>
+      </div>
+
+      <div class="z-report-section">
+        <h4>Tax Breakdown</h4>
         <div class="summary-grid">
           <div class="summary-item">
             <span class="summary-label">7% Tax Base:</span>
@@ -5239,11 +5996,494 @@ async function viewZReportDetails(reportId) {
     `;
     
     openModal('zReportDetailsModal');
+    
+    // Setup print button handler
+    const printBtn = document.getElementById('printZReportBtn');
+    if (printBtn) {
+      // Remove old event listeners
+      const newPrintBtn = printBtn.cloneNode(true);
+      printBtn.parentNode.replaceChild(newPrintBtn, printBtn);
+      
+      newPrintBtn.addEventListener('click', () => {
+        printZReport(report);
+      });
+    }
   } catch (error) {
     console.error('Error loading Z-report details:', error);
     showAlert('Error loading report details: ' + error.message, 'error', 'Error');
   }
 }
+
+function printZReport(report) {
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  const printWindow = window.open('', '_blank');
+  
+  printWindow.document.write(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Z-Report #${report.report_number}</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          max-width: 800px;
+          margin: 20px auto;
+          padding: 20px;
+          font-size: 12px;
+        }
+        .header {
+          text-align: center;
+          margin-bottom: 20px;
+          padding-bottom: 15px;
+          border-bottom: 2px solid #000;
+        }
+        .header h2 {
+          margin: 5px 0;
+          font-size: 24px;
+        }
+        .section {
+          margin: 20px 0;
+          padding: 15px;
+          border: 1px solid #ddd;
+          border-radius: 5px;
+        }
+        .section h3 {
+          margin: 0 0 15px 0;
+          font-size: 16px;
+          color: #333;
+          border-bottom: 1px solid #eee;
+          padding-bottom: 8px;
+        }
+        .grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 10px;
+        }
+        .grid-item {
+          display: flex;
+          justify-content: space-between;
+          padding: 8px;
+          background: #f9f9f9;
+          border-radius: 3px;
+        }
+        .label {
+          font-weight: 500;
+          color: #666;
+        }
+        .value {
+          font-weight: bold;
+          color: #000;
+        }
+        .highlight {
+          background: #e8f5e9;
+          font-size: 14px;
+          padding: 12px;
+          border-left: 4px solid #4caf50;
+        }
+        .expense {
+          background: #ffebee;
+          border-left: 4px solid #f44336;
+        }
+        .footer {
+          text-align: center;
+          margin-top: 30px;
+          padding-top: 15px;
+          border-top: 2px solid #000;
+          font-size: 11px;
+          color: #666;
+        }
+        @media print {
+          body {
+            margin: 0;
+            padding: 10mm;
+          }
+          .section {
+            page-break-inside: avoid;
+          }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h2>Z-REPORT (END OF DAY)</h2>
+        <p><strong>Report #${report.report_number}</strong></p>
+        <p>${new Date(report.report_date).toLocaleString()}</p>
+        <p>Cashier: ${report.cashier_name}</p>
+      </div>
+
+      <div class="section">
+        <h3>📊 Sales Summary</h3>
+        <div class="grid">
+          <div class="grid-item">
+            <span class="label">Total Sales:</span>
+            <span class="value">${report.total_sales}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">Total Returns:</span>
+            <span class="value">${report.total_returns}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">Net Sales Count:</span>
+            <span class="value">${report.net_sales_count}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>💰 Financial Summary</h3>
+        <div class="grid">
+          <div class="grid-item">
+            <span class="label">Gross Sales:</span>
+            <span class="value">${currencySymbol}${report.gross_sales.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">Returns Amount:</span>
+            <span class="value">${currencySymbol}${report.total_returns_amount.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">Net Sales:</span>
+            <span class="value">${currencySymbol}${report.net_sales.toFixed(2)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>💳 Payment Methods</h3>
+        <div class="grid">
+          <div class="grid-item">
+            <span class="label">💵 Cash Sales:</span>
+            <span class="value">${currencySymbol}${report.cash_sales.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">💳 Card Sales:</span>
+            <span class="value">${currencySymbol}${report.card_sales.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">📦 PACKING Sales:</span>
+            <span class="value">${currencySymbol}${report.loan_sales.toFixed(2)}</span>
+          </div>
+        </div>
+        <div class="grid-item highlight" style="margin-top: 15px;">
+          <span class="label" style="font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
+          <span class="value" style="font-size: 18px; color: #2e7d32;">${currencySymbol}${(report.total_sales_amount || 0).toFixed(2)}</span>
+        </div>
+      </div>
+
+      ${report.total_expenses > 0 ? `
+      <div class="section">
+        <h3>💸 Expenses</h3>
+        <div class="grid-item expense">
+          <span class="label">Total Expenses:</span>
+          <span class="value" style="color: #c62828;">${currencySymbol}${report.total_expenses.toFixed(2)}</span>
+        </div>
+        ${report.expense_description ? `
+          <p style="margin: 10px 0 0 0; padding: 10px; background: #f5f5f5; border-radius: 3px;">
+            <strong>Description:</strong> ${report.expense_description}
+          </p>
+        ` : ''}
+      </div>
+      ` : ''}
+
+      <div class="section">
+        <h3>📋 Tax Breakdown</h3>
+        <div class="grid">
+          <div class="grid-item">
+            <span class="label">7% Tax Base:</span>
+            <span class="value">${currencySymbol}${report.tax_7_base.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">7% Tax Amount:</span>
+            <span class="value">${currencySymbol}${report.tax_7_amount.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">19% Tax Base:</span>
+            <span class="value">${currencySymbol}${report.tax_19_base.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">19% Tax Amount:</span>
+            <span class="value">${currencySymbol}${report.tax_19_amount.toFixed(2)}</span>
+          </div>
+          <div class="grid-item highlight">
+            <span class="label">Total Tax:</span>
+            <span class="value">${currencySymbol}${report.total_tax.toFixed(2)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>💵 Cash Reconciliation</h3>
+        <div class="grid">
+          <div class="grid-item">
+            <span class="label">Expected Cash:</span>
+            <span class="value">${currencySymbol}${report.expected_cash.toFixed(2)}</span>
+          </div>
+          <div class="grid-item">
+            <span class="label">Actual Cash:</span>
+            <span class="value">${currencySymbol}${report.actual_cash ? report.actual_cash.toFixed(2) : 'N/A'}</span>
+          </div>
+          <div class="grid-item" style="background: ${report.cash_difference < 0 ? '#ffebee' : (report.cash_difference > 0 ? '#e8f5e9' : '#f9f9f9')}">
+            <span class="label">Difference:</span>
+            <span class="value" style="color: ${report.cash_difference < 0 ? '#c62828' : (report.cash_difference > 0 ? '#2e7d32' : '#000')}">${currencySymbol}${report.cash_difference ? report.cash_difference.toFixed(2) : 'N/A'}</span>
+          </div>
+        </div>
+      </div>
+
+      ${report.notes ? `
+      <div class="section">
+        <h3>📝 Notes</h3>
+        <p style="margin: 0; padding: 10px; background: #f5f5f5; border-radius: 3px;">${report.notes}</p>
+      </div>
+      ` : ''}
+
+      <div class="footer">
+        <p>Generated on ${new Date().toLocaleString()}</p>
+        <p>POS System - End of Day Report</p>
+      </div>
+
+      <script>
+        window.onload = function() {
+          window.print();
+        };
+      </script>
+    </body>
+    </html>
+  `);
+  
+  printWindow.document.close();
+}
+
+// ============== EXPENSES MANAGEMENT ==============
+let currentExpensePeriod = 'today';
+let currentExpenseStartDate = null;
+let currentExpenseEndDate = null;
+
+async function loadExpensesView() {
+  // Set today as default
+  const today = new Date().toISOString().split('T')[0];
+  document.getElementById('expenseStartDate').value = today;
+  document.getElementById('expenseEndDate').value = today;
+  
+  // Setup event listeners
+  document.getElementById('addExpenseBtn').addEventListener('click', () => openExpenseModal());
+  
+  // Filter buttons
+  document.querySelectorAll('.filter-controls .filter-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      document.querySelectorAll('.filter-controls .filter-btn').forEach(b => b.classList.remove('active'));
+      e.target.classList.add('active');
+      
+      const period = e.target.dataset.period;
+      currentExpensePeriod = period;
+      
+      if (period === 'custom') {
+        document.getElementById('customDateRange').style.display = 'flex';
+      } else {
+        document.getElementById('customDateRange').style.display = 'none';
+        loadExpensesByPeriod(period);
+      }
+    });
+  });
+  
+  document.getElementById('applyDateFilter').addEventListener('click', () => {
+    const startDate = document.getElementById('expenseStartDate').value;
+    const endDate = document.getElementById('expenseEndDate').value;
+    if (startDate && endDate) {
+      currentExpenseStartDate = startDate;
+      currentExpenseEndDate = endDate;
+      loadExpenses(startDate, endDate);
+    }
+  });
+  
+  // Setup expense form
+  const expenseForm = document.getElementById('expenseForm');
+  if (expenseForm) {
+    expenseForm.removeEventListener('submit', handleExpenseSubmit);
+    expenseForm.addEventListener('submit', handleExpenseSubmit);
+  }
+  
+  // Load today's expenses by default
+  loadExpensesByPeriod('today');
+}
+
+async function loadExpensesByPeriod(period) {
+  const today = new Date();
+  let startDate, endDate;
+  
+  switch(period) {
+    case 'today':
+      startDate = endDate = today.toISOString().split('T')[0];
+      break;
+    case 'week':
+      const weekStart = new Date(today);
+      weekStart.setDate(today.getDate() - today.getDay());
+      startDate = weekStart.toISOString().split('T')[0];
+      endDate = today.toISOString().split('T')[0];
+      break;
+    case 'month':
+      startDate = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().split('T')[0];
+      endDate = today.toISOString().split('T')[0];
+      break;
+    case 'year':
+      startDate = new Date(today.getFullYear(), 0, 1).toISOString().split('T')[0];
+      endDate = today.toISOString().split('T')[0];
+      break;
+  }
+  
+  currentExpenseStartDate = startDate;
+  currentExpenseEndDate = endDate;
+  await loadExpenses(startDate, endDate);
+}
+
+async function loadExpenses(startDate, endDate) {
+  try {
+    const expenses = await window.api.getExpenses(startDate, endDate);
+    const summary = await window.api.getExpenseSummary(startDate, endDate);
+    
+    // Get sales data for net profit calculation
+    const salesReport = await window.api.getSalesReport(startDate, endDate);
+    const totalSales = salesReport.sales.reduce((sum, day) => sum + (day.total_sales || 0), 0);
+    
+    // Calculate Net Profit = Sales - Expenses
+    const totalExpenses = summary.total_amount || 0;
+    const netProfit = totalSales - totalExpenses;
+    
+    // Update summary cards
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    document.getElementById('netProfit').textContent = `${currencySymbol}${netProfit.toFixed(2)}`;
+    document.getElementById('netProfit').style.color = netProfit >= 0 ? 'white' : '#ffeb3b';
+    
+    document.getElementById('totalExpenseAmount').textContent = `${currencySymbol}${totalExpenses.toFixed(2)}`;
+    document.getElementById('totalExpenseCount').textContent = summary.total_count || 0;
+    document.getElementById('avgExpenseAmount').textContent = `${currencySymbol}${(summary.avg_amount || 0).toFixed(2)}`;
+    
+    // Display expenses table
+    const tbody = document.getElementById('expensesTableBody');
+    tbody.innerHTML = '';
+    
+    if (expenses.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 20px;">No expenses found for this period</td></tr>';
+      return;
+    }
+    
+    expenses.forEach(expense => {
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td>${new Date(expense.expense_date).toLocaleDateString()}</td>
+        <td>${expense.category}</td>
+        <td>${expense.description}</td>
+        <td>${currencySymbol}${parseFloat(expense.amount).toFixed(2)}</td>
+        <td>${expense.payment_method}</td>
+        <td>${expense.user_name || 'Unknown'}</td>
+        <td>
+          <button class="btn-icon" onclick="editExpense(${expense.id})" title="Edit">✏️</button>
+          <button class="btn-icon" onclick="deleteExpense(${expense.id})" title="Delete">🗑️</button>
+        </td>
+      `;
+      tbody.appendChild(row);
+    });
+  } catch (error) {
+    console.error('Error loading expenses:', error);
+    showAlert('Error loading expenses: ' + error.message, 'error');
+  }
+}
+
+function openExpenseModal(expenseId = null) {
+  const modal = document.getElementById('expenseModal');
+  const form = document.getElementById('expenseForm');
+  const title = document.getElementById('expenseModalTitle');
+  
+  // Reset form
+  form.reset();
+  document.getElementById('expenseId').value = '';
+  
+  if (expenseId) {
+    title.textContent = 'Edit Expense';
+    // Load expense data
+    loadExpenseData(expenseId);
+  } else {
+    title.textContent = 'Add Expense';
+    // Set today's date
+    document.getElementById('expenseDate').value = new Date().toISOString().split('T')[0];
+  }
+  
+  modal.classList.add('active');
+}
+
+async function loadExpenseData(id) {
+  try {
+    const expense = await window.api.getExpenseById(id);
+    if (expense) {
+      document.getElementById('expenseId').value = expense.id;
+      document.getElementById('expenseDate').value = expense.expense_date;
+      document.getElementById('expenseCategory').value = expense.category;
+      document.getElementById('expenseDescription').value = expense.description;
+      document.getElementById('expenseAmount').value = expense.amount;
+      document.getElementById('expensePaymentMethod').value = expense.payment_method;
+    }
+  } catch (error) {
+    console.error('Error loading expense:', error);
+    showAlert('Error loading expense data', 'error');
+  }
+}
+
+async function handleExpenseSubmit(e) {
+  e.preventDefault();
+  
+  const expenseId = document.getElementById('expenseId').value;
+  const expenseData = {
+    expenseDate: document.getElementById('expenseDate').value,
+    category: document.getElementById('expenseCategory').value,
+    description: document.getElementById('expenseDescription').value,
+    amount: parseFloat(document.getElementById('expenseAmount').value),
+    paymentMethod: document.getElementById('expensePaymentMethod').value,
+    userId: currentUser.id
+  };
+  
+  try {
+    if (expenseId) {
+      await window.api.updateExpense(parseInt(expenseId), expenseData);
+      showAlert('Expense updated successfully', 'success');
+    } else {
+      await window.api.createExpense(expenseData);
+      showAlert('Expense added successfully', 'success');
+    }
+    
+    closeModal('expenseModal');
+    
+    // Reload expenses
+    if (currentExpensePeriod === 'custom') {
+      await loadExpenses(currentExpenseStartDate, currentExpenseEndDate);
+    } else {
+      await loadExpensesByPeriod(currentExpensePeriod);
+    }
+  } catch (error) {
+    console.error('Error saving expense:', error);
+    showAlert('Error saving expense: ' + error.message, 'error');
+  }
+}
+
+window.editExpense = function(id) {
+  openExpenseModal(id);
+};
+
+window.deleteExpense = async function(id) {
+  if (!confirm('Are you sure you want to delete this expense?')) return;
+  
+  try {
+    await window.api.deleteExpense(id);
+    showAlert('Expense deleted successfully', 'success');
+    
+    // Reload expenses
+    if (currentExpensePeriod === 'custom') {
+      await loadExpenses(currentExpenseStartDate, currentExpenseEndDate);
+    } else {
+      await loadExpensesByPeriod(currentExpensePeriod);
+    }
+  } catch (error) {
+    console.error('Error deleting expense:', error);
+    showAlert('Error deleting expense: ' + error.message, 'error');
+  }
+};
 
 // ============== UTILITIES ==============
 function updateDateTime() {
@@ -5451,6 +6691,8 @@ async function printReceiptToThermalPrinter(sale) {
       total: sale.total,
       taxBreakdown: taxBreakdownRows,
       paymentMethod: sale.payment_method,
+      paymentAmount: sale.payment_amount || sale.total,
+      changeAmount: sale.change_amount || 0,
       currency: currencySymbol,
       footer: receiptFooter,
       cashier: currentUser.full_name
@@ -5590,6 +6832,24 @@ function printReceiptFallback(sale) {
         <span>Payment:</span>
         <span>${sale.payment_method.toUpperCase()}</span>
       </div>
+      ${sale.payment_method === 'cash' && sale.payment_amount ? `
+        <div class="item">
+          <span>Payment Amount:</span>
+          <span>${currencySymbol}${sale.payment_amount.toFixed(2)}</span>
+        </div>
+        <div class="item" style="font-weight: bold;">
+          <span>Change:</span>
+          <span>${currencySymbol}${(sale.change_amount || 0).toFixed(2)}</span>
+        </div>
+      ` : ''}
+      
+      ${sale.notes ? `
+        <div class="separator"></div>
+        <div style="margin: 10px 0;">
+          <div style="font-weight: bold; margin-bottom: 5px;">NOTE:</div>
+          <div style="white-space: pre-wrap;">${sale.notes}</div>
+        </div>
+      ` : ''}
       
       <div class="footer">
         <p>${receiptFooter}</p>

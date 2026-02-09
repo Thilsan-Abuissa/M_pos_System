@@ -848,6 +848,31 @@ ipcMain.handle('returns:getAll', async () => {
   return db.getAllReturns();
 });
 
+// Expense handlers
+ipcMain.handle('expenses:create', async (event, expenseData) => {
+  return db.createExpense(expenseData);
+});
+
+ipcMain.handle('expenses:getAll', async (event, startDate, endDate) => {
+  return db.getExpenses(startDate, endDate);
+});
+
+ipcMain.handle('expenses:getById', async (event, id) => {
+  return db.getExpenseById(id);
+});
+
+ipcMain.handle('expenses:update', async (event, id, expenseData) => {
+  return db.updateExpense(id, expenseData);
+});
+
+ipcMain.handle('expenses:delete', async (event, id) => {
+  return db.deleteExpense(id);
+});
+
+ipcMain.handle('expenses:getSummary', async (event, startDate, endDate) => {
+  return db.getExpenseSummary(startDate, endDate);
+});
+
 ipcMain.handle('returns:getById', async (event, id) => {
   return db.getReturnById(id);
 });
@@ -1151,6 +1176,15 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     receipt += ESC + 'E' + '\x00'; // Bold off
     
     receipt += `Payment Method:`.padEnd(20) + `${receiptData.paymentMethod.toUpperCase()}`.padStart(12) + '\n';
+    
+    // Show payment and change for cash transactions
+    if (receiptData.paymentMethod === 'cash' && receiptData.paymentAmount) {
+      receipt += `Payment:`.padEnd(20) + `${receiptData.currency}${receiptData.paymentAmount.toFixed(2)}`.padStart(12) + '\n';
+      receipt += ESC + 'E' + '\x01'; // Bold on
+      receipt += `Change:`.padEnd(20) + `${receiptData.currency}${receiptData.changeAmount.toFixed(2)}`.padStart(12) + '\n';
+      receipt += ESC + 'E' + '\x00'; // Bold off
+    }
+    
     receipt += '--------------------------------\n';
     
     // Footer

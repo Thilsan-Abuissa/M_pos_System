@@ -87,6 +87,14 @@ contextBridge.exposeInMainWorld('api', {
   printBarcodeLabel: (barcodeData) => ipcRenderer.invoke('printer:printBarcode', barcodeData),
   getPrinterList: () => ipcRenderer.invoke('printer:getList'),
   
+  // Expenses
+  createExpense: (expenseData) => ipcRenderer.invoke('expenses:create', expenseData),
+  getExpenses: (startDate, endDate) => ipcRenderer.invoke('expenses:getAll', startDate, endDate),
+  getExpenseById: (id) => ipcRenderer.invoke('expenses:getById', id),
+  updateExpense: (id, expenseData) => ipcRenderer.invoke('expenses:update', id, expenseData),
+  deleteExpense: (id) => ipcRenderer.invoke('expenses:delete', id),
+  getExpenseSummary: (startDate, endDate) => ipcRenderer.invoke('expenses:getSummary', startDate, endDate),
+  
   // Scale
   listScalePorts: () => ipcRenderer.invoke('scale:listPorts'),
   connectScale: (portPath) => ipcRenderer.invoke('scale:connect', portPath),
