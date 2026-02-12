@@ -1143,7 +1143,8 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     // Items (left align)
     receipt += ESC + 'a' + '\x00'; // Left align
     receiptData.items.forEach(item => {
-      const itemLine = item.name.substring(0, 20).padEnd(20);
+      const itemName = (item.name || item.product_name || 'Unknown Item').toString();
+      const itemLine = itemName.substring(0, 20).padEnd(20);
       const qtyPrice = `x${item.quantity} ${receiptData.currency}${item.subtotal.toFixed(2)}`;
       receipt += itemLine + qtyPrice.padStart(12) + '\n';
     });

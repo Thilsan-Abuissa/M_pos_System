@@ -2098,7 +2098,9 @@ function setupInlineCartEditing() {
       this.innerHTML = '';
       this.appendChild(input);
       input.focus();
-      input.select();
+      // Set cursor to end of text
+      const length = input.value.length;
+      input.setSelectionRange(length, length);
       
       const saveValue = () => {
         const newValue = parseFloat(input.value);
@@ -2159,7 +2161,9 @@ function setupInlineCartEditing() {
       this.textContent = '';
       this.appendChild(input);
       input.focus();
-      input.select();
+      // Set cursor to end of text
+      const length = input.value.length;
+      input.setSelectionRange(length, length);
       
       const saveValue = () => {
         const newValue = parseFloat(input.value);
@@ -2209,7 +2213,9 @@ function setupInlineCartEditing() {
       this.textContent = '';
       this.appendChild(input);
       input.focus();
-      input.select();
+      // Set cursor to end of text
+      const length = input.value.length;
+      input.setSelectionRange(length, length);
       
       const saveValue = () => {
         const newValue = input.value.trim();
@@ -2260,7 +2266,9 @@ function setupInlineCartEditing() {
       this.textContent = '';
       this.appendChild(input);
       input.focus();
-      input.select();
+      // Set cursor to end of text
+      const length = input.value.length;
+      input.setSelectionRange(length, length);
       
       const saveValue = () => {
         const newValue = parseFloat(input.value);
@@ -2506,9 +2514,9 @@ async function printTicket() {
     receiptId: 'TICKET',
     date: new Date().toLocaleString(),
     items: cart.map(item => ({
-      name: item.name,
-      quantity: item.quantity,
-      subtotal: item.subtotal
+      name: item.name || 'Unknown Item',
+      quantity: item.quantity || 0,
+      subtotal: item.subtotal || 0
     })),
     subtotal: subtotal,
     tax: tax,
@@ -2517,7 +2525,7 @@ async function printTicket() {
     paymentMethod: 'UNPAID',
     currency: currencySymbol,
     footer: 'TICKET - NOT PAID',
-    cashier: currentUser.full_name
+    cashier: currentUser?.full_name || 'Unknown'
   };
 
   try {
