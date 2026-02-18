@@ -2033,7 +2033,8 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
     quantity: finalWeight, // Store weight in quantity field
     subtotal: weightedPrice,
     isWeightBased: isWeightBased, // Track whether it's weight or quantity based
-    cartItemId: Date.now() // Unique ID for each cart item to allow duplicates
+    cartItemId: Date.now(), // Unique ID for each cart item to allow duplicates
+    discountPercent: 0 // Discount as percentage (0%, 10%, 20%, etc.)
   };
   console.log('Cart item to add:', cartItem);
   cart.push(cartItem);
@@ -2089,9 +2090,8 @@ function setupInlineCartEditing() {
       
       // Replace with input
       const input = document.createElement('input');
-      input.type = 'number';
-      input.step = '0.01';
-      input.min = '0.01';
+      input.type = 'text'; // Allow natural decimal entry
+      input.inputMode = 'decimal';
       input.value = currentValue;
       input.style.cssText = 'width: 80px; text-align: center; font-weight: 800; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
       
@@ -2103,8 +2103,11 @@ function setupInlineCartEditing() {
       input.setSelectionRange(length, length);
       
       const saveValue = () => {
-        const newValue = parseFloat(input.value);
-        if (!isNaN(newValue) && newValue > 0) {
+        // Accept both dot and comma as decimal separator, trim whitespace
+        let valueStr = input.value.trim().replace(',', '.');
+        if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
+        const newValue = parseFloat(valueStr);
+        if (!isNaN(newValue) && newValue > 0 && /^\d*\.?\d*$/.test(valueStr)) {
           const product = allProducts.find(p => p.id === cartItem.productId);
           if (product && newValue > product.stock + cartItem.quantity) {
             alert(`Only ${(product.stock + cartItem.quantity).toFixed(2)} ${unit} available in stock`);
@@ -2115,7 +2118,6 @@ function setupInlineCartEditing() {
           cartItem.subtotal = newValue * cartItem.unitPrice;
         }
         updateCartDisplay();
-        updateCartSummary();
       };
       
       input.addEventListener('blur', (e) => {
@@ -2152,9 +2154,8 @@ function setupInlineCartEditing() {
       
       // Replace with input
       const input = document.createElement('input');
-      input.type = 'number';
-      input.step = '0.01';
-      input.min = '0';
+      input.type = 'text'; // Allow natural decimal entry
+      input.inputMode = 'decimal';
       input.value = currentValue;
       input.style.cssText = 'width: 100px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
       
@@ -2166,13 +2167,16 @@ function setupInlineCartEditing() {
       input.setSelectionRange(length, length);
       
       const saveValue = () => {
-        const newValue = parseFloat(input.value);
-        if (!isNaN(newValue) && newValue >= 0) {
+        // Accept both dot and comma as decimal separator, trim whitespace
+        let valueStr = input.value.trim().replace(',', '.');
+        // Allow .5 or 0.5, but not just .
+        if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
+        const newValue = parseFloat(valueStr);
+        if (!isNaN(newValue) && valueStr !== '' && /^\d*\.?\d*$/.test(valueStr)) {
           cartItem.unitPrice = newValue;
           cartItem.subtotal = cartItem.quantity * newValue;
-        }
+        } // else: do not update, just revert to previous value
         updateCartDisplay();
-        updateCartSummary();
       };
       
       input.addEventListener('blur', (e) => {
@@ -2252,14 +2256,12 @@ function setupInlineCartEditing() {
       const cartItem = cart.find(item => item.cartItemId === cartItemId);
       if (!cartItem) return;
       
-      const currentValue = (cartItem.discount || 0).toFixed(2);
+      const currentValue = (cartItem.discountPercent || 0).toFixed(0);
       
       // Replace with input
       const input = document.createElement('input');
-      input.type = 'number';
-      input.step = '0.01';
-      input.min = '0';
-      input.max = cartItem.subtotal.toFixed(2);
+      input.type = 'text'; // Allow natural decimal entry
+      input.inputMode = 'decimal';
       input.value = currentValue;
       input.style.cssText = 'width: 80px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
       
@@ -2271,14 +2273,16 @@ function setupInlineCartEditing() {
       input.setSelectionRange(length, length);
       
       const saveValue = () => {
-        const newValue = parseFloat(input.value);
-        if (!isNaN(newValue) && newValue >= 0 && newValue <= cartItem.subtotal) {
-          cartItem.discount = newValue;
-        } else if (newValue > cartItem.subtotal) {
-          alert('Discount cannot be greater than item subtotal');
+        // Accept both dot and comma as decimal separator, trim whitespace
+        let valueStr = input.value.trim().replace(',', '.').replace('%', '');
+        if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
+        const newValue = parseFloat(valueStr);
+        if (!isNaN(newValue) && newValue >= 0 && newValue <= 100 && /^\d*\.?\d*$/.test(valueStr)) {
+          cartItem.discountPercent = newValue;
+        } else if (newValue > 100) {
+          alert('Discount cannot be greater than 100%');
         }
         updateCartDisplay();
-        updateCartSummary();
       };
       
       input.addEventListener('blur', (e) => {
@@ -2356,8 +2360,9 @@ function updateCartDisplay() {
     cartTableBody.innerHTML = cart.map(item => {
       const unit = item.isWeightBased ? 'kg' : 'pc';
       const unitLabel = item.isWeightBased ? '/kg' : '/pc';
-      const discount = item.discount || 0;
-      const finalTotal = item.subtotal - discount;
+      const discountPercent = item.discountPercent || 0;
+      const discountAmount = item.subtotal * (discountPercent / 100);
+      const finalTotal = item.subtotal - discountAmount;
       return `
       <tr>
         <td class="editable-name" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${item.productName}</td>
@@ -2368,7 +2373,7 @@ function updateCartDisplay() {
             <button onclick="removeFromCart(${item.cartItemId})" style="background: #fc8181; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">×</button>
           </div>
         </td>
-        <td class="editable-discount" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${currencySymbol}${discount.toFixed(2)}</td>
+        <td class="editable-discount" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${discountPercent.toFixed(0)}%</td>
         <td style="font-weight: 800; color: #6E8FAF;">${currencySymbol}${finalTotal.toFixed(2)}</td>
       </tr>
     `;
@@ -2387,7 +2392,11 @@ function updateCartDisplay() {
 
 function calculateTotal() {
   const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
-  const totalDiscount = cart.reduce((sum, item) => sum + (item.discount || 0), 0);
+  const totalDiscount = cart.reduce((sum, item) => {
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    return sum + discountAmount;
+  }, 0);
   return subtotalBeforeDiscount - totalDiscount;
 }
 
@@ -2399,8 +2408,12 @@ function updateCartSummary() {
   // Total = sum of all product prices (tax-included)
   const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
   
-  // Calculate total discount from all items
-  const totalDiscount = cart.reduce((sum, item) => sum + (item.discount || 0), 0);
+  // Calculate total discount from all items (percentage-based)
+  const totalDiscount = cart.reduce((sum, item) => {
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    return sum + discountAmount;
+  }, 0);
   
   // Final total after discounts
   const total = subtotalBeforeDiscount - totalDiscount;
@@ -2411,7 +2424,9 @@ function updateCartSummary() {
   
   cart.forEach(item => {
     const taxRate = item.taxRate || 0;
-    const itemFinalPrice = item.subtotal - (item.discount || 0);
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    const itemFinalPrice = item.subtotal - discountAmount;
     // Reverse calculation: Base = Total / (1 + tax_rate)
     const basePrice = itemFinalPrice / (1 + taxRate);
     const taxAmount = itemFinalPrice - basePrice;
@@ -2506,26 +2521,60 @@ async function printTicket() {
       total: taxBreakdown[rate].total
     }));
 
+  // Generate a unique ticket/receipt number
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('es-ES');
+  const timeStr = now.toLocaleTimeString('es-ES');
+  const receiptNumber = `T101_1/${String(now.getFullYear()).slice(-2)}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}${String(now.getSeconds()).padStart(2,'0')}`;
+
+  // Build the ticket text (for text-based printers)
+  let ticketText = '';
+  ticketText += `${storeName}\n`;
+  if (ownerName) ticketText += `${ownerName}\n`;
+  if (nieNumber) ticketText += `${nieNumber}\n`;
+  if (companyAddress) ticketText += `${companyAddress}\n`;
+  ticketText += `\n`;
+  ticketText += `CONSULTA CUENTA\n`;
+  ticketText += `-----------------------------\n`;
+  ticketText += `FECHA: ${dateStr} ${timeStr}\n`;
+  ticketText += `Factura Simplificada  PRINCIPAL\n`;
+  ticketText += `Serie/Nº: ${receiptNumber}\n`;
+  ticketText += `Ud.Descripción     Precio Dt% Importe\n`;
+  ticketText += `*** NO VALIDO COMO FACTURA ***\n`;
+
+  cart.forEach(item => {
+    // Format: qty desc price discount% total
+    const qty = item.quantity.toFixed(0);
+    const desc = (item.productName || item.name || 'Producto').substring(0, 18);
+    const price = (item.unitPrice || 0).toFixed(2);
+    const discountPercent = item.discountPercent || 0;
+    const discountStr = discountPercent > 0 ? `${discountPercent.toFixed(0)}%` : '';
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    const total = (item.subtotal - discountAmount).toFixed(2);
+    ticketText += `${qty} ${desc.padEnd(18)} ${price.padStart(5)} ${discountStr.padStart(4)} ${total.padStart(6)}\n`;
+  });
+
+  ticketText += `-----------------------------\n`;
+  ticketText += `Iva   Base   Cuota   Total\n`;
+  Object.keys(taxBreakdown).sort().forEach(rate => {
+    const b = taxBreakdown[rate];
+    ticketText += `${rate.padEnd(3)} ${b.base.toFixed(2).padStart(5)} ${b.tax.toFixed(2).padStart(6)} ${b.total.toFixed(2).padStart(6)}\n`;
+  });
+  ticketText += `-----------------------------\n`;
+  ticketText += `TOTAL   ${subtotal.toFixed(2).padStart(5)} ${tax.toFixed(2).padStart(6)} ${total.toFixed(2).padStart(6)}\n`;
+  ticketText += `TOTAL (Impuestos Incluidos)\n`;
+  ticketText += `ENTREGA 0,00\n`;
+  ticketText += `CAMBIO 0,00\n`;
+  ticketText += `-----------------------------\n`;
+  ticketText += `SERVICIOS: ${cart.length}\n`;
+  ticketText += `CUENTAS: / 1\n`;
+  ticketText += `LE ATENDIO: ${currentUser?.full_name || ''}\n`;
+  ticketText += `---- GRACIAS POR SU VISITA ----\n`;
+  ticketText += `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}${String(now.getSeconds()).padStart(2,'0')}\n`;
+
   const ticketData = {
-    storeName: storeName,
-    ownerName: ownerName,
-    nieNumber: nieNumber,
-    companyAddress: companyAddress,
-    receiptId: 'TICKET',
-    date: new Date().toLocaleString(),
-    items: cart.map(item => ({
-      name: item.name || 'Unknown Item',
-      quantity: item.quantity || 0,
-      subtotal: item.subtotal || 0
-    })),
-    subtotal: subtotal,
-    tax: tax,
-    total: total,
-    taxBreakdown: taxBreakdownRows,
-    paymentMethod: 'UNPAID',
-    currency: currencySymbol,
-    footer: 'TICKET - NOT PAID',
-    cashier: currentUser?.full_name || 'Unknown'
+    text: ticketText,
+    raw: true // Tell the printReceipt API to print as raw text
   };
 
   try {
@@ -2561,7 +2610,16 @@ async function completeSale() {
   }
   
   // Product prices already include tax - extract tax from total
-  const total = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  
+  // Calculate total discount from percentage-based discounts
+  const totalDiscountAmount = cart.reduce((sum, item) => {
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    return sum + discountAmount;
+  }, 0);
+  
+  const total = subtotalBeforeDiscount - totalDiscountAmount;
   
   // Calculate base price (before tax) and tax amount
   let subtotal = 0;
@@ -2569,14 +2627,17 @@ async function completeSale() {
   
   cart.forEach(item => {
     const taxRate = item.taxRate || 0;
-    const basePrice = item.subtotal / (1 + taxRate);
-    const taxAmount = item.subtotal - basePrice;
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    const finalPrice = item.subtotal - discountAmount;
+    const basePrice = finalPrice / (1 + taxRate);
+    const taxAmount = finalPrice - basePrice;
     
     subtotal += basePrice;
     tax += taxAmount;
   });
   
-  const discount = 0;
+  const discount = totalDiscountAmount;
   
   // Determine payment method and amounts
   let paymentMethod = selectedPaymentMethod;
@@ -2645,23 +2706,28 @@ async function completeSale() {
   try {
     const sale = await window.api.createSale(saleData);
     lastSalePaymentMethod = paymentMethod;
-    
+
+    // Open cash drawer if payment method is cash
+    if (paymentMethod === 'cash') {
+      await openCashDrawer();
+    }
+
     // Close payment modal
     closePaymentModalFunc();
-    
+
     // Show receipt
     showReceipt(sale);
-    
+
     // Clear cart
     cart = [];
-    
+
     // Clear invoice note
     currentInvoiceNote = '';
-    
+
     // Clear payment input
     const paymentInput = document.getElementById('paymentInput');
     if (paymentInput) paymentInput.value = '';
-    
+
     // Reset payment method selection
     selectedPaymentMethod = null;
     paymentMode = 'single';
@@ -2671,9 +2737,9 @@ async function completeSale() {
         b.style.transform = 'scale(1)';
       }
     });
-    
+
     updateCartDisplay();
-    
+
     // Reload products to update stock
     await loadAllProducts();
     displayQuickProducts();
@@ -2857,11 +2923,18 @@ async function completeLoanSale(customerType, customerName, customerPhone, resta
   // Generate unique receipt number
   const receiptNumber = generateReceiptNumber();
   
+  // Calculate total discount from percentage-based discounts
+  const totalDiscountAmount = cart.reduce((sum, item) => {
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    return sum + discountAmount;
+  }, 0);
+  
   // Create the sale first
   const saleData = {
     subtotal,
     tax,
-    discount: 0,
+    discount: totalDiscountAmount,
     total,
     paymentMethod: 'loan',
     cashierId: currentUser.id,
@@ -5090,36 +5163,27 @@ function setupModalHandlers() {
     // Remove any existing listeners by cloning the button
     const newPrintBtn = printBtn.cloneNode(true);
     printBtn.parentNode.replaceChild(newPrintBtn, printBtn);
-    
+
     newPrintBtn.addEventListener('click', async () => {
       if (isPrinting) {
         console.log('Print already in progress, ignoring duplicate request');
         return;
       }
-      
+
       if (!lastSale) {
         console.log('No sale to print');
         return;
       }
-      
+
       isPrinting = true;
       console.log('Reprinting receipt...');
-      const printed = await printReceiptToThermalPrinter(lastSale);
+      await printReceiptToThermalPrinter(lastSale);
 
-      // Old POS behavior: open drawer when printing for cash sales
-      const paymentMethod = (lastSalePaymentMethod || lastSale?.payment_method || '').toString().toLowerCase();
-      if (paymentMethod === 'cash') {
-        if (printed) {
-          await openCashDrawer();
-        } else {
-          // Try drawer anyway; show error if it fails
-          await openCashDrawer();
-        }
-      }
+      // Do NOT open cash drawer here; it is only opened on complete sale
 
       // Close receipt modal after print action
       closeModal('receiptModal');
-      
+
       // Reset flag after 2 seconds
       setTimeout(() => {
         isPrinting = false;
@@ -5170,7 +5234,6 @@ let currentKeyboardInput = null;
 
 function setupVirtualKeyboard() {
   const keyboard = document.getElementById('virtualKeyboard');
-  const closeKeyboardBtn = document.getElementById('closeKeyboard');
   const keyButtons = document.querySelectorAll('.key-btn');
   let isShiftActive = false;
   let keyboardMode = 'text'; // 'text' | 'numeric'
@@ -5315,15 +5378,22 @@ function setupVirtualKeyboard() {
     });
   });
   
-  // Close keyboard button
-  closeKeyboardBtn.addEventListener('click', () => {
-    if (currentKeyboardInput) {
-      currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+  // Close keyboard when clicking outside
+  document.addEventListener('click', (e) => {
+    if (keyboard.classList.contains('active')) {
+      // Check if click is outside keyboard and not on an input field
+      if (!keyboard.contains(e.target) && 
+          e.target.tagName !== 'INPUT' && 
+          e.target.tagName !== 'TEXTAREA') {
+        if (currentKeyboardInput) {
+          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        keyboard.classList.remove('active');
+        currentKeyboardInput = null;
+        isShiftActive = false;
+        updateKeyboardCase();
+      }
     }
-    keyboard.classList.remove('active');
-    currentKeyboardInput = null;
-    isShiftActive = false;
-    updateKeyboardCase();
   });
 }
 
