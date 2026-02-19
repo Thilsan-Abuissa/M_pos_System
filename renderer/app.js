@@ -5288,8 +5288,10 @@ function setupVirtualKeyboard() {
 
     keyButtons.forEach(btn => {
       const key = btn.dataset.key;
+      const modeSwitch = btn.dataset.mode;
       const isNumberKey = btn.classList.contains('key-number');
-      const isBackspace = btn.classList.contains('key-backspace') || key === 'Backspace';
+      const isBackspaceNumeric = btn.classList.contains('key-backspace-numeric');
+      const isBackspaceText = btn.classList.contains('key-backspace-text');
       const isDone = btn.classList.contains('key-done') || key === 'Done';
       const isSpace = btn.classList.contains('key-space') || key === ' ';
       const isShift = btn.classList.contains('key-shift') || key === 'Shift';
@@ -5299,9 +5301,13 @@ function setupVirtualKeyboard() {
       // Letter keys are defined with uppercase A-Z in data-key.
       const isLetterKey = !!(key && key.length === 1 && /[A-Z]/.test(key) && !isNumberKey);
 
+      // Mode switch buttons: show 123 in text mode, show ABC in numeric mode
+      const is123Button = modeSwitch === 'numeric';
+      const isABCButton = modeSwitch === 'text';
+
       const shouldShow = (keyboardMode === 'numeric')
-        ? (isNumberKey || isDecimal || isBackspace || isDone || isSpecial)
-        : (isLetterKey || isSpace || isShift || isBackspace || isDone || isSpecial);
+        ? (isNumberKey || isDecimal || isBackspaceNumeric || isDone || isSpecial || isABCButton)
+        : (isLetterKey || isSpace || isShift || isBackspaceText || isDone || is123Button);
 
       btn.style.display = shouldShow ? '' : 'none';
     });
@@ -5319,21 +5325,45 @@ function setupVirtualKeyboard() {
         (e.target.type === 'text' || e.target.type === 'tel' || e.target.type === 'number') && 
         e.target.id !== 'barcodeInput' &&
         e.target.id !== 'paymentAmount') {
+      const previousInput = currentKeyboardInput;
       currentKeyboardInput = e.target;
       setKeyboardMode(isNumericKeyboardTarget(e.target) ? 'numeric' : 'text');
       keyboard.classList.add('active');
+      
+      // Always move cursor to end when focusing an input
+      const len = e.target.value.length;
+      e.target.setSelectionRange(len, len);
+      e.target.focus();
     }
     if (e.target.tagName === 'TEXTAREA') {
+      const previousInput = currentKeyboardInput;
       currentKeyboardInput = e.target;
       setKeyboardMode('text');
       keyboard.classList.add('active');
+      
+      // Always move cursor to end when focusing a textarea
+      const len = e.target.value.length;
+      e.target.setSelectionRange(len, len);
+      e.target.focus();
     }
   });
   
   // Handle key presses
   keyButtons.forEach(btn => {
+    btn.addEventListener('mousedown', (e) => {
+      // Prevent keyboard buttons from stealing focus from input
+      e.preventDefault();
+    });
+    
     btn.addEventListener('click', () => {
       const key = btn.dataset.key;
+      const mode = btn.dataset.mode;
+      
+      // Handle mode switch (123 / ABC buttons)
+      if (mode) {
+        setKeyboardMode(mode);
+        return;
+      }
       
       if (key === 'Shift') {
         isShiftActive = !isShiftActive;
@@ -5366,8 +5396,25 @@ function setupVirtualKeyboard() {
         if (currentKeyboardInput) {
           // Extra guard: never inject letters into numeric mode.
           if (keyboardMode === 'numeric' && /[a-zA-Z]/.test(actualKey)) return;
-          currentKeyboardInput.value += actualKey;
-          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+          
+          // For numeric inputs, always append to the end
+          if (keyboardMode === 'numeric') {
+            currentKeyboardInput.value += actualKey;
+            currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+          } else {
+            // For text inputs, insert at cursor position
+            const start = currentKeyboardInput.selectionStart;
+            const end = currentKeyboardInput.selectionEnd;
+            const currentValue = currentKeyboardInput.value;
+            
+            currentKeyboardInput.value = currentValue.substring(0, start) + actualKey + currentValue.substring(end);
+            
+            // Move cursor after inserted character
+            const newCursorPos = start + actualKey.length;
+            currentKeyboardInput.setSelectionRange(newCursorPos, newCursorPos);
+            
+            currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+          }
         }
         // Auto-turn off shift after typing one character
         if (isShiftActive) {
@@ -6781,9 +6828,7 @@ async function printReceiptToThermalPrinter(sale) {
     
     if (!result.success) {
       console.error('Thermal print error:', result.error);
-      // Fallback to standard printing
-      console.log('Falling back to standard print...');
-      printReceiptFallback(sale);
+      showAlert('Failed to print receipt: ' + (result.error || 'Printer not configured'), 'error', 'Print Error');
       return false;
     } else {
       console.log('Receipt printed successfully to thermal printer');
@@ -6791,164 +6836,12 @@ async function printReceiptToThermalPrinter(sale) {
     }
   } catch (error) {
     console.error('Error printing receipt:', error);
-    // Fallback to standard printing
-    printReceiptFallback(sale);
+    showAlert('Failed to print receipt: ' + error.message, 'error', 'Print Error');
     return false;
   }
 }
 
-// Fallback: Print receipt using standard browser print (same as daily report)
-function printReceiptFallback(sale) {
-  const currencySymbol = systemSettings?.currency_symbol || '€';
-  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
-  const ownerName = systemSettings?.owner_name || '';
-  const nieNumber = systemSettings?.nie_number || '';
-  const companyAddress = systemSettings?.company_address || '';
-  const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
-  const date = new Date(sale.sale_date).toLocaleString();
-  
-  const printWindow = window.open('', '_blank');
-  printWindow.document.write(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Receipt #${sale.id}</title>
-      <style>
-        body {
-          font-family: 'Courier New', monospace;
-          max-width: 80mm;
-          margin: 0 auto;
-          padding: 10mm;
-          font-size: 12px;
-        }
-        .center {
-          text-align: center;
-        }
-        .header {
-          text-align: center;
-          margin-bottom: 10px;
-          padding-bottom: 10px;
-          border-bottom: 1px dashed #000;
-        }
-        .header h2 {
-          margin: 5px 0;
-          font-size: 16px;
-        }
-        .header p {
-          margin: 2px 0;
-          font-size: 11px;
-        }
-        .items {
-          margin: 10px 0;
-        }
-        .item {
-          display: flex;
-          justify-content: space-between;
-          margin: 5px 0;
-        }
-        .separator {
-          border-top: 1px dashed #000;
-          margin: 10px 0;
-        }
-        .total-line {
-          display: flex;
-          justify-content: space-between;
-          font-weight: bold;
-          font-size: 14px;
-          margin: 5px 0;
-        }
-        .footer {
-          text-align: center;
-          margin-top: 10px;
-          padding-top: 10px;
-          border-top: 1px dashed #000;
-          font-size: 11px;
-        }
-        @media print {
-          body {
-            padding: 0;
-            margin: 0;
-          }
-        }
-      </style>
-    </head>
-    <body>
-      <div class="header">
-        <h2>${storeName}</h2>
-        ${ownerName ? `<p>${ownerName}</p>` : ''}
-        ${nieNumber ? `<p>NIE: ${nieNumber}</p>` : ''}
-        ${companyAddress ? `<p>${companyAddress.replace(/\n/g, '<br>')}</p>` : ''}
-        <p style="font-weight: bold; margin-top: 8px;">FACTURA SIMPLIFICADA</p>
-        <p>Receipt #${sale.id}</p>
-        <p>${date}</p>
-      </div>
-      
-      <div class="items">
-        ${sale.items.map(item => `
-          <div class="item">
-            <span>${item.product_name} x${item.quantity}</span>
-            <span>${currencySymbol}${item.subtotal.toFixed(2)}</span>
-          </div>
-        `).join('')}
-      </div>
-      
-      <div class="separator"></div>
-      
-      <div class="item">
-        <span>Subtotal:</span>
-        <span>${currencySymbol}${sale.subtotal.toFixed(2)}</span>
-      </div>
-      <div class="item">
-        <span>Tax:</span>
-        <span>${currencySymbol}${sale.tax.toFixed(2)}</span>
-      </div>
-      <div class="total-line">
-        <span>TOTAL:</span>
-        <span>${currencySymbol}${sale.total.toFixed(2)}</span>
-      </div>
-      <div class="item">
-        <span>Payment:</span>
-        <span>${sale.payment_method.toUpperCase()}</span>
-      </div>
-      ${sale.payment_method === 'cash' && sale.payment_amount ? `
-        <div class="item">
-          <span>Payment Amount:</span>
-          <span>${currencySymbol}${sale.payment_amount.toFixed(2)}</span>
-        </div>
-        <div class="item" style="font-weight: bold;">
-          <span>Change:</span>
-          <span>${currencySymbol}${(sale.change_amount || 0).toFixed(2)}</span>
-        </div>
-      ` : ''}
-      
-      ${sale.notes ? `
-        <div class="separator"></div>
-        <div style="margin: 10px 0;">
-          <div style="font-weight: bold; margin-bottom: 5px;">NOTE:</div>
-          <div style="white-space: pre-wrap;">${sale.notes}</div>
-        </div>
-      ` : ''}
-      
-      <div class="footer">
-        <p>${receiptFooter}</p>
-        <p>Cashier: ${currentUser.full_name}</p>
-        <p>Generated by SUPERMARKET POS</p>
-        <p>Date: ${new Date().toLocaleString()}</p>
-      </div>
-      
-      <script>
-        window.onload = function() {
-          window.print();
-          setTimeout(function() {
-            window.close();
-          }, 500);
-        };
-      </script>
-    </body>
-    </html>
-  `);
-  printWindow.document.close();
-}
+
 
 async function printBarcodeLabel(product) {
   try {

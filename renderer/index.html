@@ -948,7 +948,7 @@
                   <h3>Tax Settings</h3>
                   <div class="form-group">
                     <label>Tax Rate (%) *</label>
-                    <input type="number" id="taxRate" step="0.01" min="0" max="100" required>
+                    <input type="text" inputmode="decimal" id="taxRate" required>
                     <small>Enter percentage (e.g., 10 for 10%)</small>
                   </div>
                 </div>
@@ -1123,11 +1123,11 @@
         <div class="form-row">
           <div class="form-group">
             <label>Regular Price *</label>
-            <input type="number" id="productRegularPrice" step="0.01" required>
+            <input type="text" inputmode="decimal" id="productRegularPrice" required>
           </div>
           <div class="form-group">
             <label>Sale Price</label>
-            <input type="number" id="productSalePrice" step="0.01" placeholder="Leave empty if not on sale">
+            <input type="text" inputmode="decimal" id="productSalePrice" placeholder="Leave empty if not on sale">
           </div>
         </div>
         <div class="form-group">
@@ -1209,7 +1209,7 @@
         </div>
         <div class="form-group">
           <label>Tax Rate (%) *</label>
-          <input type="number" id="categoryTaxRate" step="0.01" min="0" max="100" required>
+          <input type="text" inputmode="decimal" id="categoryTaxRate" required>
         </div>
         <div class="form-group" id="subcategoriesSection" style="display: none;">
           <label>Subcategories</label>
@@ -1276,7 +1276,7 @@
         </div>
         <div class="form-group">
           <label>Amount (€) *</label>
-          <input type="number" id="expenseAmount" step="0.01" min="0" required placeholder="0.00">
+          <input type="text" inputmode="decimal" id="expenseAmount" required placeholder="0.00">
         </div>
         <div class="form-group">
           <label>Payment Method *</label>
@@ -1542,7 +1542,7 @@
             </div>
             <div class="form-group">
               <label>Add Expense (Optional):</label>
-              <input type="number" step="0.01" id="zReportExpenseAmount" placeholder="0.00">
+              <input type="text" inputmode="decimal" id="zReportExpenseAmount" placeholder="0.00">
               <small>Enter any money spent/paid out during the day</small>
             </div>
             <div class="form-group">
@@ -1585,7 +1585,7 @@
             </div>
             <div class="form-group">
               <label>Actual Cash Count:</label>
-              <input type="number" step="0.01" id="zReportActualCash" required>
+              <input type="text" inputmode="decimal" id="zReportActualCash" required>
             </div>
             <div class="form-group">
               <label>Difference:</label>
@@ -1629,7 +1629,9 @@
   <!-- Virtual Keyboard -->
   <div id="virtualKeyboard" class="virtual-keyboard">
     <div class="keyboard-buttons">
+      <!-- Row 1: Numbers -->
       <div class="keyboard-row">
+        <button class="key-btn key-mode-switch" data-mode="text">ABC</button>
         <button class="key-btn key-number" data-key="1">1</button>
         <button class="key-btn key-number" data-key="2">2</button>
         <button class="key-btn key-number" data-key="3">3</button>
@@ -1640,53 +1642,67 @@
         <button class="key-btn key-number" data-key="8">8</button>
         <button class="key-btn key-number" data-key="9">9</button>
         <button class="key-btn key-number" data-key="0">0</button>
+        <button class="key-btn key-backspace key-backspace-numeric" data-key="Backspace">⌫</button>
       </div>
+      
+      <!-- Row 2: QWERTY -->
       <div class="keyboard-row">
-        <button class="key-btn" data-key="Q">Q</button>
-        <button class="key-btn" data-key="W">W</button>
-        <button class="key-btn" data-key="E">E</button>
-        <button class="key-btn" data-key="R">R</button>
-        <button class="key-btn" data-key="T">T</button>
-        <button class="key-btn" data-key="Y">Y</button>
-        <button class="key-btn" data-key="U">U</button>
-        <button class="key-btn" data-key="I">I</button>
-        <button class="key-btn" data-key="O">O</button>
-        <button class="key-btn" data-key="P">P</button>
-        <button class="key-btn" data-key="A">A</button>
-        <button class="key-btn" data-key="S">S</button>
-        <button class="key-btn" data-key="D">D</button>
+        <button class="key-btn key-letter" data-key="Q">q</button>
+        <button class="key-btn key-letter" data-key="W">w</button>
+        <button class="key-btn key-letter" data-key="E">e</button>
+        <button class="key-btn key-letter" data-key="R">r</button>
+        <button class="key-btn key-letter" data-key="T">t</button>
+        <button class="key-btn key-letter" data-key="Y">y</button>
+        <button class="key-btn key-letter" data-key="U">u</button>
+        <button class="key-btn key-letter" data-key="I">i</button>
+        <button class="key-btn key-letter" data-key="O">o</button>
+        <button class="key-btn key-letter" data-key="P">p</button>
       </div>
+      
+      <!-- Row 3: ASDF -->
       <div class="keyboard-row">
-        <button class="key-btn" data-key="F">F</button>
-        <button class="key-btn" data-key="G">G</button>
-        <button class="key-btn" data-key="H">H</button>
-        <button class="key-btn" data-key="J">J</button>
-        <button class="key-btn" data-key="K">K</button>
-        <button class="key-btn" data-key="L">L</button>
-        <button class="key-btn" data-key="Z">Z</button>
-        <button class="key-btn" data-key="X">X</button>
-        <button class="key-btn" data-key="C">C</button>
-        <button class="key-btn" data-key="V">V</button>
-        <button class="key-btn" data-key="B">B</button>
-        <button class="key-btn" data-key="N">N</button>
-        <button class="key-btn" data-key="M">M</button>
+        <button class="key-btn key-letter" data-key="A">a</button>
+        <button class="key-btn key-letter" data-key="S">s</button>
+        <button class="key-btn key-letter" data-key="D">d</button>
+        <button class="key-btn key-letter" data-key="F">f</button>
+        <button class="key-btn key-letter" data-key="G">g</button>
+        <button class="key-btn key-letter" data-key="H">h</button>
+        <button class="key-btn key-letter" data-key="J">j</button>
+        <button class="key-btn key-letter" data-key="K">k</button>
+        <button class="key-btn key-letter" data-key="L">l</button>
       </div>
+      
+      <!-- Row 4: ZXCV -->
       <div class="keyboard-row">
+        <button class="key-btn key-shift" data-key="Shift">⇧</button>
+        <button class="key-btn key-letter" data-key="Z">z</button>
+        <button class="key-btn key-letter" data-key="X">x</button>
+        <button class="key-btn key-letter" data-key="C">c</button>
+        <button class="key-btn key-letter" data-key="V">v</button>
+        <button class="key-btn key-letter" data-key="B">b</button>
+        <button class="key-btn key-letter" data-key="N">n</button>
+        <button class="key-btn key-letter" data-key="M">m</button>
+        <button class="key-btn key-backspace key-backspace-text" data-key="Backspace">⌫</button>
+      </div>
+      
+      <!-- Row 5: Symbols and space -->
+      <div class="keyboard-row">
+        <button class="key-btn key-mode-switch" data-mode="numeric">123</button>
         <button class="key-btn key-special" data-key="@">@</button>
-        <button class="key-btn key-special" data-key="_">_</button>
-        <button class="key-btn key-special" data-key="/">/</button>
-        <button class="key-btn key-special" data-key=",">,</button>
+        <button class="key-btn key-special" data-key="-">-</button>
+        <button class="key-btn key-special" data-key="=">=</button>
+        <button class="key-btn key-special" data-key="[">[</button>
+        <button class="key-btn key-special" data-key="]">]</button>
+        <button class="key-btn key-special" data-key=";">;</button>
+        <button class="key-btn key-special" data-key="'">'</button>
         <button class="key-btn key-special" data-key="#">#</button>
-        <button class="key-btn key-special" data-key="%">%</button>
-        <button class="key-btn key-special" data-key="&">&</button>
-        <button class="key-btn key-special" data-key="+">&plus;</button>
+        <button class="key-btn key-special" data-key=",">,</button>
+        <button class="key-btn key-special" data-key=".">.</button>
+        <button class="key-btn key-special" data-key="/">/</button>
         <button class="key-btn key-special" data-key="(">(</button>
         <button class="key-btn key-special" data-key=")">)</button>
-        <button class="key-btn key-special" data-key="-">-</button>
-        <button class="key-btn key-special" data-key=".">.</button>
-        <button class="key-btn key-backspace" data-key="Backspace">⌫</button>
-      </div>
-      <div class="keyboard-row">
+        <button class="key-btn key-special" data-key="&">&</button>
+        <button class="key-btn key-special" data-key="%">%</button>
         <button class="key-btn key-space" data-key=" ">SPACE</button>
         <button class="key-btn key-done" data-key="Done">✓ DONE</button>
       </div>

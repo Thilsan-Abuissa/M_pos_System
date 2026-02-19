@@ -3195,8 +3195,8 @@ button {
   bottom: -100%;
   left: 50%;
   transform: translateX(-50%);
-  width: 60%;
-  max-width: 1100px;
+  width: 90%;
+  max-width: 1500px;
   background: white;
   border-radius: 12px 12px 0 0;
   box-shadow: 0 -10px 50px rgba(0,0,0,0.4);
@@ -3248,25 +3248,25 @@ button {
 .keyboard-buttons {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 8px;
 }
 
 .keyboard-row {
   display: flex;
-  gap: 5px;
+  gap: 8px;
   justify-content: center;
 }
 
 .key-btn {
-  min-width: 42px;
-  height: 42px;
-  padding: 6px;
-  font-size: 15px;
+  min-width: 50px;
+  height: 60px;
+  padding: 10px;
+  font-size: 26px;
   font-weight: 700;
   background: white;
   color: #1e293b;
   border: 2px solid #cbd5e1;
-  border-radius: 8px;
+  border-radius: 10px;
   cursor: pointer;
   transition: all 0.2s;
   box-shadow: 0 2px 8px rgba(0,0,0,0.15);
@@ -3287,9 +3287,11 @@ button {
 
 /* Number keys - highlighted */
 .key-number {
+  min-width: 70px;
+  height: 70px;
   background: white;
   color: #1e293b;
-  font-size: 16px;
+  font-size: 22px;
   border: 2px solid #cbd5e1;
 }
 
@@ -3300,9 +3302,11 @@ button {
 
 /* Special characters */
 .key-special {
+  min-width: 70px;
+  height: 70px;
   background: white;
   color: #1e293b;
-  font-size: 16px;
+  font-size: 22px;
   border: 2px solid #cbd5e1;
 }
 
@@ -3313,10 +3317,11 @@ button {
 
 /* Backspace key */
 .key-backspace {
-  min-width: 60px;
+  min-width: 70px;
+  height: 70px;
   background: white;
   color: #1e293b;
-  font-size: 18px;
+  font-size: 24px;
   border: 2px solid #cbd5e1;
 }
 
@@ -3343,10 +3348,11 @@ button {
 
 /* Done button */
 .key-done {
-  min-width: 90px;
+  min-width: 70px;
+  height: 70px;
   background: white;
   color: #1e293b;
-  font-size: 15px;
+  font-size: 20px;
   font-weight: 700;
   border: 2px solid #cbd5e1;
 }
@@ -3356,9 +3362,30 @@ button {
   border-color: #94a3b8;
 }
 
+/* Mode switch button (ABC/123) */
+.key-mode-switch {
+  min-width: 70px;
+  height: 70px;
+  background: white;
+  color: #1e293b;
+  font-size: 20px;
+  font-weight: 700;
+  border: 2px solid #cbd5e1;
+}
+
+.key-mode-switch:active {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+/* Letter keys - wider for English keyboard */
+.key-letter {
+  min-width: 80px;
+}
+
 /* Shift key */
 .key-shift {
-  min-width: 60px;
+  min-width: 80px;
   background: white;
   color: #1e293b;
   font-size: 18px;
