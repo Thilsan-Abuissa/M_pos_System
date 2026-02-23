@@ -1189,7 +1189,7 @@ function displayQuickProducts(searchQuery = '', category = null, subcategory = n
     return;
   }
   
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   container.innerHTML = filteredProducts.map(product => {
     // Use product image if available, otherwise use emoji icon
@@ -1308,7 +1308,7 @@ function promptForWeight(productId) {
   // Set flag to prevent duplicate opens
   isWeightModalOpen = true;
   
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   let isWeightBased = product.unit_type === 'weight' || !product.unit_type; // Default to weight if not set
   
   // Show custom modal
@@ -2037,7 +2037,7 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
     discountPercent: 0 // Discount as percentage (0%, 10%, 20%, etc.)
   };
   console.log('Cart item to add:', cartItem);
-  cart.push(cartItem);
+  cart.unshift(cartItem); // Add to beginning (most recent first)
   
   console.log('Cart after update:', cart);
   
@@ -2072,7 +2072,7 @@ function removeFromCart(cartItemId) {
 }
 
 function setupInlineCartEditing() {
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   console.log('Setting up inline cart editing...');
   
@@ -2318,7 +2318,7 @@ function updateCartDisplay() {
   const checkoutBtn = document.getElementById('checkoutBtn');
   const ticketBtn = document.getElementById('ticketBtn');
   const paymentBtn = document.getElementById('paymentBtn');
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   // Reset payment method selection and button highlighting
   selectedPaymentMethod = null;
@@ -2599,7 +2599,7 @@ async function completeSale() {
   // Validate payment based on mode
   if (paymentMode === 'single') {
     if (!selectedPaymentMethod) {
-      alert('Please select a payment method: CASH, CARD, or PACKING');
+      alert('Please select a payment method: CASH, CARD, or PARKING');
       return;
     }
   }
@@ -2685,6 +2685,8 @@ async function completeSale() {
   
   // If loan is selected, open loan customer info modal
   if (paymentMethod === 'loan') {
+    // Close payment modal first
+    closePaymentModalFunc();
     openLoanModal(total, subtotal, tax);
     return;
   }
@@ -3068,19 +3070,19 @@ async function searchLoanByReceipt(receiptNumber) {
     const loan = await window.api.getLoanByReceipt(receiptNumber);
     
     if (!loan) {
-      alert('PACKING not found with this receipt number');
+      alert('PARKING not found with this receipt number');
       return;
     }
     
     if (loan.status === 'paid') {
-      alert('This PACKING has already been paid in full');
+      alert('This PARKING has already been paid in full');
       return;
     }
     
     // Show loan payment modal
     showLoanPaymentModal(loan);
   } catch (error) {
-    alert('Error searching for PACKING: ' + error.message);
+    alert('Error searching for PARKING: ' + error.message);
   }
 }
 
@@ -4923,8 +4925,8 @@ async function loadSystemSettingsView() {
       logoPreviewText.textContent = systemSettings.store_logo || '\ud83d\uded2';
     }
     
-    document.getElementById('currencySymbol').value = systemSettings.currency_symbol || '';
-    document.getElementById('currencyCode').value = systemSettings.currency_code || '';
+    document.getElementById('currencySymbol').value = systemSettings.currency_symbol || '€';
+    document.getElementById('currencyCode').value = systemSettings.currency_code || 'EUR';
     document.getElementById('taxRate').value = (systemSettings.tax_rate * 100) || 0;
     document.getElementById('receiptFooter').value = systemSettings.receipt_footer || '';
     document.getElementById('printerName').value = systemSettings.printer_name || '';
@@ -6042,7 +6044,7 @@ async function viewZReportDetails(reportId) {
             <span class="summary-value">${currencySymbol}${report.card_sales.toFixed(2)}</span>
           </div>
           <div class="summary-item">
-            <span class="summary-label">📦 Loan:</span>
+            <span class="summary-label">🅿️ Loan:</span>
             <span class="summary-value">${currencySymbol}${report.loan_sales.toFixed(2)}</span>
           </div>
           <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
@@ -6139,242 +6141,147 @@ async function viewZReportDetails(reportId) {
   }
 }
 
-function printZReport(report) {
-  const currencySymbol = systemSettings?.currency_symbol || '€';
-  const printWindow = window.open('', '_blank');
-  
-  printWindow.document.write(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Z-Report #${report.report_number}</title>
-      <style>
-        body {
-          font-family: Arial, sans-serif;
-          max-width: 800px;
-          margin: 20px auto;
-          padding: 20px;
-          font-size: 12px;
-        }
-        .header {
-          text-align: center;
-          margin-bottom: 20px;
-          padding-bottom: 15px;
-          border-bottom: 2px solid #000;
-        }
-        .header h2 {
-          margin: 5px 0;
-          font-size: 24px;
-        }
-        .section {
-          margin: 20px 0;
-          padding: 15px;
-          border: 1px solid #ddd;
-          border-radius: 5px;
-        }
-        .section h3 {
-          margin: 0 0 15px 0;
-          font-size: 16px;
-          color: #333;
-          border-bottom: 1px solid #eee;
-          padding-bottom: 8px;
-        }
-        .grid {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 10px;
-        }
-        .grid-item {
-          display: flex;
-          justify-content: space-between;
-          padding: 8px;
-          background: #f9f9f9;
-          border-radius: 3px;
-        }
-        .label {
-          font-weight: 500;
-          color: #666;
-        }
-        .value {
-          font-weight: bold;
-          color: #000;
-        }
-        .highlight {
-          background: #e8f5e9;
-          font-size: 14px;
-          padding: 12px;
-          border-left: 4px solid #4caf50;
-        }
-        .expense {
-          background: #ffebee;
-          border-left: 4px solid #f44336;
-        }
-        .footer {
-          text-align: center;
-          margin-top: 30px;
-          padding-top: 15px;
-          border-top: 2px solid #000;
-          font-size: 11px;
-          color: #666;
-        }
-        @media print {
-          body {
-            margin: 0;
-            padding: 10mm;
-          }
-          .section {
-            page-break-inside: avoid;
-          }
-        }
-      </style>
-    </head>
-    <body>
-      <div class="header">
-        <h2>Z-REPORT (END OF DAY)</h2>
-        <p><strong>Report #${report.report_number}</strong></p>
-        <p>${new Date(report.report_date).toLocaleString()}</p>
-        <p>Cashier: ${report.cashier_name}</p>
-      </div>
-
-      <div class="section">
-        <h3>📊 Sales Summary</h3>
-        <div class="grid">
-          <div class="grid-item">
-            <span class="label">Total Sales:</span>
-            <span class="value">${report.total_sales}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">Total Returns:</span>
-            <span class="value">${report.total_returns}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">Net Sales Count:</span>
-            <span class="value">${report.net_sales_count}</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <h3>💰 Financial Summary</h3>
-        <div class="grid">
-          <div class="grid-item">
-            <span class="label">Gross Sales:</span>
-            <span class="value">${currencySymbol}${report.gross_sales.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">Returns Amount:</span>
-            <span class="value">${currencySymbol}${report.total_returns_amount.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">Net Sales:</span>
-            <span class="value">${currencySymbol}${report.net_sales.toFixed(2)}</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <h3>💳 Payment Methods</h3>
-        <div class="grid">
-          <div class="grid-item">
-            <span class="label">💵 Cash Sales:</span>
-            <span class="value">${currencySymbol}${report.cash_sales.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">💳 Card Sales:</span>
-            <span class="value">${currencySymbol}${report.card_sales.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">📦 PACKING Sales:</span>
-            <span class="value">${currencySymbol}${report.loan_sales.toFixed(2)}</span>
-          </div>
-        </div>
-        <div class="grid-item highlight" style="margin-top: 15px;">
-          <span class="label" style="font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
-          <span class="value" style="font-size: 18px; color: #2e7d32;">${currencySymbol}${(report.total_sales_amount || 0).toFixed(2)}</span>
-        </div>
-      </div>
-
-      ${report.total_expenses > 0 ? `
-      <div class="section">
-        <h3>💸 Expenses</h3>
-        <div class="grid-item expense">
-          <span class="label">Total Expenses:</span>
-          <span class="value" style="color: #c62828;">${currencySymbol}${report.total_expenses.toFixed(2)}</span>
-        </div>
-        ${report.expense_description ? `
-          <p style="margin: 10px 0 0 0; padding: 10px; background: #f5f5f5; border-radius: 3px;">
-            <strong>Description:</strong> ${report.expense_description}
-          </p>
-        ` : ''}
-      </div>
-      ` : ''}
-
-      <div class="section">
-        <h3>📋 Tax Breakdown</h3>
-        <div class="grid">
-          <div class="grid-item">
-            <span class="label">7% Tax Base:</span>
-            <span class="value">${currencySymbol}${report.tax_7_base.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">7% Tax Amount:</span>
-            <span class="value">${currencySymbol}${report.tax_7_amount.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">19% Tax Base:</span>
-            <span class="value">${currencySymbol}${report.tax_19_base.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">19% Tax Amount:</span>
-            <span class="value">${currencySymbol}${report.tax_19_amount.toFixed(2)}</span>
-          </div>
-          <div class="grid-item highlight">
-            <span class="label">Total Tax:</span>
-            <span class="value">${currencySymbol}${report.total_tax.toFixed(2)}</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <h3>💵 Cash Reconciliation</h3>
-        <div class="grid">
-          <div class="grid-item">
-            <span class="label">Expected Cash:</span>
-            <span class="value">${currencySymbol}${report.expected_cash.toFixed(2)}</span>
-          </div>
-          <div class="grid-item">
-            <span class="label">Actual Cash:</span>
-            <span class="value">${currencySymbol}${report.actual_cash ? report.actual_cash.toFixed(2) : 'N/A'}</span>
-          </div>
-          <div class="grid-item" style="background: ${report.cash_difference < 0 ? '#ffebee' : (report.cash_difference > 0 ? '#e8f5e9' : '#f9f9f9')}">
-            <span class="label">Difference:</span>
-            <span class="value" style="color: ${report.cash_difference < 0 ? '#c62828' : (report.cash_difference > 0 ? '#2e7d32' : '#000')}">${currencySymbol}${report.cash_difference ? report.cash_difference.toFixed(2) : 'N/A'}</span>
-          </div>
-        </div>
-      </div>
-
-      ${report.notes ? `
-      <div class="section">
-        <h3>📝 Notes</h3>
-        <p style="margin: 0; padding: 10px; background: #f5f5f5; border-radius: 3px;">${report.notes}</p>
-      </div>
-      ` : ''}
-
-      <div class="footer">
-        <p>Generated on ${new Date().toLocaleString()}</p>
-        <p>POS System - End of Day Report</p>
-      </div>
-
-      <script>
-        window.onload = function() {
-          window.print();
-        };
-      </script>
-    </body>
-    </html>
-  `);
-  
-  printWindow.document.close();
+async function printZReport(report) {
+  try {
+    const settings = await window.api.getSystemSettings();
+    const currencySymbol = settings?.currency_symbol || '€';
+    
+    // Format Z report for thermal printer
+    const ESC = '\x1B';
+    const GS = '\x1D';
+    
+    let receipt = '';
+    
+    // Initialize printer
+    receipt += ESC + '@'; // Initialize
+    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+    
+    // Header
+    receipt += ESC + '!' + String.fromCharCode(0x30); // Double height + double width
+    receipt += (settings?.store_name || 'SUPERMARKET') + '\n';
+    receipt += 'POS\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    receipt += '\n';
+    
+    receipt += ESC + '!' + String.fromCharCode(0x20); // Double height
+    receipt += 'Daily Sales Report\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    receipt += new Date(report.report_date).toLocaleString('en-GB', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }) + '\n';
+    receipt += '================================\n\n';
+    
+    // Summary - Center align
+    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+    receipt += '\n';
+    receipt += '      Total           Total Sales\n';
+    receipt += ' Transactions\n\n';
+    receipt += ESC + '!' + String.fromCharCode(0x38); // Quad size
+    receipt += '    ' + report.total_sales + '         ' + currencySymbol + (report.total_sales_amount || 0).toFixed(2) + '\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    receipt += '\n\n';
+    
+    // Transaction Details Header
+    receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
+    receipt += 'Transaction Details\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    receipt += '\n';
+    
+    // Table header
+    receipt += ESC + 'a' + String.fromCharCode(0); // Left align
+    receipt += 'TIME         RECEIPT    SUBTOTAL\n';
+    receipt += '            #\n';
+    receipt += '--------------------------------\n';
+    
+    // Get recent sales for the report
+    const sales = await window.api.getTodaySales();
+    
+    // List transactions
+    if (sales && sales.length > 0) {
+      sales.forEach(sale => {
+        const time = new Date(sale.sale_date).toLocaleTimeString('en-GB', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit'
+        });
+        const receiptNum = ('#' + sale.id).padEnd(11);
+        const subtotal = (currencySymbol + (sale.subtotal || 0).toFixed(2));
+        
+        receipt += time + '  ' + receiptNum + subtotal + '\n';
+      });
+    }
+    
+    receipt += '\n';
+    receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
+    receipt += 'TOTAL'.padEnd(20) + currencySymbol + (report.total_sales_amount || 0).toFixed(2) + '\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    receipt += '--------------------------------\n\n\n';
+    
+    // Expenses Section
+    if (report.total_expenses && report.total_expenses > 0) {
+      receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
+      receipt += 'Expenses\n';
+      receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+      receipt += '\n';
+      
+      // Add note about expenses
+      receipt += 'Total Expenses: ' + currencySymbol + report.total_expenses.toFixed(2) + '\n';
+      if (report.expense_description) {
+        receipt += 'Notes: ' + report.expense_description.substring(0, 30) + '\n';
+      }
+      
+      receipt += '\n';
+      receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
+      receipt += 'TOTAL EXPENSES'.padEnd(15) + currencySymbol + report.total_expenses.toFixed(2) + '\n';
+      receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+      receipt += '--------------------------------\n\n';
+      
+      // Net amount (Sales - Expenses)
+      const netAmount = (report.total_sales_amount || 0) - report.total_expenses;
+      receipt += ESC + '!' + String.fromCharCode(0x20); // Double height
+      receipt += 'NET AMOUNT: ' + currencySymbol + netAmount.toFixed(2) + '\n';
+      receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+      receipt += '--------------------------------\n\n';
+    }
+    
+    // Footer
+    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+    receipt += 'Generated by ' + (settings?.store_name || 'SUPERMARKET') + ' POS\n';
+    receipt += 'POS System\n';
+    receipt += new Date().toLocaleString('en-GB', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }) + '\n';
+    receipt += '\n\n';
+    
+    // Cut paper
+    receipt += GS + 'V' + String.fromCharCode(66) + String.fromCharCode(0); // Partial cut
+    receipt += '\n\n\n';
+    
+    // Print using thermal printer
+    const result = await window.api.printReceipt({
+      raw: true,
+      text: receipt
+    });
+    
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to print');
+    }
+    
+    showAlert('Z-Report printed successfully', 'success');
+  } catch (error) {
+    console.error('Error printing Z report:', error);
+    showAlert('Failed to print Z-Report: ' + error.message, 'error', 'Print Error');
+  }
 }
 
 // ============== EXPENSES MANAGEMENT ==============

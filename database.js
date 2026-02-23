@@ -244,7 +244,7 @@ class POSDatabase {
         console.error('Error adding split_payments column:', error);
       }
     }
-
+    
     // Add printer_name column to system_settings table if it doesn't exist
     try {
       this.db.prepare('ALTER TABLE system_settings ADD COLUMN printer_name TEXT').run();

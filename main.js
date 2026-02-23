@@ -1126,14 +1126,174 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       }
     }
 
-    // ...existing code for structured receipt printing...
     // Format receipt for thermal printer (ESC/POS)
     const ESC = '\x1B';
     const GS = '\x1D';
     
     let receipt = '';
     
-    // ...existing code...
+    // Initialize printer
+    receipt += ESC + '@'; // Initialize
+    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+    
+    // Store name (large text)
+    receipt += ESC + '!' + String.fromCharCode(0x20); // Bold + large
+    receipt += receiptData.storeName + '\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    
+    // Owner name
+    if (receiptData.ownerName) {
+      receipt += receiptData.ownerName + '\n';
+    }
+    // NIE/CIF number
+    if (receiptData.nieNumber) {
+      receipt += receiptData.nieNumber + '\n';
+    }
+    // Store address
+    if (receiptData.companyAddress) {
+      receipt += receiptData.companyAddress + '\n';
+    }
+    
+    receipt += '\n';
+    
+    // FACTURA SIMPLIFICADA header
+    receipt += ESC + '!' + String.fromCharCode(0x10); // Bold
+    receipt += 'FACTURA SIMPLIFICADA\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    
+    receipt += '================================\n';
+    receipt += '\n';
+    
+    receipt += ESC + 'a' + String.fromCharCode(0); // Left align
+    receipt += 'FECHA: ' + receiptData.date + '\n';
+    receipt += 'Factura Simplificada PRINCIPAL\n';
+    receipt += 'Serie/N' + String.fromCharCode(248) + ': ' + (receiptData.receiptId || '') + '\n';
+    receipt += 'Ud.Descripcion       Precio Dt% Importe\n';
+    receipt += '--------------------------------\n';
+    
+    // Items with proper formatting (currency after amount, comma decimal)
+    receiptData.items.forEach(item => {
+      const itemName = (item.name || '').substring(0, 20).toUpperCase();
+      const qty = item.quantity || 1;
+      const price = (item.subtotal || 0) / qty;
+      const subtotal = item.subtotal || 0;
+      
+      const qtyStr = qty.toString().padStart(2);
+      const nameStr = itemName.padEnd(21);
+      const priceStr = price.toFixed(2).replace('.', ',').padStart(6);
+      const totalStr = subtotal.toFixed(2).replace('.', ',').padStart(7);
+      
+      receipt += qtyStr + '  ' + nameStr + priceStr + totalStr + '\n';
+    });
+    
+    receipt += '--------------------------------\n';
+    receipt += '\n';
+    
+    // Tax breakdown table (currency symbol after amount)
+    receipt += 'Iva      Base    Cuota    Total\n';
+    
+    let totalBase = 0;
+    let totalCuota = 0;
+    let totalTotal = 0;
+    
+    if (receiptData.taxBreakdown && receiptData.taxBreakdown.length > 0) {
+      receiptData.taxBreakdown.forEach(taxLine => {
+        const rate = taxLine.rate || 0;
+        const base = taxLine.base || 0;
+        const cuota = taxLine.tax || 0;
+        const total = taxLine.total || 0;
+        
+        totalBase += base;
+        totalCuota += cuota;
+        totalTotal += total;
+        
+        const rateStr = (rate.toFixed(0) + '%').padEnd(8);
+        const baseStr = (base.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
+        const cuotaStr = (cuota.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
+        const totalStr = (total.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
+        
+        receipt += rateStr + baseStr + cuotaStr + totalStr + '\n';
+      });
+    }
+    
+    receipt += '--------------------------------\n';
+    
+    // TOTAL row for tax table
+    const totalBaseStr = (totalBase.toFixed(2).replace('.', ',') + receiptData.currency).padStart(15);
+    const totalCuotaStr = (totalCuota.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
+    const totalTotalStr = (totalTotal.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
+    receipt += 'TOTAL  ' + totalBaseStr + totalCuotaStr + totalTotalStr + '\n';
+    
+    receipt += '--------------------------------\n';
+    receipt += '\n';
+    
+    // Payment method line
+    const paymentMethod = receiptData.paymentMethod || 'CASH';
+    const paymentMethodUpper = paymentMethod.toUpperCase();
+    const paymentLine = (paymentMethodUpper === 'CASH' ? 'EFECTIVO' : 
+                        paymentMethodUpper === 'CARD' ? 'TARJETA' : 
+                        paymentMethodUpper === 'PARKING' ? 'CREDITO' : paymentMethodUpper);
+    receipt += paymentLine.padEnd(20) + (receiptData.total.toFixed(2).replace('.', ',') + receiptData.currency).padStart(12) + '\n';
+    
+    receipt += '--------------------------------\n';
+    receipt += '\n';
+    
+    // Payment section - big TOTAL (centered, with period for decimal, NO currency)
+    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+    receipt += ESC + '!' + String.fromCharCode(0x30); // Double height + double width
+    receipt += 'TOTAL        ' + (receiptData.total || 0).toFixed(2) + '\n';
+    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    
+    receipt += '(Impuestos Inluidos)\n';
+    receipt += '\n';
+    
+    receipt += ESC + 'a' + String.fromCharCode(0); // Left align
+    const entregaAmount = (receiptData.paymentAmount || receiptData.total).toFixed(2);
+    const cambioAmount = (receiptData.changeAmount || 0).toFixed(2);
+    // Keep within 32 character width for thermal printer
+    receipt += 'ENTREGA' + (' '.repeat(Math.max(2, 32 - 7 - entregaAmount.length))) + entregaAmount + '\n';
+    receipt += 'CAMBIO' + (' '.repeat(Math.max(2, 32 - 6 - cambioAmount.length))) + cambioAmount + '\n';
+    receipt += '\n';
+    
+    // Services count
+    receipt += 'SERVICIOS: ' + receiptData.items.length + '\n';
+    receipt += 'CUENTAS:   / 1 )\n';
+    receipt += 'LE ATENDIO: ' + (receiptData.cashier || '') + '\n';
+    receipt += '\n';
+    
+    // Footer message
+    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+    if (receiptData.footer) {
+      receipt += '---- ' + receiptData.footer + ' ----\n';
+    } else {
+      receipt += '---- GRACIAS POR SU VISITA ----\n';
+    }
+    
+    receipt += '\n\n';
+    
+    // Cut paper
+    receipt += GS + 'V' + String.fromCharCode(66) + String.fromCharCode(0); // Partial cut
+    receipt += '\n\n\n';
+    
+    // Write to temp file and print
+    const tempFile = path.join(app.getPath('temp'), 'receipt_' + Date.now() + '.txt');
+    const receiptBuffer = iconv.encode(receipt, 'cp1252');
+    fs.writeFileSync(tempFile, receiptBuffer);
+    
+    try {
+      if (process.platform === 'win32') {
+        await sendRawFileToPrinterWindows(printerName, tempFile);
+      } else {
+        await execPromise(`lp -d "${printerName}" -o raw "${tempFile}"`);
+      }
+      
+      fs.unlinkSync(tempFile);
+      console.log('Receipt printed successfully');
+      return { success: true };
+    } catch (printError) {
+      try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (cleanupError) {}
+      throw printError;
+    }
   } catch (error) {
     console.error('Error printing receipt:', error);
     return { success: false, error: error.message };

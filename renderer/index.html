@@ -67,7 +67,7 @@
             <span class="tab-text">Checkout</span>
           </button>
           <button class="tab-btn" data-view="products">
-            <span class="tab-icon">📦</span>
+            <span class="tab-icon">🅿️</span>
             <span class="tab-text">Products</span>
           </button>
           <button class="tab-btn" data-view="categories">
@@ -124,29 +124,29 @@
                   <div class="summary-left">
                     <div class="summary-item">
                       <span class="summary-label">Subtotal</span>
-                      <span class="summary-value" id="cartSubtotal">$0.00</span>
+                      <span class="summary-value" id="cartSubtotal">0.00</span>
                     </div>
                     <div class="summary-item">
                       <span class="summary-label">Discount</span>
-                      <span class="summary-value" id="cartDiscount">$0.00</span>
+                      <span class="summary-value" id="cartDiscount">0.00</span>
                     </div>
                     <div class="summary-item">
                       <span class="summary-label">Tax</span>
-                      <span class="summary-value" id="cartTax">$0.00</span>
+                      <span class="summary-value" id="cartTax">0.00</span>
                     </div>
                     <div class="change-section">
                       <div class="change-label">Change</div>
-                      <div class="change-amount" id="changeAmount">$0.00</div>
+                      <div class="change-amount" id="changeAmount">0.00</div>
                     </div>
                   </div>
                   <div class="summary-right">
                     <div class="total-section">
                       <div class="total-label">Total</div>
-                      <div class="total-amount" id="cartTotal">$0.00</div>
+                      <div class="total-amount" id="cartTotal">0.00</div>
                     </div>
                     <div class="payment-section">
                       <div class="payment-label">Payment</div>
-                      <div class="payment-amount" id="paymentAmount">$0.00</div>
+                      <div class="payment-amount" id="paymentAmount">0.00</div>
                       <input type="hidden" id="paymentInput" value="">
                     </div>
                     <!-- Drawer & Note Buttons -->
@@ -231,8 +231,8 @@
                         <span class="payment-label">CARD</span>
                       </button>
                       <button class="payment-method-btn payment-packing" data-value="loan">
-                        <span class="payment-icon">📦</span>
-                        <span class="payment-label">PACKING</span>
+                        <span class="payment-icon">🅿️</span>
+                        <span class="payment-label">PARKING</span>
                       </button>
                     </div>
                   </div>
@@ -297,7 +297,7 @@
                         <span class="menu-text">Checkout</span>
                       </button>
                       <button class="settings-menu-item" data-view="products">
-                        <span class="menu-icon">📦</span>
+                        <span class="menu-icon">🅿️</span>
                         <span class="menu-text">Products</span>
                       </button>
                       <button class="settings-menu-item" data-view="sales">
@@ -370,7 +370,7 @@
                 <span class="settings-card-desc">Process sales and transactions</span>
               </button>
               <button class="settings-card" data-view="products">
-                <span class="settings-card-icon">📦</span>
+                <span class="settings-card-icon">🅿️</span>
                 <span class="settings-card-title">Products</span>
                 <span class="settings-card-desc">Manage product inventory</span>
               </button>
@@ -406,8 +406,8 @@
               </button>
               <button class="settings-card" data-view="loans">
                 <span class="settings-card-icon">💳</span>
-                <span class="settings-card-title">PACKING</span>
-                <span class="settings-card-desc">Manage customer packing</span>
+                <span class="settings-card-title">PARKING</span>
+                <span class="settings-card-desc">Manage customer parking</span>
               </button>
               <button class="settings-card" data-view="categories">
                 <span class="settings-card-icon">🏷️</span>
@@ -487,7 +487,7 @@
                     <button id="filterAllBtn" class="btn-filter active" data-filter="all">All</button>
                     <button id="filterCashBtn" class="btn-filter" data-filter="cash">💵 Cash</button>
                     <button id="filterCardBtn" class="btn-filter" data-filter="card">💳 Card</button>
-                    <button id="filterLoanBtn" class="btn-filter" data-filter="loan">📦 Packing</button>
+                    <button id="filterLoanBtn" class="btn-filter" data-filter="loan">🅿️ Parking</button>
                   </div>
                   <button id="printTodaySalesBtn" class="btn-primary" style="min-width: 150px;">🖨️ Print Today</button>
                 </div>
@@ -541,7 +541,7 @@
                         <th>Net Sales</th>
                         <th>Cash</th>
                         <th>Card</th>
-                        <th>PACKING</th>
+                        <th>PARKING</th>
                         <th>Total Amount</th>
                         <th>Expenses</th>
                         <th>Total Tax</th>
@@ -849,15 +849,15 @@
           <div class="view-wrapper">
             <div class="view-content">
               <div class="view-header">
-                <h2>PACKING Management</h2>
+                <h2>PARKING Management</h2>
                 <div class="loan-search-container">
                   <input type="text" id="loanReceiptSearch" placeholder="Search by receipt number...">
-                  <button id="searchLoanBtn" class="btn-primary">Search PACKING</button>
+                  <button id="searchLoanBtn" class="btn-primary">Search PARKING</button>
                 </div>
               </div>
 
               <div class="loan-filter-tabs">
-                <button class="loan-filter-tab active" data-status="all">All PACKING</button>
+                <button class="loan-filter-tab active" data-status="all">All PARKING</button>
                 <button class="loan-filter-tab" data-status="pending">Pending</button>
                 <button class="loan-filter-tab" data-status="partial">Partial</button>
                 <button class="loan-filter-tab" data-status="paid">Paid</button>
@@ -935,11 +935,11 @@
                   <div class="form-row">
                     <div class="form-group">
                       <label>Currency Symbol *</label>
-                      <input type="text" id="currencySymbol" required maxlength="5">
+                      <input type="text" id="currencySymbol" required maxlength="5" placeholder="€">
                     </div>
                     <div class="form-group">
                       <label>Currency Code *</label>
-                      <input type="text" id="currencyCode" required maxlength="3" placeholder="USD">
+                      <input type="text" id="currencyCode" required maxlength="3" placeholder="EUR">
                     </div>
                   </div>
                 </div>
@@ -981,6 +981,7 @@
             </div>
           </div>
         </div>
+        
         <!-- Users View (Admin Only) -->
         <div id="usersView" class="view">
           <div class="view-wrapper">
@@ -1389,7 +1390,7 @@
   <div id="loanPaymentModal" class="modal">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Pay PACKING</h2>
+        <h2>Pay PARKING</h2>
         <span class="close">&times;</span>
       </div>
       <div id="loanPaymentContent">
@@ -1522,7 +1523,7 @@
                 <span class="summary-value" id="zReportCard">€0.00</span>
               </div>
               <div class="summary-item">
-                <span class="summary-label">📦 PACKING Sales:</span>
+                <span class="summary-label">🅿️ PARKING Sales:</span>
                 <span class="summary-value" id="zReportLoan">€0.00</span>
               </div>
               <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
