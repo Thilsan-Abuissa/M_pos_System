@@ -1,12 +1,13 @@
 {
   "name": "supermarket-pos",
-  "version": "62.0.0",
+  "version": "63.0.1",
   "description": "Cross-platform Supermarket POS System",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
     "postinstall": "electron-builder install-app-deps",
+    "preview:receipt": "node tools/preview-receipt.js",
     "build:mac": "electron-builder --mac",
     "build:win": "electron-builder --win --x64",
     "build:win:x64": "electron-builder --win --x64",

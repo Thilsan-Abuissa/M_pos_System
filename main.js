@@ -1129,16 +1129,82 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     // Format receipt for thermal printer (ESC/POS)
     const ESC = '\x1B';
     const GS = '\x1D';
+
+    const inferLineWidth = (printer, data) => {
+      const explicit = Number(data?.lineWidth);
+      if (Number.isFinite(explicit) && explicit >= 24 && explicit <= 64) {
+        return Math.round(explicit);
+      }
+
+      const name = String(printer || '').toLowerCase();
+      // Heuristic: many 80mm ESC/POS printers are 48 columns in Font A.
+      // Keep 32 as safe default for 58mm.
+      const looks80mm = name.includes('80mm')
+        || name.includes('80 mm')
+        || name.includes('posprinter')
+        || name.includes('pos-80')
+        || name.includes('pos 80')
+        || name.includes('easy 80')
+        || name.includes('tp easy 80')
+        || name.includes('tp7001')
+        || name.includes('tp 7001')
+        || name.includes('iggual')
+        || name.includes('tm-t20')
+        || name.includes('tm t20')
+        || name.includes('tm-t88')
+        || name.includes('tm t88');
+      return looks80mm ? 48 : 32;
+    };
+
+    const LINE_WIDTH = inferLineWidth(printerName, receiptData);
+
+    const getItemLayout = (lineWidth) => {
+      const qtyWidth = 6;
+      const isWide = lineWidth >= 42;
+      const priceWidth = isWide ? 8 : 6;
+      const totalWidth = isWide ? 8 : 6;
+      const gapDescPrice = isWide ? 1 : 0;
+      const gapPriceTotal = 1;
+      const descWidth = lineWidth - qtyWidth - gapDescPrice - priceWidth - gapPriceTotal - totalWidth;
+      const headerLeftWidth = qtyWidth + descWidth + gapDescPrice;
+      return { qtyWidth, descWidth, priceWidth, totalWidth, gapDescPrice, gapPriceTotal, headerLeftWidth };
+    };
+
+    const layout = getItemLayout(LINE_WIDTH);
+
+    const padRight = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(0, length) : text + ' '.repeat(length - text.length);
+    };
+
+    const padLeft = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(text.length - length) : ' '.repeat(length - text.length) + text;
+    };
+
+    const formatMoney = (amount, { decimals = 2, decimal = ',', suffix = '' } = {}) => {
+      const num = Number(amount || 0);
+      return num.toFixed(decimals).replace('.', decimal) + suffix;
+    };
+
+    const rightLabelValue = (label, value, gap = 2) => {
+      const labelText = String(label);
+      const valueText = String(value);
+      const spaces = Math.max(gap, LINE_WIDTH - labelText.length - valueText.length);
+      return labelText + ' '.repeat(spaces) + valueText;
+    };
     
     let receipt = '';
     
     // Initialize printer
     receipt += ESC + '@'; // Initialize
+    // Ensure standard mode + left margin
+    receipt += ESC + '!\x00';
     receipt += ESC + 'a' + String.fromCharCode(1); // Center align
     
     // Store name (large text)
     receipt += ESC + '!' + String.fromCharCode(0x20); // Bold + large
-    receipt += receiptData.storeName + '\n';
+    receipt += (receiptData.storeName || '').toString().toUpperCase() + '\n';
     receipt += ESC + '!' + String.fromCharCode(0); // Normal text
     
     // Owner name
@@ -1153,106 +1219,124 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     if (receiptData.companyAddress) {
       receipt += receiptData.companyAddress + '\n';
     }
-    
+
     receipt += '\n';
-    
+
     // FACTURA SIMPLIFICADA header
     receipt += ESC + '!' + String.fromCharCode(0x10); // Bold
     receipt += 'FACTURA SIMPLIFICADA\n';
     receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-    
-    receipt += '================================\n';
     receipt += '\n';
-    
+
+    // Divider
+    receipt += '='.repeat(LINE_WIDTH) + '\n';
+
     receipt += ESC + 'a' + String.fromCharCode(0); // Left align
-    receipt += 'FECHA: ' + receiptData.date + '\n';
+    receipt += 'FECHA: ' + (receiptData.date || '') + '\n';
     receipt += 'Factura Simplificada PRINCIPAL\n';
     receipt += 'Serie/N' + String.fromCharCode(248) + ': ' + (receiptData.receiptId || '') + '\n';
-    receipt += 'Ud.Descripcion       Precio Dt% Importe\n';
-    receipt += '--------------------------------\n';
-    
-    // Items with proper formatting (currency after amount, comma decimal)
-    receiptData.items.forEach(item => {
-      const itemName = (item.name || '').substring(0, 20).toUpperCase();
-      const qty = item.quantity || 1;
-      const price = (item.subtotal || 0) / qty;
-      const subtotal = item.subtotal || 0;
-      
-      const qtyStr = qty.toString().padStart(2);
-      const nameStr = itemName.padEnd(21);
-      const priceStr = price.toFixed(2).replace('.', ',').padStart(6);
-      const totalStr = subtotal.toFixed(2).replace('.', ',').padStart(7);
-      
-      receipt += qtyStr + '  ' + nameStr + priceStr + totalStr + '\n';
+
+    // Columns header
+    const totalHeaderLabel = layout.totalWidth >= 7 ? 'Importe' : 'Import';
+    receipt += padRight('Ud.Descripcion', layout.headerLeftWidth)
+      + padLeft('Precio', layout.priceWidth)
+      + ' '.repeat(layout.gapPriceTotal)
+      + padLeft(totalHeaderLabel, layout.totalWidth)
+      + '\n';
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    // Items
+    (receiptData.items || []).forEach(item => {
+      const qty = Number(item.quantity || 0);
+      const subtotal = Number(item.subtotal || 0);
+      const unitPrice = qty ? (subtotal / qty) : subtotal;
+
+      const qtyStrRaw = Number.isFinite(qty) ? (qty % 1 === 0 ? String(qty) : qty.toFixed(3)) : '';
+      const qtyStr = padRight(qtyStrRaw.replace(/0+$/,'').replace(/\.$/,''), layout.qtyWidth);
+      const descStr = padRight(((item.name || '').toString().toUpperCase()), layout.descWidth);
+      const priceStr = padLeft(formatMoney(unitPrice, { decimal: ',' }), layout.priceWidth);
+      const totalStr = padLeft(formatMoney(subtotal, { decimal: ',' }), layout.totalWidth);
+
+      receipt += qtyStr
+        + descStr
+        + ' '.repeat(layout.gapDescPrice)
+        + priceStr
+        + ' '.repeat(layout.gapPriceTotal)
+        + totalStr
+        + '\n';
     });
-    
-    receipt += '--------------------------------\n';
-    receipt += '\n';
-    
-    // Tax breakdown table (currency symbol after amount)
-    receipt += 'Iva      Base    Cuota    Total\n';
-    
+
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    // Tax breakdown table (scale to LINE_WIDTH)
+    const ivaWidth = 5;
+    const remaining = LINE_WIDTH - ivaWidth;
+    const colWidth = Math.floor(remaining / 3);
+    const rem = remaining - (colWidth * 3);
+    const baseWidth = colWidth;
+    const cuotaWidth = colWidth;
+    const taxTotalWidth = colWidth + rem;
+
+    receipt += padRight('Iva', ivaWidth)
+      + padLeft('Base', baseWidth)
+      + padLeft('Cuota', cuotaWidth)
+      + padLeft('Total', taxTotalWidth)
+      + '\n';
+
     let totalBase = 0;
     let totalCuota = 0;
-    let totalTotal = 0;
-    
-    if (receiptData.taxBreakdown && receiptData.taxBreakdown.length > 0) {
-      receiptData.taxBreakdown.forEach(taxLine => {
-        const rate = taxLine.rate || 0;
-        const base = taxLine.base || 0;
-        const cuota = taxLine.tax || 0;
-        const total = taxLine.total || 0;
-        
-        totalBase += base;
-        totalCuota += cuota;
-        totalTotal += total;
-        
-        const rateStr = (rate.toFixed(0) + '%').padEnd(8);
-        const baseStr = (base.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
-        const cuotaStr = (cuota.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
-        const totalStr = (total.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
-        
-        receipt += rateStr + baseStr + cuotaStr + totalStr + '\n';
-      });
-    }
-    
-    receipt += '--------------------------------\n';
-    
-    // TOTAL row for tax table
-    const totalBaseStr = (totalBase.toFixed(2).replace('.', ',') + receiptData.currency).padStart(15);
-    const totalCuotaStr = (totalCuota.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
-    const totalTotalStr = (totalTotal.toFixed(2).replace('.', ',') + receiptData.currency).padStart(9);
-    receipt += 'TOTAL  ' + totalBaseStr + totalCuotaStr + totalTotalStr + '\n';
-    
-    receipt += '--------------------------------\n';
-    receipt += '\n';
-    
-    // Payment method line
-    const paymentMethod = receiptData.paymentMethod || 'CASH';
-    const paymentMethodUpper = paymentMethod.toUpperCase();
-    const paymentLine = (paymentMethodUpper === 'CASH' ? 'EFECTIVO' : 
-                        paymentMethodUpper === 'CARD' ? 'TARJETA' : 
-                        paymentMethodUpper === 'PARKING' ? 'CREDITO' : paymentMethodUpper);
-    receipt += paymentLine.padEnd(20) + (receiptData.total.toFixed(2).replace('.', ',') + receiptData.currency).padStart(12) + '\n';
-    
-    receipt += '--------------------------------\n';
-    receipt += '\n';
-    
-    // Payment section - big TOTAL (centered, with period for decimal, NO currency)
+    let totalAll = 0;
+
+    (receiptData.taxBreakdown || []).forEach(taxLine => {
+      const rate = Number(taxLine.rate || 0);
+      const base = Number(taxLine.base || 0);
+      const cuota = Number(taxLine.tax || 0);
+      const total = Number(taxLine.total || 0);
+
+      totalBase += base;
+      totalCuota += cuota;
+      totalAll += total;
+
+      const ivaStr = padRight((Number.isFinite(rate) ? rate.toFixed(0) : '0') + '%', ivaWidth);
+      const baseStr = padLeft(formatMoney(base, { decimal: ',', suffix: (receiptData.currency || '€') }), baseWidth);
+      const cuotaStr = padLeft(formatMoney(cuota, { decimal: ',', suffix: (receiptData.currency || '€') }), cuotaWidth);
+      const totalStr = padLeft(formatMoney(total, { decimal: ',', suffix: (receiptData.currency || '€') }), taxTotalWidth);
+      receipt += ivaStr + baseStr + cuotaStr + totalStr + '\n';
+    });
+
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+    receipt += padRight('TOTAL', ivaWidth)
+      + padLeft(formatMoney(totalBase, { decimal: ',', suffix: (receiptData.currency || '€') }), baseWidth)
+      + padLeft(formatMoney(totalCuota, { decimal: ',', suffix: (receiptData.currency || '€') }), cuotaWidth)
+      + padLeft(formatMoney(totalAll, { decimal: ',', suffix: (receiptData.currency || '€') }), taxTotalWidth)
+      + '\n';
+
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    // Payment method line (like sample: EFECTIVO/TARJETA with amount)
+    const paymentMethod = (receiptData.paymentMethod || 'CASH').toString().toUpperCase();
+    const paymentLabel = paymentMethod === 'CASH' ? 'EFECTIVO'
+      : paymentMethod === 'CARD' ? 'TARJETA'
+      : paymentMethod === 'PARKING' ? 'CREDITO'
+      : paymentMethod;
+    receipt += rightLabelValue(paymentLabel, formatMoney(receiptData.total || 0, { decimal: ',', suffix: (receiptData.currency || '€') })) + '\n';
+
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    // Big total section (comma decimal, no currency)
     receipt += ESC + 'a' + String.fromCharCode(1); // Center align
     receipt += ESC + '!' + String.fromCharCode(0x30); // Double height + double width
-    receipt += 'TOTAL        ' + (receiptData.total || 0).toFixed(2) + '\n';
+    receipt += 'TOTAL        ' + formatMoney(receiptData.total || 0, { decimal: ',' }) + '\n';
     receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-    
-    receipt += '(Impuestos Inluidos)\n';
+    receipt += '(Impuestos Incluidos)\n';
     receipt += '\n';
-    
+
+    // ENTREGA / CAMBIO
     receipt += ESC + 'a' + String.fromCharCode(0); // Left align
-    const entregaAmount = (receiptData.paymentAmount || receiptData.total).toFixed(2);
-    const cambioAmount = (receiptData.changeAmount || 0).toFixed(2);
-    // Keep within 32 character width for thermal printer
-    receipt += 'ENTREGA' + (' '.repeat(Math.max(2, 32 - 7 - entregaAmount.length))) + entregaAmount + '\n';
-    receipt += 'CAMBIO' + (' '.repeat(Math.max(2, 32 - 6 - cambioAmount.length))) + cambioAmount + '\n';
+    const entrega = formatMoney((receiptData.paymentAmount || receiptData.total), { decimal: ',' });
+    const cambio = formatMoney((receiptData.changeAmount || 0), { decimal: ',' });
+    receipt += rightLabelValue('ENTREGA', entrega) + '\n';
+    receipt += rightLabelValue('CAMBIO', cambio) + '\n';
     receipt += '\n';
     
     // Services count
@@ -1270,10 +1354,12 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     }
     
     receipt += '\n\n';
-    
-    // Cut paper
-    receipt += GS + 'V' + String.fromCharCode(66) + String.fromCharCode(0); // Partial cut
-    receipt += '\n\n\n';
+
+    // Feed and cut (more compatible across ESC/POS printers)
+    receipt += ESC + 'd' + String.fromCharCode(6); // feed 6 lines
+    receipt += GS + 'V' + String.fromCharCode(0); // Full cut
+    receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(0); // Full cut (alt form)
+    receipt += '\n\n';
     
     // Write to temp file and print
     const tempFile = path.join(app.getPath('temp'), 'receipt_' + Date.now() + '.txt');
