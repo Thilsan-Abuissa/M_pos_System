@@ -15,6 +15,7 @@ let lastSale = null; // Store last sale for reprinting
 let lastSalePaymentMethod = null; // Track payment method for drawer-open-on-print
 let isWeightModalOpen = false; // Flag to prevent multiple modal opens
 let currentInvoiceNote = ''; // Store note for current invoice
+let currentSalesReportPrintContext = null; // Store last generated sales report for thermal printing
 
 // Scale Debug Functions for Touchscreen
 function addScaleDebugLog(message, type = 'info') {
@@ -4077,6 +4078,7 @@ function loadReportsView() {
       }
       
       const report = await window.api.getSalesReport(startDate, endDate);
+      currentSalesReportPrintContext = { report, periodType, startDate, endDate };
       displayReport(report, periodType);
     };
   }
@@ -4268,9 +4270,152 @@ function displayReport(report, periodType = 'custom') {
     </div>
     
     <div style="margin-top: 30px; text-align: right;">
-      <button class="btn-primary" onclick="window.print()">🖨️ Print Report</button>
+      <button class="btn-primary" onclick="window.printSalesReportThermal()">🖨️ Print Report</button>
     </div>
   `;
+}
+
+async function printSalesReportThermal() {
+  try {
+    if (!currentSalesReportPrintContext?.report) {
+      showAlert('No sales report data to print. Generate the report first.', 'warning', 'Missing Report');
+      return;
+    }
+
+    const { report, startDate, endDate, periodType } = currentSalesReportPrintContext;
+    const settings = await window.api.getSystemSettings();
+    const currencySymbol = settings?.currency_symbol || '€';
+    const printerName = (settings?.printer_name || '').toString().toLowerCase();
+
+    const inferLineWidth = (printer) => {
+      const name = String(printer || '').toLowerCase();
+      const looks80mm = name.includes('80mm')
+        || name.includes('80 mm')
+        || name.includes('posprinter')
+        || name.includes('pos-80')
+        || name.includes('pos 80')
+        || name.includes('easy 80')
+        || name.includes('tp easy 80')
+        || name.includes('tp7001')
+        || name.includes('tp 7001')
+        || name.includes('iggual')
+        || name.includes('tm-t20')
+        || name.includes('tm t20')
+        || name.includes('tm-t88')
+        || name.includes('tm t88');
+      return looks80mm ? 48 : 32;
+    };
+
+    const LINE_WIDTH = inferLineWidth(printerName);
+
+    const padRight = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(0, length) : text + ' '.repeat(length - text.length);
+    };
+
+    const padLeft = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(text.length - length) : ' '.repeat(length - text.length) + text;
+    };
+
+    const center = (value) => {
+      const text = String(value ?? '');
+      if (text.length >= LINE_WIDTH) return text.slice(0, LINE_WIDTH);
+      const left = Math.floor((LINE_WIDTH - text.length) / 2);
+      return ' '.repeat(left) + text;
+    };
+
+    const rightLabelValue = (label, value, fillChar = '.') => {
+      const labelText = String(label);
+      const valueText = String(value);
+      const gap = Math.max(1, LINE_WIDTH - labelText.length - valueText.length);
+      return labelText + fillChar.repeat(gap) + valueText;
+    };
+
+    const formatMoney = (amount) => {
+      const num = Number(amount || 0);
+      return num.toFixed(2).replace('.', ',') + currencySymbol;
+    };
+
+    const fmtDate = (d) => {
+      if (!d) return '';
+      // Accept YYYY-MM-DD or ISO
+      const dt = String(d).includes('T') ? new Date(d) : new Date(`${d}T00:00:00`);
+      return dt.toLocaleDateString('es-ES');
+    };
+
+    const totalSales = (report.sales || []).reduce((sum, day) => sum + (day.total_sales || 0), 0);
+    const totalTransactions = (report.sales || []).reduce((sum, day) => sum + (day.transaction_count || 0), 0);
+    const totalTax = (report.sales || []).reduce((sum, day) => sum + (day.tax || 0), 0);
+    const totalSubtotal = (report.sales || []).reduce((sum, day) => sum + (day.subtotal || 0), 0);
+
+    const now = new Date();
+    const time = now.toLocaleTimeString('es-ES');
+    const title = periodType === 'daily' ? 'INFORME DE VENTAS (DIARIO)'
+      : periodType === 'weekly' ? 'INFORME DE VENTAS (SEMANAL)'
+      : periodType === 'monthly' ? 'INFORME DE VENTAS (MENSUAL)'
+      : periodType === 'yearly' ? 'INFORME DE VENTAS (ANUAL)'
+      : 'INFORME DE VENTAS';
+
+    const ESC = '\x1B';
+    const GS = '\x1D';
+    let receipt = '';
+    receipt += ESC + '@';
+
+    receipt += center((settings?.store_name || 'SUPERMARKET POS').toString().toUpperCase()) + '\n';
+    receipt += center(title) + '\n';
+    receipt += '='.repeat(LINE_WIDTH) + '\n';
+    receipt += `FECHAS....: ${fmtDate(startDate)} ${fmtDate(endDate)}\n`;
+    receipt += `HORA......: ${time}\n`;
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    receipt += rightLabelValue('VENTA BRUTA', formatMoney(totalSales)) + '\n';
+    receipt += rightLabelValue('SUBTOTAL', formatMoney(totalSubtotal)) + '\n';
+    receipt += rightLabelValue('IMPUESTOS', formatMoney(totalTax)) + '\n';
+    receipt += rightLabelValue('TRANSACCIONES', String(totalTransactions)) + '\n';
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    receipt += center('TOP PRODUCTOS') + '\n';
+
+    const idxWidth = 2;
+    const qtyWidth = LINE_WIDTH >= 42 ? 7 : 5;
+    const revenueWidth = LINE_WIDTH >= 42 ? 10 : 8;
+    const nameWidth = Math.max(10, LINE_WIDTH - idxWidth - 1 - qtyWidth - revenueWidth);
+
+    receipt += padRight('#', idxWidth) + ' '
+      + padRight('PRODUCTO', nameWidth)
+      + padLeft('CANT', qtyWidth)
+      + padLeft('IMP', revenueWidth)
+      + '\n';
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    const top = Array.isArray(report.topProducts) ? report.topProducts : [];
+    if (top.length === 0) {
+      receipt += center('SIN DATOS') + '\n';
+    } else {
+      top.forEach((p, i) => {
+        const qty = p.total_quantity;
+        const rev = p.total_revenue;
+        const name = (p.product_name || '').toString();
+        receipt += padRight(String(i + 1), idxWidth) + ' '
+          + padRight(name, nameWidth)
+          + padLeft(String(qty ?? ''), qtyWidth)
+          + padLeft(formatMoney(rev), revenueWidth)
+          + '\n';
+      });
+    }
+
+    receipt += '\n';
+    receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(2);
+
+    const result = await window.api.printReceipt({ raw: true, text: receipt });
+    if (!result?.success) {
+      throw new Error(result?.error || 'Failed to print');
+    }
+  } catch (error) {
+    console.error('Error printing sales report:', error);
+    showAlert('Failed to print report: ' + error.message, 'error', 'Print Error');
+  }
 }
 
 // Helper function to get week number
@@ -7036,6 +7181,7 @@ window.printBarcodeLabel = printBarcodeLabel;
 window.printProductBarcode = printProductBarcode;
 window.showAlert = showAlert;
 window.viewZReportDetails = viewZReportDetails;
+window.printSalesReportThermal = printSalesReportThermal;
 
 // Detect available printers
 async function detectPrinters() {
