@@ -3098,6 +3098,7 @@ async function searchLoanByReceipt(receiptNumber) {
 function showLoanPaymentModal(loan) {
   const modal = document.getElementById('loanPaymentModal');
   const content = document.getElementById('loanPaymentContent');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   const loanDate = new Date(loan.loan_date);
   
@@ -3141,15 +3142,15 @@ function showLoanPaymentModal(loan) {
       </div>
       <div class="loan-detail-row" style="margin-top: 10px; padding-top: 10px; border-top: 2px solid #ddd;">
         <span>Total Amount:</span>
-        <span><strong>$${loan.loan_amount.toFixed(2)}</strong></span>
+        <span><strong>${currencySymbol}${loan.loan_amount.toFixed(2)}</strong></span>
       </div>
       <div class="loan-detail-row">
         <span>Paid Amount:</span>
-        <span>$${loan.paid_amount.toFixed(2)}</span>
+        <span>${currencySymbol}${loan.paid_amount.toFixed(2)}</span>
       </div>
       <div class="loan-detail-row" style="font-size: 18px; color: #d9534f;">
         <span><strong>Remaining:</strong></span>
-        <span><strong>$${loan.remaining_amount.toFixed(2)}</strong></span>
+        <span><strong>${currencySymbol}${loan.remaining_amount.toFixed(2)}</strong></span>
       </div>
     </div>
     
@@ -3221,14 +3222,83 @@ function showLoanPaymentModal(loan) {
       return;
     }
     
-    await completeLoanPayment(loan.id, amount, method);
+    await completeLoanPayment(loan, amount, method);
   });
   
   modal.classList.add('active');
 }
 
-async function completeLoanPayment(loanId, amount, paymentMethod) {
+async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentMethod }) {
   try {
+    if (!systemSettings) {
+      systemSettings = await window.api.getSystemSettings();
+    }
+
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    const printerName = (systemSettings?.printer_name || '').toString().toLowerCase();
+    const looks80mm = printerName.includes('80mm')
+      || printerName.includes('80 mm')
+      || printerName.includes('posprinter')
+      || printerName.includes('pos-80')
+      || printerName.includes('pos 80')
+      || printerName.includes('easy 80')
+      || printerName.includes('tp easy 80')
+      || printerName.includes('tp7001')
+      || printerName.includes('tp 7001')
+      || printerName.includes('iggual');
+
+    const before = loanBefore || {};
+    const after = loanAfter || {};
+
+    const receiptData = {
+      type: 'loanPayment',
+      storeName: systemSettings?.store_name || 'SUPERMARKET POS',
+      ownerName: systemSettings?.owner_name || '',
+      nieNumber: systemSettings?.nie_number || '',
+      companyAddress: systemSettings?.company_address || '',
+      currency: currencySymbol,
+      lineWidth: looks80mm ? 48 : undefined,
+
+      date: new Date().toLocaleString('es-ES'),
+      paymentReceiptNumber: `P${Date.now()}`,
+
+      loanId: after.id ?? before.id,
+      loanReceiptNumber: after.receipt_number ?? before.receipt_number,
+      customerType: after.customer_type ?? before.customer_type,
+      customerName: after.customer_name ?? before.customer_name,
+      customerPhone: after.customer_phone ?? before.customer_phone,
+      restaurantName: after.restaurant_name ?? before.restaurant_name,
+      restaurantNie: after.restaurant_nie ?? before.restaurant_nie,
+
+      loanTotal: Number(after.loan_amount ?? before.loan_amount ?? 0),
+      remainingBefore: Number(before.remaining_amount ?? 0),
+      remainingAfter: Number(after.remaining_amount ?? 0),
+      paidAmountTotal: Number(after.paid_amount ?? 0),
+      amountPaid: Number(amount ?? 0),
+      paymentMethod,
+      status: after.status ?? before.status,
+      cashier: currentUser?.full_name || ''
+    };
+
+    const result = await window.api.printReceipt(receiptData);
+    if (!result?.success) {
+      showAlert('Failed to print PARKING payment receipt: ' + (result?.error || 'Printer not configured'), 'error', 'Print Error');
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error('Error printing loan payment receipt:', error);
+    showAlert('Failed to print PARKING payment receipt: ' + error.message, 'error', 'Print Error');
+    return false;
+  }
+}
+
+async function completeLoanPayment(loanOrId, amount, paymentMethod) {
+  try {
+    const loanBefore = (loanOrId && typeof loanOrId === 'object') ? loanOrId : null;
+    const loanId = loanBefore ? loanBefore.id : loanOrId;
+
     const paymentData = {
       amount,
       paymentMethod,
@@ -3236,6 +3306,9 @@ async function completeLoanPayment(loanId, amount, paymentMethod) {
     };
     
     const result = await window.api.payLoan(loanId, paymentData);
+
+    // Print receipt immediately at payment time
+    await printLoanPaymentReceipt({ loanBefore, loanAfter: result, amount, paymentMethod });
     
     // If cash payment, open cash drawer
     if (paymentMethod === 'cash') {
@@ -5762,6 +5835,7 @@ async function openZReportModal() {
     // Get sales and returns for today
     const sales = await window.api.getSalesByDateRange(startDateTime, endDateTime, currentUser.id);
     const returns = await window.api.getReturnsByDateRange(startDateTime, endDateTime, currentUser.id);
+    const loanPayments = await window.api.getLoanPaymentsByDateRange(startDateTime, endDateTime, currentUser.id);
     
     // Parse items for each sale and return
     sales.forEach(sale => {
@@ -5794,9 +5868,21 @@ async function openZReportModal() {
     const netSales = grossSales - totalReturnsAmount;
     
     // Calculate payment methods
-    const cashSales = sales.filter(s => s.payment_method?.toLowerCase() === 'cash').reduce((sum, s) => sum + s.total, 0);
-    const cardSales = sales.filter(s => s.payment_method?.toLowerCase() === 'card').reduce((sum, s) => sum + s.total, 0);
-    const loanSales = sales.filter(s => s.payment_method?.toLowerCase() === 'loan').reduce((sum, s) => sum + s.total, 0);
+    const cashSalesFromSales = sales.filter(s => s.payment_method?.toLowerCase() === 'cash').reduce((sum, s) => sum + s.total, 0);
+    const cardSalesFromSales = sales.filter(s => s.payment_method?.toLowerCase() === 'card').reduce((sum, s) => sum + s.total, 0);
+
+    // PARKING payments: count the money on the day it is paid
+    const loanCashPayments = (loanPayments || [])
+      .filter(p => (p.payment_method || '').toLowerCase() === 'cash')
+      .reduce((sum, p) => sum + (p.amount || 0), 0);
+    const loanCardPayments = (loanPayments || [])
+      .filter(p => (p.payment_method || '').toLowerCase() === 'card')
+      .reduce((sum, p) => sum + (p.amount || 0), 0);
+
+    const cashSales = cashSalesFromSales + loanCashPayments;
+    const cardSales = cardSalesFromSales + loanCardPayments;
+    // Store PARKING payments separately for visibility (they are already included in cash/card totals)
+    const loanSales = loanCashPayments + loanCardPayments;
     
     // Calculate tax breakdown (7% and 19%)
     let tax7Base = 0;
@@ -5850,6 +5936,8 @@ async function openZReportModal() {
       cash_sales: cashSales,
       card_sales: cardSales,
       loan_sales: loanSales,
+      loan_cash_payments: loanCashPayments,
+      loan_card_payments: loanCardPayments,
       tax_7_base: tax7Base,
       tax_7_amount: tax7Amount,
       tax_19_base: tax19Base,
@@ -5872,10 +5960,10 @@ async function openZReportModal() {
     
     document.getElementById('zReportCash').textContent = `${currencySymbol}${cashSales.toFixed(2)}`;
     document.getElementById('zReportCard').textContent = `${currencySymbol}${cardSales.toFixed(2)}`;
-    document.getElementById('zReportLoan').textContent = `${currencySymbol}${loanSales.toFixed(2)}`;
+    document.getElementById('zReportLoan').textContent = `${currencySymbol}${(loanCashPayments + loanCardPayments).toFixed(2)}`;
     
     // Calculate and display total sales amount
-    const totalSalesAmount = cashSales + cardSales + loanSales;
+    const totalSalesAmount = cashSales + cardSales;
     document.getElementById('zReportTotalAmount').textContent = `${currencySymbol}${totalSalesAmount.toFixed(2)}`;
     
     // Initialize expenses to 0
@@ -5949,8 +6037,8 @@ async function completeZReport() {
   const expenseAmount = parseFloat(document.getElementById('zReportExpenseAmount').value) || 0;
   const expenseDescription = document.getElementById('zReportExpenseDescription').value || '';
   
-  // Calculate total sales amount
-  const totalSalesAmount = currentZReportData.cash_sales + currentZReportData.card_sales + currentZReportData.loan_sales;
+  // Calculate total sales amount (cash/card already include PARKING payments)
+  const totalSalesAmount = currentZReportData.cash_sales + currentZReportData.card_sales;
   
   const reportData = {
     ...currentZReportData,
@@ -6154,6 +6242,138 @@ async function printZReport(report) {
   try {
     const settings = await window.api.getSystemSettings();
     const currencySymbol = settings?.currency_symbol || '€';
+    const printerName = (settings?.printer_name || '').toString().toLowerCase();
+
+    const inferLineWidth = (printer) => {
+      const name = String(printer || '').toLowerCase();
+      const looks80mm = name.includes('80mm')
+        || name.includes('80 mm')
+        || name.includes('posprinter')
+        || name.includes('pos-80')
+        || name.includes('pos 80')
+        || name.includes('easy 80')
+        || name.includes('tp easy 80')
+        || name.includes('tp7001')
+        || name.includes('tp 7001')
+        || name.includes('iggual')
+        || name.includes('tm-t20')
+        || name.includes('tm t20')
+        || name.includes('tm-t88')
+        || name.includes('tm t88');
+      return looks80mm ? 48 : 32;
+    };
+
+    const LINE_WIDTH = inferLineWidth(printerName);
+
+    const padRight = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(0, length) : text + ' '.repeat(length - text.length);
+    };
+
+    const padLeft = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(text.length - length) : ' '.repeat(length - text.length) + text;
+    };
+
+    const center = (value) => {
+      const text = String(value ?? '');
+      if (text.length >= LINE_WIDTH) return text.slice(0, LINE_WIDTH);
+      const left = Math.floor((LINE_WIDTH - text.length) / 2);
+      return ' '.repeat(left) + text;
+    };
+
+    const rightLabelValue = (label, value, fillChar = '.') => {
+      const labelText = String(label);
+      const valueText = String(value);
+      const gap = Math.max(1, LINE_WIDTH - labelText.length - valueText.length);
+      return labelText + fillChar.repeat(gap) + valueText;
+    };
+
+    const formatMoney = (amount) => {
+      const num = Number(amount || 0);
+      return num.toFixed(2).replace('.', ',') + currencySymbol;
+    };
+
+    const formatDateTime = (isoString) => {
+      const dt = isoString ? new Date(isoString) : new Date();
+      const date = dt.toLocaleDateString('es-ES');
+      const time = dt.toLocaleTimeString('es-ES');
+      return { date, time };
+    };
+
+    // Fetch sales/returns for the report period to compute VAT breakdown accurately
+    const start = report.start_datetime;
+    const end = report.end_datetime;
+    const cashierId = report.cashier_id || null;
+    const [sales, returns] = await Promise.all([
+      window.api.getSalesByDateRange(start, end, cashierId),
+      window.api.getReturnsByDateRange(start, end, cashierId)
+    ]);
+
+    const safeParseItems = (record) => {
+      if (!record) return [];
+      const items = record.items;
+      if (!items) return [];
+      if (Array.isArray(items)) return items;
+      try {
+        return JSON.parse(items);
+      } catch {
+        return [];
+      }
+    };
+
+    // Ensure we can map product_id -> tax_rate
+    if (!allProducts || allProducts.length === 0) {
+      try {
+        allProducts = await window.api.getAllProducts();
+      } catch (e) {
+        allProducts = [];
+      }
+    }
+    if (!allCategories || allCategories.length === 0) {
+      try {
+        allCategories = await window.api.getAllCategories();
+      } catch (e) {
+        allCategories = [];
+      }
+    }
+
+    const productById = new Map((allProducts || []).map(p => [p.id, p]));
+    const categoryByName = new Map((allCategories || []).map(c => [c.name, c]));
+    const defaultTaxRate = Number(settings?.tax_rate ?? 0);
+
+    const taxBreakdown = new Map();
+    (sales || []).forEach(sale => {
+      safeParseItems(sale).forEach(item => {
+        const lineTotal = Number(item.subtotal || 0);
+        if (!Number.isFinite(lineTotal) || lineTotal === 0) return;
+
+        const product = productById.get(item.product_id);
+        const category = product ? categoryByName.get(product.category) : null;
+        const taxRate = Number(category?.tax_rate ?? product?.tax_rate ?? defaultTaxRate ?? 0);
+        const ratePercent = Math.round(taxRate * 100);
+
+        const base = lineTotal / (1 + taxRate);
+        const cuota = lineTotal - base;
+
+        const row = taxBreakdown.get(ratePercent) || { rate: ratePercent, base: 0, cuota: 0, total: 0 };
+        row.base += base;
+        row.cuota += cuota;
+        row.total += lineTotal;
+        taxBreakdown.set(ratePercent, row);
+      });
+    });
+
+    const vatRows = Array.from(taxBreakdown.values()).sort((a, b) => a.rate - b.rate);
+
+    const cashSales = Number(report.cash_sales || 0);
+    const cardSales = Number(report.card_sales || 0);
+    const loanSales = Number(report.loan_sales || 0);
+    const totalSalesAmount = Number(report.total_sales_amount ?? (cashSales + cardSales) ?? 0);
+    const totalExpenses = Number(report.total_expenses || 0);
+    const expectedCash = Number(report.expected_cash || 0);
+    const actualCash = Number(report.actual_cash || 0);
+    const difference = Number(report.cash_difference || (actualCash - expectedCash) || 0);
     
     // Format Z report for thermal printer
     const ESC = '\x1B';
@@ -6162,125 +6382,108 @@ async function printZReport(report) {
     let receipt = '';
     
     // Initialize printer
-    receipt += ESC + '@'; // Initialize
-    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
-    
+    receipt += ESC + '@';
+
+    const { date: reportDate, time: reportTime } = formatDateTime(report.report_date);
+
     // Header
-    receipt += ESC + '!' + String.fromCharCode(0x30); // Double height + double width
-    receipt += (settings?.store_name || 'SUPERMARKET') + '\n';
-    receipt += 'POS\n';
-    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
+    receipt += center((settings?.store_name || 'SUPERMARKET POS').toString().toUpperCase()) + '\n';
+    receipt += center('ARQUEO DE CAJA') + '\n';
+    receipt += '='.repeat(LINE_WIDTH) + '\n';
+    receipt += `CAJA.......: PRINCIPAL\n`;
+    receipt += `ARQUEO.....: ${report.report_number || ''}\n`;
+    receipt += `FECHA......: ${reportDate}\n`;
+    receipt += `HORA.......: ${reportTime}\n`;
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    // Sales summary
+    receipt += rightLabelValue('VENTA BRUTA', formatMoney(report.gross_sales || 0)) + '\n';
+    receipt += rightLabelValue('DEVOLUCIONES', formatMoney(report.total_returns_amount || 0)) + '\n';
+    receipt += rightLabelValue('VENTA NETA', formatMoney(report.net_sales || 0)) + '\n';
     receipt += '\n';
-    
-    receipt += ESC + '!' + String.fromCharCode(0x20); // Double height
-    receipt += 'Daily Sales Report\n';
-    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-    receipt += new Date(report.report_date).toLocaleString('en-GB', {
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    }) + '\n';
-    receipt += '================================\n\n';
-    
-    // Summary - Center align
-    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+
+    receipt += rightLabelValue('DOCUMENTOS', String(report.total_sales || 0).padStart(1, ' ')) + '\n';
+    receipt += rightLabelValue('NUMERO DE VENTAS', String(report.total_sales || 0)) + '\n';
+    receipt += rightLabelValue('NUMERO DEVOL.', String(report.total_returns || 0)) + '\n';
+    receipt += rightLabelValue('VENTAS NETAS', String(report.net_sales_count || 0)) + '\n';
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    // Payment methods
+    receipt += center('FORMAS PAGO') + '\n';
+    receipt += rightLabelValue('CONTADO', formatMoney(cashSales)) + '\n';
+    receipt += rightLabelValue('TARJETA', formatMoney(cardSales)) + '\n';
+    receipt += rightLabelValue('PARKING COBRADO', formatMoney(loanSales)) + '\n';
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+    receipt += rightLabelValue('TOTAL', formatMoney(totalSalesAmount)) + '\n';
     receipt += '\n';
-    receipt += '      Total           Total Sales\n';
-    receipt += ' Transactions\n\n';
-    receipt += ESC + '!' + String.fromCharCode(0x38); // Quad size
-    receipt += '    ' + report.total_sales + '         ' + currencySymbol + (report.total_sales_amount || 0).toFixed(2) + '\n';
-    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-    receipt += '\n\n';
-    
-    // Transaction Details Header
-    receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
-    receipt += 'Transaction Details\n';
-    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-    receipt += '\n';
-    
-    // Table header
-    receipt += ESC + 'a' + String.fromCharCode(0); // Left align
-    receipt += 'TIME         RECEIPT    SUBTOTAL\n';
-    receipt += '            #\n';
-    receipt += '--------------------------------\n';
-    
-    // Get recent sales for the report
-    const sales = await window.api.getTodaySales();
-    
-    // List transactions
-    if (sales && sales.length > 0) {
-      sales.forEach(sale => {
-        const time = new Date(sale.sale_date).toLocaleTimeString('en-GB', {
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit'
-        });
-        const receiptNum = ('#' + sale.id).padEnd(11);
-        const subtotal = (currencySymbol + (sale.subtotal || 0).toFixed(2));
-        
-        receipt += time + '  ' + receiptNum + subtotal + '\n';
-      });
+
+    // Cash movements
+    receipt += center('MOVIMIENTOS DE EFECTIVO') + '\n';
+    receipt += rightLabelValue('ENTREGAS AL CONTADO', formatMoney(cashSales)) + '\n';
+    receipt += rightLabelValue('SALIDAS DE CAJA', formatMoney(totalExpenses)) + '\n';
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+    receipt += rightLabelValue('EFECTIVO ESPERADO', formatMoney(expectedCash)) + '\n';
+    if (Number.isFinite(actualCash) && actualCash > 0) {
+      receipt += rightLabelValue('EFECTIVO REAL', formatMoney(actualCash)) + '\n';
+      const diffText = (difference < 0 ? '-' : '') + formatMoney(Math.abs(difference));
+      receipt += rightLabelValue('DIFERENCIA', diffText) + '\n';
     }
-    
     receipt += '\n';
-    receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
-    receipt += 'TOTAL'.padEnd(20) + currencySymbol + (report.total_sales_amount || 0).toFixed(2) + '\n';
-    receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-    receipt += '--------------------------------\n\n\n';
-    
-    // Expenses Section
-    if (report.total_expenses && report.total_expenses > 0) {
-      receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
-      receipt += 'Expenses\n';
-      receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-      receipt += '\n';
-      
-      // Add note about expenses
-      receipt += 'Total Expenses: ' + currencySymbol + report.total_expenses.toFixed(2) + '\n';
-      if (report.expense_description) {
-        receipt += 'Notes: ' + report.expense_description.substring(0, 30) + '\n';
-      }
-      
-      receipt += '\n';
-      receipt += ESC + '!' + String.fromCharCode(0x10); // Double width
-      receipt += 'TOTAL EXPENSES'.padEnd(15) + currencySymbol + report.total_expenses.toFixed(2) + '\n';
-      receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-      receipt += '--------------------------------\n\n';
-      
-      // Net amount (Sales - Expenses)
-      const netAmount = (report.total_sales_amount || 0) - report.total_expenses;
-      receipt += ESC + '!' + String.fromCharCode(0x20); // Double height
-      receipt += 'NET AMOUNT: ' + currencySymbol + netAmount.toFixed(2) + '\n';
-      receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-      receipt += '--------------------------------\n\n';
-    }
-    
+
+    // Card movements
+    receipt += center('MOVIMIENTOS DE TARJETA') + '\n';
+    receipt += rightLabelValue('COBROS CON TARJETA', formatMoney(cardSales)) + '\n';
+    receipt += rightLabelValue('PAGOS EN TARJETA', formatMoney(cardSales)) + '\n';
+    receipt += '\n';
+
+    // VAT breakdown
+    receipt += center('DESGLOSE DEL IVA') + '\n';
+    const ivaWidth = 5;
+    const remaining = LINE_WIDTH - ivaWidth;
+    const colWidth = Math.floor(remaining / 3);
+    const rem = remaining - (colWidth * 3);
+    const baseWidth = colWidth;
+    const cuotaWidth = colWidth;
+    const totalWidth = colWidth + rem;
+
+    receipt += padRight('Iva', ivaWidth)
+      + padLeft('Base', baseWidth)
+      + padLeft('Cuota', cuotaWidth)
+      + padLeft('Total', totalWidth)
+      + '\n';
+
+    let sumBase = 0;
+    let sumCuota = 0;
+    let sumTotal = 0;
+    vatRows.forEach(r => {
+      sumBase += r.base;
+      sumCuota += r.cuota;
+      sumTotal += r.total;
+      receipt += padRight(`${r.rate}%`, ivaWidth)
+        + padLeft(formatMoney(r.base), baseWidth)
+        + padLeft(formatMoney(r.cuota), cuotaWidth)
+        + padLeft(formatMoney(r.total), totalWidth)
+        + '\n';
+    });
+
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+    receipt += padRight('TOTAL', ivaWidth)
+      + padLeft(formatMoney(sumBase), baseWidth)
+      + padLeft(formatMoney(sumCuota), cuotaWidth)
+      + padLeft(formatMoney(sumTotal), totalWidth)
+      + '\n';
+
     // Footer
-    receipt += ESC + 'a' + String.fromCharCode(1); // Center align
-    receipt += 'Generated by ' + (settings?.store_name || 'SUPERMARKET') + ' POS\n';
-    receipt += 'POS System\n';
-    receipt += new Date().toLocaleString('en-GB', {
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    }) + '\n';
-    receipt += '\n\n';
-    
-    // Cut paper
-    receipt += GS + 'V' + String.fromCharCode(66) + String.fromCharCode(0); // Partial cut
-    receipt += '\n\n\n';
+    receipt += '\n';
+    receipt += `LE ATENDIO.: ${(report.cashier_name || '').toString().slice(0, LINE_WIDTH - 12)}\n`;
+    receipt += '='.repeat(LINE_WIDTH) + '\n';
+
+    // Cut
+    receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(2);
+    receipt += '\n';
     
     // Print using thermal printer
-    const result = await window.api.printReceipt({
-      raw: true,
-      text: receipt
-    });
+    const result = await window.api.printReceipt({ raw: true, text: receipt });
     
     if (!result.success) {
       throw new Error(result.error || 'Failed to print');

@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('api', {
   getZReportByNumber: (reportNumber) => ipcRenderer.invoke('zreport:getByNumber', reportNumber),
   getSalesByDateRange: (startDate, endDate, cashierId) => ipcRenderer.invoke('zreport:getSalesByDateRange', startDate, endDate, cashierId),
   getReturnsByDateRange: (startDate, endDate, cashierId) => ipcRenderer.invoke('zreport:getReturnsByDateRange', startDate, endDate, cashierId),
+  getLoanPaymentsByDateRange: (startDate, endDate, cashierId) => ipcRenderer.invoke('zreport:getLoanPaymentsByDateRange', startDate, endDate, cashierId),
   
   // System Settings
   getSystemSettings: () => ipcRenderer.invoke('settings:get'),

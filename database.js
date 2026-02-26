@@ -114,6 +114,17 @@ class POSDatabase {
         FOREIGN KEY (sale_id) REFERENCES sales(id)
       );
 
+      CREATE TABLE IF NOT EXISTS loan_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER NOT NULL,
+        payment_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+        amount REAL NOT NULL,
+        payment_method TEXT NOT NULL,
+        cashier_id INTEGER,
+        FOREIGN KEY (loan_id) REFERENCES loans(id),
+        FOREIGN KEY (cashier_id) REFERENCES users(id)
+      );
+
       CREATE TABLE IF NOT EXISTS z_reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         report_number TEXT UNIQUE NOT NULL,
@@ -153,6 +164,8 @@ class POSDatabase {
       CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id);
       CREATE INDEX IF NOT EXISTS idx_z_reports_date ON z_reports(report_date);
       CREATE INDEX IF NOT EXISTS idx_z_reports_number ON z_reports(report_number);
+      CREATE INDEX IF NOT EXISTS idx_loan_payments_loan_id ON loan_payments(loan_id);
+      CREATE INDEX IF NOT EXISTS idx_loan_payments_date ON loan_payments(payment_date);
 
       CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,6 +277,27 @@ class POSDatabase {
       if (!error.message.includes('duplicate column name')) {
         console.error('Error adding printer_name column:', error);
       }
+    }
+
+    // Add loan_payments table for tracking PARKING payments by date
+    // (CREATE TABLE IF NOT EXISTS is safe across versions)
+    try {
+      this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS loan_payments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          loan_id INTEGER NOT NULL,
+          payment_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+          amount REAL NOT NULL,
+          payment_method TEXT NOT NULL,
+          cashier_id INTEGER,
+          FOREIGN KEY (loan_id) REFERENCES loans(id),
+          FOREIGN KEY (cashier_id) REFERENCES users(id)
+        );
+      `).run();
+      this.db.prepare('CREATE INDEX IF NOT EXISTS idx_loan_payments_loan_id ON loan_payments(loan_id)').run();
+      this.db.prepare('CREATE INDEX IF NOT EXISTS idx_loan_payments_date ON loan_payments(payment_date)').run();
+    } catch (error) {
+      console.error('Error ensuring loan_payments table:', error);
     }
 
     // Add new columns to z_reports table if they don't exist
@@ -818,6 +852,18 @@ class POSDatabase {
       const loan = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId);
       if (!loan) throw new Error('Loan not found');
 
+      // Store payment event (so Z report can count it by payment date)
+      this.db.prepare(`
+        INSERT INTO loan_payments (loan_id, payment_date, amount, payment_method, cashier_id)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        loanId,
+        new Date().toISOString(),
+        data.amount,
+        data.paymentMethod,
+        data.cashierId || null
+      );
+
       const paidAmount = loan.paid_amount + data.amount;
       const remainingAmount = loan.loan_amount - paidAmount;
       const status = remainingAmount <= 0 ? 'paid' : 'partial';
@@ -840,6 +886,21 @@ class POSDatabase {
     });
 
     return transaction(paymentData);
+  }
+
+  getLoanPaymentsByDateRange(startDate, endDate, cashierId = null) {
+    let query = `
+      SELECT lp.*
+      FROM loan_payments lp
+      WHERE lp.payment_date BETWEEN ? AND ?
+    `;
+
+    if (cashierId) {
+      query += ' AND lp.cashier_id = ?';
+      return this.db.prepare(query + ' ORDER BY lp.payment_date').all(startDate, endDate, cashierId);
+    }
+
+    return this.db.prepare(query + ' ORDER BY lp.payment_date').all(startDate, endDate);
   }
 
   getLoanById(id) {
@@ -1083,6 +1144,7 @@ class POSDatabase {
           'product_name', si.product_name,
           'quantity', si.quantity,
           'unit_price', si.unit_price,
+          'discount_percent', si.discount_percent,
           'subtotal', si.subtotal
         ))
         FROM sale_items si WHERE si.sale_id = s.id) as items

@@ -1158,6 +1158,125 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
     const LINE_WIDTH = inferLineWidth(printerName, receiptData);
 
+    // Special receipt: PARKING payment receipt
+    if (receiptData && receiptData.type === 'loanPayment') {
+      const padRight = (value, length) => {
+        const text = String(value ?? '');
+        return text.length >= length ? text.slice(0, length) : text + ' '.repeat(length - text.length);
+      };
+
+      const padLeft = (value, length) => {
+        const text = String(value ?? '');
+        return text.length >= length ? text.slice(text.length - length) : ' '.repeat(length - text.length) + text;
+      };
+
+      const center = (value) => {
+        const text = String(value ?? '');
+        if (text.length >= LINE_WIDTH) return text.slice(0, LINE_WIDTH);
+        const left = Math.floor((LINE_WIDTH - text.length) / 2);
+        return ' '.repeat(left) + text;
+      };
+
+      const rightLabelValue = (label, value, fillChar = '.') => {
+        const labelText = String(label);
+        const valueText = String(value);
+        const gap = Math.max(1, LINE_WIDTH - labelText.length - valueText.length);
+        return labelText + fillChar.repeat(gap) + valueText;
+      };
+
+      const currency = (receiptData.currency || '€').toString();
+      const formatMoney = (amount) => {
+        const num = Number(amount || 0);
+        return num.toFixed(2).replace('.', ',') + currency;
+      };
+
+      const method = (receiptData.paymentMethod || '').toString().toLowerCase();
+      const methodLabel = method === 'cash' ? 'CONTADO' : method === 'card' ? 'TARJETA' : method.toUpperCase();
+
+      let receipt = '';
+      receipt += ESC + '@';
+      receipt += ESC + '! ';
+      receipt += ESC + 'a' + String.fromCharCode(1);
+
+      receipt += ESC + '!' + String.fromCharCode(0x20);
+      receipt += (receiptData.storeName || 'SUPERMARKET POS').toString().toUpperCase() + '\n';
+      receipt += ESC + '!' + String.fromCharCode(0);
+
+      if (receiptData.companyAddress) receipt += receiptData.companyAddress + '\n';
+      if (receiptData.nieNumber) receipt += receiptData.nieNumber + '\n';
+      receipt += '\n';
+
+      receipt += ESC + '!' + String.fromCharCode(0x10);
+      receipt += 'PAGO PARKING\n';
+      receipt += 'NO VALIDO COMO FACTURA\n';
+      receipt += ESC + '!' + String.fromCharCode(0);
+      receipt += '='.repeat(LINE_WIDTH) + '\n';
+
+      receipt += ESC + 'a' + String.fromCharCode(0);
+      receipt += 'FECHA: ' + (receiptData.date || '') + '\n';
+      if (receiptData.loanReceiptNumber) {
+        receipt += 'RECIBO PARKING: ' + String(receiptData.loanReceiptNumber) + '\n';
+      }
+      if (receiptData.paymentReceiptNumber) {
+        receipt += 'PAGO N' + String.fromCharCode(248) + ': ' + String(receiptData.paymentReceiptNumber) + '\n';
+      }
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+      const customerType = (receiptData.customerType || '').toString().toLowerCase();
+      if (receiptData.restaurantName) {
+        receipt += 'RESTAURANTE: ' + String(receiptData.restaurantName) + '\n';
+        if (receiptData.restaurantNie) receipt += 'NIE: ' + String(receiptData.restaurantNie) + '\n';
+      }
+      if (receiptData.customerName) {
+        receipt += 'CLIENTE: ' + String(receiptData.customerName) + '\n';
+      } else if (customerType) {
+        receipt += 'TIPO: ' + customerType.toUpperCase() + '\n';
+      }
+      if (receiptData.customerPhone) receipt += 'TEL: ' + String(receiptData.customerPhone) + '\n';
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+      receipt += rightLabelValue('IMPORTE PAGADO', formatMoney(receiptData.amountPaid || 0)) + '\n';
+      receipt += rightLabelValue('FORMA DE PAGO', methodLabel) + '\n';
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+      const remainingAfter = Number(receiptData.remainingAfter ?? 0);
+      const loanTotal = Number(receiptData.loanTotal ?? 0);
+      if (Number.isFinite(loanTotal) && loanTotal > 0) {
+        receipt += rightLabelValue('TOTAL PARKING', formatMoney(loanTotal)) + '\n';
+      }
+      receipt += rightLabelValue('PENDIENTE', formatMoney(remainingAfter)) + '\n';
+      if (receiptData.status) {
+        receipt += rightLabelValue('ESTADO', String(receiptData.status).toUpperCase(), ' ') + '\n';
+      }
+      receipt += '\n';
+
+      if (receiptData.cashier) {
+        receipt += 'LE ATENDIO: ' + String(receiptData.cashier).slice(0, Math.max(0, LINE_WIDTH - 12)) + '\n';
+      }
+      receipt += '='.repeat(LINE_WIDTH) + '\n';
+
+      receipt += '\n\n';
+      receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(2);
+
+      const tempFile = path.join(app.getPath('temp'), 'loan_payment_' + Date.now() + '.txt');
+      const receiptBuffer = iconv.encode(receipt, 'cp1252');
+      fs.writeFileSync(tempFile, receiptBuffer);
+
+      try {
+        if (process.platform === 'win32') {
+          await sendRawFileToPrinterWindows(printerName, tempFile);
+        } else {
+          await execPromise(`lp -d "${printerName}" -o raw "${tempFile}"`);
+        }
+        fs.unlinkSync(tempFile);
+        console.log('Loan payment receipt printed successfully');
+        return { success: true };
+      } catch (printError) {
+        try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (cleanupError) {}
+        throw printError;
+      }
+    }
+
     const getItemLayout = (lineWidth) => {
       const isWide = lineWidth >= 42;
       if (isWide) {
@@ -1494,6 +1613,10 @@ ipcMain.handle('zreport:getSalesByDateRange', async (event, startDate, endDate, 
 
 ipcMain.handle('zreport:getReturnsByDateRange', async (event, startDate, endDate, cashierId) => {
   return db.getReturnsByDateRange(startDate, endDate, cashierId);
+});
+
+ipcMain.handle('zreport:getLoanPaymentsByDateRange', async (event, startDate, endDate, cashierId) => {
+  return db.getLoanPaymentsByDateRange(startDate, endDate, cashierId);
 });
 
 // System Settings handlers
