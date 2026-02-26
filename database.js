@@ -78,6 +78,7 @@ class POSDatabase {
         product_name TEXT NOT NULL,
         quantity INTEGER NOT NULL,
         unit_price REAL NOT NULL,
+        discount_percent REAL DEFAULT 0,
         subtotal REAL NOT NULL,
         FOREIGN KEY (sale_id) REFERENCES sales(id),
         FOREIGN KEY (product_id) REFERENCES products(id)
@@ -242,6 +243,16 @@ class POSDatabase {
       // Column already exists, ignore error
       if (!error.message.includes('duplicate column name')) {
         console.error('Error adding split_payments column:', error);
+      }
+    }
+
+    // Add discount_percent column to sale_items table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE sale_items ADD COLUMN discount_percent REAL DEFAULT 0').run();
+    } catch (error) {
+      // Column already exists, ignore error
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding discount_percent column:', error);
       }
     }
     
@@ -543,15 +554,28 @@ class POSDatabase {
 
       // Insert sale items and update stock
       const itemStmt = this.db.prepare(`
-        INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, subtotal)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, discount_percent, subtotal)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
       const updateStockStmt = this.db.prepare(`
         UPDATE products SET stock = stock - ? WHERE id = ?
       `);
 
       for (const item of sale.items) {
-        itemStmt.run(saleId, item.productId, item.productName, item.quantity, item.unitPrice, item.subtotal);
+        const discountPercent = Number(item.discountPercent || 0);
+        const lineSubtotal = Number(item.subtotal || 0);
+        const discountAmount = lineSubtotal * (discountPercent / 100);
+        const finalSubtotal = lineSubtotal - discountAmount;
+
+        itemStmt.run(
+          saleId,
+          item.productId,
+          item.productName,
+          item.quantity,
+          item.unitPrice,
+          discountPercent,
+          finalSubtotal
+        );
         updateStockStmt.run(item.quantity, item.productId);
       }
 

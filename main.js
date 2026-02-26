@@ -1159,15 +1159,46 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     const LINE_WIDTH = inferLineWidth(printerName, receiptData);
 
     const getItemLayout = (lineWidth) => {
-      const qtyWidth = 6;
       const isWide = lineWidth >= 42;
-      const priceWidth = isWide ? 8 : 6;
-      const totalWidth = isWide ? 8 : 6;
-      const gapDescPrice = isWide ? 1 : 0;
+      if (isWide) {
+        // 80mm style: Ud + (qty) + Descripción + Precio + Dt% + Importe
+        const unitsWidth = 2;
+        const weightWidth = 8; // e.g. (1,265)
+        const priceWidth = 7;
+        const discountWidth = 4;
+        const totalWidth = 7;
+        const descWidth = Math.max(10, lineWidth - unitsWidth - weightWidth - priceWidth - discountWidth - totalWidth);
+        const headerLeftWidth = unitsWidth + weightWidth + descWidth;
+        return {
+          isWide,
+          unitsWidth,
+          weightWidth,
+          descWidth,
+          priceWidth,
+          discountWidth,
+          totalWidth,
+          headerLeftWidth,
+        };
+      }
+
+      // 58mm style
+      const qtyWidth = 6;
+      const priceWidth = 6;
+      const totalWidth = 6;
+      const gapDescPrice = 0;
       const gapPriceTotal = 1;
       const descWidth = lineWidth - qtyWidth - gapDescPrice - priceWidth - gapPriceTotal - totalWidth;
       const headerLeftWidth = qtyWidth + descWidth + gapDescPrice;
-      return { qtyWidth, descWidth, priceWidth, totalWidth, gapDescPrice, gapPriceTotal, headerLeftWidth };
+      return {
+        isWide,
+        qtyWidth,
+        descWidth,
+        priceWidth,
+        totalWidth,
+        gapDescPrice,
+        gapPriceTotal,
+        headerLeftWidth,
+      };
     };
 
     const layout = getItemLayout(LINE_WIDTH);
@@ -1185,6 +1216,17 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     const formatMoney = (amount, { decimals = 2, decimal = ',', suffix = '' } = {}) => {
       const num = Number(amount || 0);
       return num.toFixed(decimals).replace('.', decimal) + suffix;
+    };
+
+    const formatQty = (amount, { decimals = 3, decimal = ',' } = {}) => {
+      const num = Number(amount || 0);
+      let text = num.toFixed(decimals).replace('.', decimal);
+      if (decimal === ',') {
+        text = text.replace(/0+$/, '').replace(/,$/, '');
+      } else {
+        text = text.replace(/0+$/, '').replace(/\.$/, '');
+      }
+      return text;
     };
 
     const rightLabelValue = (label, value, gap = 2) => {
@@ -1222,48 +1264,81 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
     receipt += '\n';
 
-    // FACTURA SIMPLIFICADA header
+    // Header label (receipt vs ticket)
     receipt += ESC + '!' + String.fromCharCode(0x10); // Bold
-    receipt += 'FACTURA SIMPLIFICADA\n';
+    if (receiptData.isTicket) {
+      receipt += 'NO VALIDO COMO FACTURA\n';
+    } else {
+      receipt += 'FACTURA SIMPLIFICADA\n';
+    }
     receipt += ESC + '!' + String.fromCharCode(0); // Normal text
-    receipt += '\n';
 
     // Divider
     receipt += '='.repeat(LINE_WIDTH) + '\n';
 
     receipt += ESC + 'a' + String.fromCharCode(0); // Left align
     receipt += 'FECHA: ' + (receiptData.date || '') + '\n';
-    receipt += 'Factura Simplificada PRINCIPAL\n';
+    if (!receiptData.isTicket) {
+      receipt += 'Factura Simplificada PRINCIPAL\n';
+    }
     receipt += 'Serie/N' + String.fromCharCode(248) + ': ' + (receiptData.receiptId || '') + '\n';
 
     // Columns header
-    const totalHeaderLabel = layout.totalWidth >= 7 ? 'Importe' : 'Import';
-    receipt += padRight('Ud.Descripcion', layout.headerLeftWidth)
-      + padLeft('Precio', layout.priceWidth)
-      + ' '.repeat(layout.gapPriceTotal)
-      + padLeft(totalHeaderLabel, layout.totalWidth)
-      + '\n';
+    if (layout.isWide) {
+      receipt += padRight('Ud.Descripción', layout.headerLeftWidth)
+        + padLeft('Precio', layout.priceWidth)
+        + padLeft('Dt%', layout.discountWidth)
+        + padLeft('Importe', layout.totalWidth)
+        + '\n';
+    } else {
+      const totalHeaderLabel = layout.totalWidth >= 7 ? 'Importe' : 'Import';
+      receipt += padRight('Ud.Descripcion', layout.headerLeftWidth)
+        + padLeft('Precio', layout.priceWidth)
+        + ' '.repeat(layout.gapPriceTotal)
+        + padLeft(totalHeaderLabel, layout.totalWidth)
+        + '\n';
+    }
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
 
     // Items
     (receiptData.items || []).forEach(item => {
       const qty = Number(item.quantity || 0);
       const subtotal = Number(item.subtotal || 0);
-      const unitPrice = qty ? (subtotal / qty) : subtotal;
+      const explicitUnitPrice = Number(item.unitPrice ?? item.unit_price);
+      const unitPrice = Number.isFinite(explicitUnitPrice)
+        ? explicitUnitPrice
+        : (qty ? (subtotal / qty) : subtotal);
+
+      const discountPercent = Number(item.discountPercent ?? item.discount_percent ?? 0);
 
       const qtyStrRaw = Number.isFinite(qty) ? (qty % 1 === 0 ? String(qty) : qty.toFixed(3)) : '';
-      const qtyStr = padRight(qtyStrRaw.replace(/0+$/,'').replace(/\.$/,''), layout.qtyWidth);
-      const descStr = padRight(((item.name || '').toString().toUpperCase()), layout.descWidth);
-      const priceStr = padLeft(formatMoney(unitPrice, { decimal: ',' }), layout.priceWidth);
-      const totalStr = padLeft(formatMoney(subtotal, { decimal: ',' }), layout.totalWidth);
 
-      receipt += qtyStr
-        + descStr
-        + ' '.repeat(layout.gapDescPrice)
-        + priceStr
-        + ' '.repeat(layout.gapPriceTotal)
-        + totalStr
-        + '\n';
+      if (layout.isWide) {
+        const isDecimalQty = Number.isFinite(qty) && qty % 1 !== 0;
+        const units = isDecimalQty ? 1 : qty;
+        const unitsStr = padRight((Number.isFinite(units) ? String(units) : ''), layout.unitsWidth);
+        const weightText = isDecimalQty ? `(${formatQty(qty, { decimals: 3, decimal: ',' })})` : '';
+        const weightStr = padRight(weightText, layout.weightWidth);
+        const descStr = padRight(((item.name || '').toString()), layout.descWidth);
+        const priceStr = padLeft(formatMoney(unitPrice, { decimal: ',' }), layout.priceWidth);
+        const discountStr = padLeft(discountPercent ? `${Math.round(discountPercent)}%` : '', layout.discountWidth);
+        const totalStr = padLeft(formatMoney(subtotal, { decimal: ',' }), layout.totalWidth);
+
+        receipt += unitsStr + weightStr + descStr + priceStr + discountStr + totalStr + '\n';
+      } else {
+        const qtyStr = padRight(qtyStrRaw.replace(/0+$/,'').replace(/\.$/,''), layout.qtyWidth);
+        const descStr = padRight(((item.name || '').toString().toUpperCase()), layout.descWidth);
+        const priceStr = padLeft(formatMoney(unitPrice, { decimal: ',' }), layout.priceWidth);
+        const totalStr = padLeft(formatMoney(subtotal, { decimal: ',' }), layout.totalWidth);
+
+        receipt += qtyStr
+          + descStr
+          + ' '.repeat(layout.gapDescPrice)
+          + priceStr
+          + ' '.repeat(layout.gapPriceTotal)
+          + totalStr
+          + '\n';
+      }
     });
 
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
@@ -1313,9 +1388,9 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
 
-    // Payment method line (like sample: EFECTIVO/TARJETA with amount)
+    // Payment method line (like sample: CONTADO/TARJETA with amount)
     const paymentMethod = (receiptData.paymentMethod || 'CASH').toString().toUpperCase();
-    const paymentLabel = paymentMethod === 'CASH' ? 'EFECTIVO'
+    const paymentLabel = paymentMethod === 'CASH' ? 'CONTADO'
       : paymentMethod === 'CARD' ? 'TARJETA'
       : paymentMethod === 'PARKING' ? 'CREDITO'
       : paymentMethod;
@@ -1355,11 +1430,11 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     
     receipt += '\n\n';
 
-    // Feed and cut (more compatible across ESC/POS printers)
-    receipt += ESC + 'd' + String.fromCharCode(6); // feed 6 lines
-    receipt += GS + 'V' + String.fromCharCode(0); // Full cut
-    receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(0); // Full cut (alt form)
-    receipt += '\n\n';
+    // Feed and cut
+    // Use a single ESC/POS command to feed then cut. This avoids printers
+    // that mis-handle double cut commands and can cause extra blank paper
+    // before the next ticket/receipt.
+    receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(2); // Full cut after feeding 2 lines
     
     // Write to temp file and print
     const tempFile = path.join(app.getPath('temp'), 'receipt_' + Date.now() + '.txt');

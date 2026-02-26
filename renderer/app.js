@@ -1884,7 +1884,7 @@ function editCartWeight(productId) {
   const product = allProducts.find(p => p.id === productId);
   if (!product) return;
   
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   // Show custom modal
   const modal = document.getElementById('weightModal');
@@ -2402,7 +2402,7 @@ function calculateTotal() {
 
 function updateCartSummary() {
   // Update summary
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   // Product prices already include tax - we need to extract the tax amount
   // Total = sum of all product prices (tax-included)
@@ -2463,13 +2463,35 @@ async function printTicket() {
     systemSettings = await window.api.getSystemSettings();
   }
 
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
   const companyAddress = systemSettings?.company_address || '';
+  const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
 
-  // Calculate totals from cart
+  const inferTicketLineWidth = (printer) => {
+    const name = String(printer || '').toLowerCase();
+    const looks80mm = name.includes('80mm')
+      || name.includes('80 mm')
+      || name.includes('posprinter')
+      || name.includes('pos-80')
+      || name.includes('pos 80')
+      || name.includes('easy 80')
+      || name.includes('tp easy 80')
+      || name.includes('tp7001')
+      || name.includes('tp 7001')
+      || name.includes('iggual')
+      || name.includes('tm-t20')
+      || name.includes('tm t20')
+      || name.includes('tm-t88')
+      || name.includes('tm t88');
+    return looks80mm ? 48 : 32;
+  };
+
+  const LINE_WIDTH = inferTicketLineWidth(systemSettings?.printer_name);
+
+  // Calculate totals from cart (apply discountPercent if present)
   let subtotal = 0;
   let tax = 0;
   let total = 0;
@@ -2478,12 +2500,16 @@ async function printTicket() {
 
   cart.forEach(item => {
     const taxRate = item.taxRate || 0;
-    const basePrice = item.subtotal / (1 + taxRate);
-    const taxAmount = item.subtotal - basePrice;
-    
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    const finalSubtotal = item.subtotal - discountAmount;
+
+    const basePrice = finalSubtotal / (1 + taxRate);
+    const taxAmount = finalSubtotal - basePrice;
+
     subtotal += basePrice;
     tax += taxAmount;
-    total += item.subtotal;
+    total += finalSubtotal;
 
     // Track tax breakdown
     const taxRatePercent = Math.round(taxRate * 100);
@@ -2496,7 +2522,7 @@ async function printTicket() {
     }
     taxBreakdown[taxRatePercent].base += basePrice;
     taxBreakdown[taxRatePercent].tax += taxAmount;
-    taxBreakdown[taxRatePercent].total += item.subtotal;
+    taxBreakdown[taxRatePercent].total += finalSubtotal;
   });
 
   // Generate tax breakdown HTML
@@ -2527,54 +2553,37 @@ async function printTicket() {
   const timeStr = now.toLocaleTimeString('es-ES');
   const receiptNumber = `T101_1/${String(now.getFullYear()).slice(-2)}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}${String(now.getSeconds()).padStart(2,'0')}`;
 
-  // Build the ticket text (for text-based printers)
-  let ticketText = '';
-  ticketText += `${storeName}\n`;
-  if (ownerName) ticketText += `${ownerName}\n`;
-  if (nieNumber) ticketText += `${nieNumber}\n`;
-  if (companyAddress) ticketText += `${companyAddress}\n`;
-  ticketText += `\n`;
-  ticketText += `CONSULTA CUENTA\n`;
-  ticketText += `-----------------------------\n`;
-  ticketText += `FECHA: ${dateStr} ${timeStr}\n`;
-  ticketText += `Factura Simplificada  PRINCIPAL\n`;
-  ticketText += `Serie/Nº: ${receiptNumber}\n`;
-  ticketText += `Ud.Descripción     Precio Dt% Importe\n`;
-  ticketText += `*** NO VALIDO COMO FACTURA ***\n`;
-
-  cart.forEach(item => {
-    // Format: qty desc price discount% total
-    const qty = item.quantity.toFixed(0);
-    const desc = (item.productName || item.name || 'Producto').substring(0, 18);
-    const price = (item.unitPrice || 0).toFixed(2);
-    const discountPercent = item.discountPercent || 0;
-    const discountStr = discountPercent > 0 ? `${discountPercent.toFixed(0)}%` : '';
-    const discountAmount = item.subtotal * (discountPercent / 100);
-    const total = (item.subtotal - discountAmount).toFixed(2);
-    ticketText += `${qty} ${desc.padEnd(18)} ${price.padStart(5)} ${discountStr.padStart(4)} ${total.padStart(6)}\n`;
-  });
-
-  ticketText += `-----------------------------\n`;
-  ticketText += `Iva   Base   Cuota   Total\n`;
-  Object.keys(taxBreakdown).sort().forEach(rate => {
-    const b = taxBreakdown[rate];
-    ticketText += `${rate.padEnd(3)} ${b.base.toFixed(2).padStart(5)} ${b.tax.toFixed(2).padStart(6)} ${b.total.toFixed(2).padStart(6)}\n`;
-  });
-  ticketText += `-----------------------------\n`;
-  ticketText += `TOTAL   ${subtotal.toFixed(2).padStart(5)} ${tax.toFixed(2).padStart(6)} ${total.toFixed(2).padStart(6)}\n`;
-  ticketText += `TOTAL (Impuestos Incluidos)\n`;
-  ticketText += `ENTREGA 0,00\n`;
-  ticketText += `CAMBIO 0,00\n`;
-  ticketText += `-----------------------------\n`;
-  ticketText += `SERVICIOS: ${cart.length}\n`;
-  ticketText += `CUENTAS: / 1\n`;
-  ticketText += `LE ATENDIO: ${currentUser?.full_name || ''}\n`;
-  ticketText += `---- GRACIAS POR SU VISITA ----\n`;
-  ticketText += `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}${String(now.getSeconds()).padStart(2,'0')}\n`;
-
   const ticketData = {
-    text: ticketText,
-    raw: true // Tell the printReceipt API to print as raw text
+    isTicket: true,
+    storeName,
+    ownerName,
+    nieNumber,
+    companyAddress,
+    lineWidth: LINE_WIDTH === 48 ? 48 : undefined,
+    receiptId: receiptNumber,
+    date: `${dateStr} ${timeStr}`,
+    items: cart.map(item => {
+      const discountPercent = item.discountPercent || 0;
+      const discountAmount = item.subtotal * (discountPercent / 100);
+      const finalSubtotal = item.subtotal - discountAmount;
+      return {
+        name: item.productName || item.name || 'PRODUCTO',
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        subtotal: finalSubtotal,
+        discountPercent
+      };
+    }),
+    subtotal,
+    tax,
+    total,
+    taxBreakdown: taxBreakdownRows,
+    paymentMethod: 'cash',
+    paymentAmount: total,
+    changeAmount: 0,
+    currency: currencySymbol,
+    footer: receiptFooter,
+    cashier: currentUser?.full_name || ''
   };
 
   try {
@@ -2759,7 +2768,7 @@ function showReceipt(sale) {
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
   const companyAddress = systemSettings?.company_address || '';
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
   
   // Calculate tax breakdown by rate
@@ -2996,7 +3005,7 @@ function showLoanReceipt(sale, loan) {
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
   const companyAddress = systemSettings?.company_address || '';
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
   const taxRate = (systemSettings?.tax_rate || 0.10) * 100;
   
@@ -3320,7 +3329,7 @@ async function loadProductsView() {
 
 function displayProducts(products) {
   const tbody = document.querySelector('#productsTable tbody');
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   if (products.length === 0) {
     tbody.innerHTML = '<tr><td colspan="8" class="empty-state"><div class="icon">📦</div><p>No products found</p></td></tr>';
@@ -5474,7 +5483,7 @@ async function loadReturnsView() {
 
 function displayReturns(returns) {
   const tbody = document.querySelector('#returnsTable tbody');
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   if (returns.length === 0) {
     tbody.innerHTML = '<tr><td colspan=\"7\" class=\"empty-state\"><div class=\"icon\">↩️</div><p>No returns processed</p></td></tr>';
@@ -5536,7 +5545,7 @@ async function lookupSaleForReturn() {
     
     // Display sale items
     const itemsList = document.getElementById('returnItemsList');
-    const currencySymbol = systemSettings?.currency_symbol || '$';
+    const currencySymbol = systemSettings?.currency_symbol || '€';
     
     itemsList.innerHTML = sale.items.map((item, index) => `
       <div class=\"return-item\">
@@ -5581,7 +5590,7 @@ function calculateReturnTotal() {
   });
   
   const total = subtotal + tax;
-  const currencySymbol = systemSettings?.currency_symbol || '$';
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   document.getElementById('returnTotalDisplay').value = `${currencySymbol}${total.toFixed(2)}`;
 }
@@ -5636,7 +5645,7 @@ async function viewReturnDetails(returnId) {
   const returnRecord = await window.api.getReturnById(returnId);
   if (returnRecord) {
     // Could show a detailed modal here
-    showAlert(`Return Details:\\nDate: ${new Date(returnRecord.return_date).toLocaleString()}\\nAmount: ${systemSettings?.currency_symbol || '$'}${returnRecord.total.toFixed(2)}\\nReason: ${returnRecord.reason}`, 'info', 'Return Information');
+    showAlert(`Return Details:\\nDate: ${new Date(returnRecord.return_date).toLocaleString()}\\nAmount: ${systemSettings?.currency_symbol || '€'}${returnRecord.total.toFixed(2)}\\nReason: ${returnRecord.reason}`, 'info', 'Return Information');
   }
 }
 
@@ -6671,8 +6680,20 @@ async function printReceiptToThermalPrinter(sale) {
     const ownerName = systemSettings?.owner_name || '';
     const nieNumber = systemSettings?.nie_number || '';
     const companyAddress = systemSettings?.company_address || '';
-    const currencySymbol = systemSettings?.currency_symbol || '$';
+    const currencySymbol = systemSettings?.currency_symbol || '€';
     const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
+
+    const printerName = (systemSettings?.printer_name || '').toString().toLowerCase();
+    const looks80mm = printerName.includes('80mm')
+      || printerName.includes('80 mm')
+      || printerName.includes('posprinter')
+      || printerName.includes('pos-80')
+      || printerName.includes('pos 80')
+      || printerName.includes('easy 80')
+      || printerName.includes('tp easy 80')
+      || printerName.includes('tp7001')
+      || printerName.includes('tp 7001')
+      || printerName.includes('iggual');
 
     // Calculate tax breakdown by rate (to match the on-screen receipt)
     const taxBreakdown = {};
@@ -6711,11 +6732,14 @@ async function printReceiptToThermalPrinter(sale) {
       ownerName: ownerName,
       nieNumber: nieNumber,
       companyAddress: companyAddress,
+      lineWidth: looks80mm ? 48 : undefined,
       receiptId: sale.id,
       date: new Date(sale.sale_date).toLocaleString(),
       items: sale.items.map(item => ({
         name: item.product_name,
         quantity: item.quantity,
+        unitPrice: item.unit_price,
+        discountPercent: item.discount_percent,
         subtotal: item.subtotal
       })),
       subtotal: sale.subtotal,
