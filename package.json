@@ -1,6 +1,6 @@
 {
   "name": "supermarket-pos",
-  "version": "63.0.3",
+  "version": "80.0.55",
   "description": "Cross-platform Supermarket POS System",
   "main": "main.js",
   "scripts": {
@@ -8,8 +8,9 @@
     "dev": "electron . --dev",
     "postinstall": "electron-builder install-app-deps",
     "preview:receipt": "node tools/preview-receipt.js",
+    "inspect:customer-display": "node tools/inspect-customer-display-format.js",
     "build:mac": "electron-builder --mac",
-    "build:win": "electron-builder --win --x64",
+    "build:win": "electron-builder --win",
     "build:win:x64": "electron-builder --win --x64",
     "build:all": "electron-builder -mw"
   },
@@ -50,16 +51,25 @@
         {
           "target": "nsis",
           "arch": [
+            "x64",
+            "ia32"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
             "x64"
           ]
         }
       ],
-      "artifactName": "supermarket_pos_v${version}.${ext}"
+      "artifactName": "supermarket_pos_v${version}_${arch}.${ext}",
+      "requestedExecutionLevel": "asInvoker"
     },
     "files": [
       "main.js",
       "renderer/**/*",
       "database.js",
+      "customer-display.js",
       "preload.js",
       "node_modules/**/*",
       "!node_modules/@serialport/bindings-cpp/build/**",
@@ -75,7 +85,14 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "allowElevation": true,
+      "artifactName": "supermarket_pos_v${version}_nsis_${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "supermarket_pos_v${version}_portable_${arch}.${ext}"
     }
   }
 }

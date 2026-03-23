@@ -23,7 +23,7 @@
       <p class="loading-text">Loading...</p>
       
       <div class="loading-version">
-        <p>Version 2.0.0</p>
+        <p>Version <span id="appVersion">--</span></p>
         <p class="loading-copyright">© All Rights Reserved</p>
       </div>
     </div>
@@ -134,10 +134,6 @@
                       <span class="summary-label">Tax</span>
                       <span class="summary-value" id="cartTax">0.00</span>
                     </div>
-                    <div class="change-section">
-                      <div class="change-label">Change</div>
-                      <div class="change-amount" id="changeAmount">0.00</div>
-                    </div>
                   </div>
                   <div class="summary-right">
                     <div class="total-section">
@@ -209,6 +205,40 @@
                     </div>
                   </div>
 
+                  <!-- CASH: Paid input + Change (shown only when CASH is selected) -->
+                  <div id="cashPaymentDetails" class="cash-payment-details" style="display: none;">
+                    <div class="cash-payment-top">
+                      <div class="cash-paid-card">
+                        <div class="cash-paid-label">Paid</div>
+                        <input type="text" inputmode="decimal" id="cashPaidInput" class="cash-paid-input" placeholder="0.00" autocomplete="off">
+                        <div class="cash-paid-hint">Use keypad below</div>
+                      </div>
+                      <div class="change-section change-section-modal">
+                        <div class="change-label">Change</div>
+                        <div class="change-amount" id="changeAmount">€0.00</div>
+                      </div>
+                    </div>
+
+                    <div class="modal-numpad-grid" id="cashNumpad">
+                      <button type="button" class="modal-numpad-btn" data-value="1">1</button>
+                      <button type="button" class="modal-numpad-btn" data-value="2">2</button>
+                      <button type="button" class="modal-numpad-btn" data-value="3">3</button>
+                      <button type="button" class="modal-numpad-btn modal-numpad-back" data-value="back">⌫</button>
+                      <button type="button" class="modal-numpad-btn" data-value="4">4</button>
+                      <button type="button" class="modal-numpad-btn" data-value="5">5</button>
+                      <button type="button" class="modal-numpad-btn" data-value="6">6</button>
+                      <button type="button" class="modal-numpad-btn modal-numpad-clear" data-value="clear">CLEAR</button>
+                      <button type="button" class="modal-numpad-btn" data-value="7">7</button>
+                      <button type="button" class="modal-numpad-btn" data-value="8">8</button>
+                      <button type="button" class="modal-numpad-btn" data-value="9">9</button>
+                      <button type="button" class="modal-numpad-btn" data-value="00">00</button>
+                      <button type="button" class="modal-numpad-btn modal-numpad-dot" data-value=".">.</button>
+                      <button type="button" class="modal-numpad-btn" data-value="0">0</button>
+                      <button type="button" class="modal-numpad-btn modal-numpad-fill" data-value="exact">EXACT</button>
+                      <button type="button" class="modal-numpad-btn modal-numpad-fill" data-value="next">NEXT</button>
+                    </div>
+                  </div>
+
                   <!-- Payment Mode Toggle -->
                   <div style="display: flex; gap: 10px; margin-bottom: 20px;">
                     <button id="singlePaymentModeBtn" class="payment-mode-btn active" style="flex: 1; padding: 12px; border: 2px solid #3b82f6; background: #3b82f6; color: white; border-radius: 8px; font-weight: 600; cursor: pointer;">
@@ -270,7 +300,8 @@
                       </div>
                     </div>
                   </div>
-
+                </div>
+                <div class="payment-modal-footer">
                   <button id="checkoutBtn" class="btn-complete-sale-modal" disabled>COMPLETE SALE</button>
                 </div>
               </div>
@@ -483,13 +514,38 @@
                 <h2>Sales History</h2>
                 <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                   <div class="today-summary" id="todaySummary"></div>
+                  
+                  <!-- Date Filter Controls -->
+                  <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                    <div style="display: flex; align-items: center; gap: 4px;">
+                      <label class="filter-label">📅 Filter:</label>
+                      <select id="salesDateFilter" class="filter-select" style="min-width: 120px;">
+                        <option value="today">Today</option>
+                        <option value="yesterday">Yesterday</option>
+                        <option value="week">This Week</option>
+                        <option value="month">This Month</option>
+                        <option value="year">This Year</option>
+                        <option value="custom">Custom Range</option>
+                      </select>
+                    </div>
+                    
+                    <div id="customDateRange" style="display: none; gap: 8px; align-items: center;">
+                      <input type="date" id="salesStartDate" class="filter-input">
+                      <span>to</span>
+                      <input type="date" id="salesEndDate" class="filter-input">
+                      <button id="applySalesDateFilter" class="btn-secondary">Apply</button>
+                    </div>
+                  </div>
+                  
+                  <!-- Payment Method Filters -->
                   <div style="display: flex; gap: 8px;">
                     <button id="filterAllBtn" class="btn-filter active" data-filter="all">All</button>
                     <button id="filterCashBtn" class="btn-filter" data-filter="cash">💵 Cash</button>
                     <button id="filterCardBtn" class="btn-filter" data-filter="card">💳 Card</button>
                     <button id="filterLoanBtn" class="btn-filter" data-filter="loan">🅿️ Parking</button>
                   </div>
-                  <button id="printTodaySalesBtn" class="btn-primary" style="min-width: 150px;">🖨️ Print Today</button>
+                  
+                  <button id="printSalesBtn" class="btn-primary" style="min-width: 150px;">🖨️ Print Sales</button>
                 </div>
               </div>
 
@@ -974,6 +1030,15 @@
                   </div>
                 </div>
 
+                <div class="settings-section">
+                  <h3>Customer Display</h3>
+                  <div class="form-group">
+                    <label>Customer Display Port (optional)</label>
+                    <input type="text" id="customerDisplayPort" placeholder="COM12" autocomplete="off">
+                    <small>Windows example: COM12 (Prolific). Leave empty for auto-detect.</small>
+                  </div>
+                </div>
+
                 <div class="modal-footer">
                   <button type="submit" class="btn-primary">💾 Save Settings</button>
                 </div>
@@ -1346,6 +1411,37 @@
           <label>Restaurant NIE Number</label>
           <input type="text" id="loanRestaurantNie" placeholder="Enter NIE number (optional)">
         </div>
+        <div class="form-group" id="restaurantParkingModeField" style="display: none;">
+          <label>Parking Mode</label>
+          <div class="parking-mode-toggle" role="radiogroup" aria-label="Parking Mode">
+            <label class="parking-mode-option">
+              <input type="radio" name="loanParkingMode" value="append" checked>
+              <span class="pm-card">
+                <span class="pm-title">Add to existing</span>
+                <span class="pm-sub">Select a restaurant tab</span>
+              </span>
+            </label>
+            <label class="parking-mode-option">
+              <input type="radio" name="loanParkingMode" value="new">
+              <span class="pm-card">
+                <span class="pm-title">Create new</span>
+                <span class="pm-sub">Start a fresh parking tab</span>
+              </span>
+            </label>
+          </div>
+          <div class="parking-mode-help">
+            If the restaurant already has an unpaid Parking tab, choose “Add to existing parking”.
+          </div>
+
+          <div class="form-group" id="existingRestaurantSelectField" style="display:none; margin-top:14px;">
+            <label>Select Existing Restaurant Parking *</label>
+            <div class="existing-restaurant-row">
+              <select id="loanExistingRestaurant" class="existing-restaurant-select"></select>
+              <button type="button" class="btn-secondary" id="refreshExistingRestaurantBtn">Refresh</button>
+            </div>
+            <div id="existingRestaurantHelp" class="existing-restaurant-help"></div>
+          </div>
+        </div>
         <div class="form-group">
           <label>Customer Name *</label>
           <input type="text" id="loanCustomerName" required placeholder="Enter customer name">
@@ -1522,11 +1618,7 @@
                 <span class="summary-label">💳 Card Sales:</span>
                 <span class="summary-value" id="zReportCard">€0.00</span>
               </div>
-              <div class="summary-item">
-                <span class="summary-label">🅿️ PARKING Sales:</span>
-                <span class="summary-value" id="zReportLoan">€0.00</span>
-              </div>
-              <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
+              <div class="summary-item" style="grid-column: span 2; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
                 <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
                 <span class="summary-value" style="font-weight: bold; font-size: 16px; color: #059669;" id="zReportTotalAmount">€0.00</span>
               </div>

@@ -80,7 +80,296 @@ const PERMISSIONS = {
 // Initialize app
 document.addEventListener('DOMContentLoaded', () => {
   showLoadingScreen();
+  updateAppVersionUI();
+  setupCustomerDisplayPreviewOverlay();
 });
+
+function setupCustomerDisplayPreviewOverlay() {
+  try {
+    // Disabled by default: hide the on-screen debug/preview overlay.
+    // (Customer display output still works normally.)
+    const enablePreviewOverlay = false;
+    if (!enablePreviewOverlay) return;
+
+    if (!window.api || typeof window.api.onCustomerDisplayPreview !== 'function') return;
+
+    const ensurePanel = () => {
+      let panel = document.getElementById('customerDisplayPreviewPanel');
+      if (panel) return panel;
+
+      panel = document.createElement('div');
+      panel.id = 'customerDisplayPreviewPanel';
+      panel.style.cssText = [
+        'position:fixed',
+        'right:16px',
+        'bottom:16px',
+        'z-index:99999',
+        'background:rgba(10,10,10,0.90)',
+        'color:#fff',
+        'border:1px solid rgba(255,255,255,0.2)',
+        'border-radius:10px',
+        'padding:10px 12px',
+        'min-width:260px',
+        'max-width:420px',
+        'font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+        'box-shadow:0 10px 30px rgba(0,0,0,0.35)'
+      ].join(';');
+
+      panel.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px;">
+          <div style="font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-weight:700; font-size:12px; opacity:0.9;">
+            Customer Display Preview
+          </div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <button id="customerDisplayPreviewDebug" style="border:none; background:rgba(59,130,246,0.30); color:#fff; padding:4px 10px; border-radius:8px; cursor:pointer; font-weight:800;">DEBUG</button>
+            <button id="customerDisplayPreviewClose" style="border:none; background:rgba(255,255,255,0.12); color:#fff; padding:4px 8px; border-radius:8px; cursor:pointer; font-weight:700;">×</button>
+          </div>
+        </div>
+        <div id="customerDisplayPreviewRuler" style="opacity:0.55; font-size:12px;">|12345678901234567890|</div>
+        <div id="customerDisplayPreviewL1" style="white-space:pre; font-size:14px; margin-top:4px;">|                    |</div>
+        <div id="customerDisplayPreviewL2" style="white-space:pre; font-size:14px;">|                    |</div>
+
+        <div id="customerDisplayDebugPanel" style="display:none; margin-top:10px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.18);">
+          <div style="display:flex; gap:8px; margin-bottom:8px;">
+            <button id="customerDisplayDebugReconnect" style="flex:1; border:none; background:rgba(16,185,129,0.85); color:#06281f; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:900;">RECONNECT</button>
+            <button id="customerDisplayDebugRefresh" style="flex:1; border:none; background:rgba(148,163,184,0.30); color:#fff; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:900;">REFRESH</button>
+          </div>
+          <div style="display:flex; gap:8px; margin-bottom:8px;">
+            <button id="customerDisplayDebugAuto" style="flex:1; border:none; background:rgba(245,158,11,0.85); color:#2a1b04; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:900;">AUTO</button>
+            <button id="customerDisplayDebugReset" style="flex:1; border:none; background:rgba(239,68,68,0.85); color:#2a0b0b; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:900;">RESET</button>
+          </div>
+          <div id="customerDisplayPortButtons" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:8px;"></div>
+          <div id="customerDisplayDebugAction" style="white-space:pre-wrap; font-size:12px; opacity:0.95; line-height:1.3; color:#fde68a; margin-bottom:8px;">action: (none)</div>
+          <div id="customerDisplayDebugInfo" style="white-space:pre-wrap; font-size:12px; opacity:0.95; line-height:1.3;">loading...</div>
+        </div>
+      `;
+
+      document.body.appendChild(panel);
+
+      const closeBtn = document.getElementById('customerDisplayPreviewClose');
+      if (closeBtn) {
+        closeBtn.addEventListener('click', () => {
+          panel.style.display = 'none';
+        });
+      }
+
+      const debugBtn = document.getElementById('customerDisplayPreviewDebug');
+      const debugPanel = document.getElementById('customerDisplayDebugPanel');
+      const infoEl = document.getElementById('customerDisplayDebugInfo');
+      const actionEl = document.getElementById('customerDisplayDebugAction');
+      const portButtonsEl = document.getElementById('customerDisplayPortButtons');
+      const reconnectBtn = document.getElementById('customerDisplayDebugReconnect');
+      const refreshBtn = document.getElementById('customerDisplayDebugRefresh');
+      const autoBtn = document.getElementById('customerDisplayDebugAuto');
+      const resetBtn = document.getElementById('customerDisplayDebugReset');
+
+      let debugBusy = false;
+
+      const setAction = (text) => {
+        if (!actionEl) return;
+        actionEl.textContent = `action: ${text || '(none)'}`;
+      };
+
+      const refreshDebugInfo = async () => {
+        try {
+          if (!window.api || typeof window.api.getCustomerDisplayConnectionStatus !== 'function') {
+            if (infoEl) infoEl.textContent = 'debug API not available';
+            return;
+          }
+          const st = await window.api.getCustomerDisplayConnectionStatus();
+
+          // Build touch buttons for each detected port (COMxx)
+          if (portButtonsEl) {
+            portButtonsEl.innerHTML = '';
+
+            const portsRaw = Array.isArray(st?.availablePorts) ? st.availablePorts : [];
+            const entries = portsRaw
+              .map((p) => {
+                const portName = (p?.path || p || '').toString().trim();
+                const manufacturer = (p?.manufacturer || '').toString().trim();
+                return { portName, manufacturer };
+              })
+              .filter((x) => /^COM\d+$/i.test(x.portName))
+              // Avoid COM1/COM2 (usually motherboard ports, easy to tap by mistake)
+              .filter((x) => !/^COM[12]$/i.test(x.portName));
+
+            // Deduplicate by port name
+            const byName = new Map();
+            for (const e of entries) {
+              if (!byName.has(e.portName.toUpperCase())) byName.set(e.portName.toUpperCase(), e);
+            }
+
+            // Sort COM ports numerically
+            const sorted = Array.from(byName.values()).sort((a, b) => {
+              const na = Number(String(a.portName).replace(/[^0-9]/g, ''));
+              const nb = Number(String(b.portName).replace(/[^0-9]/g, ''));
+              return (na || 0) - (nb || 0);
+            });
+
+            for (const e of sorted) {
+              const portName = e.portName;
+              const manufacturer = e.manufacturer;
+              const label = manufacturer ? `${portName} (${manufacturer.slice(0, 12)})` : portName;
+
+              const btn = document.createElement('button');
+              btn.textContent = label;
+              btn.style.cssText = [
+                'border:none',
+                // Highlight Prolific ports (most likely the customer display)
+                (manufacturer.toLowerCase().includes('prolific') ? 'background:rgba(16,185,129,0.30)' : 'background:rgba(255,255,255,0.10)'),
+                'color:#fff',
+                'padding:8px 10px',
+                'border-radius:10px',
+                'cursor:pointer',
+                'font-weight:900',
+                'min-width:110px'
+              ].join(';');
+              btn.addEventListener('click', async () => {
+                try {
+                  if (!window.api || typeof window.api.setCustomerDisplayPreferredPort !== 'function') {
+                    setAction('set-port API not available');
+                    return;
+                  }
+                  debugBusy = true;
+                  setAction(`setting port: ${portName}...`);
+                  const res = await window.api.setCustomerDisplayPreferredPort(portName);
+                  setAction(`set port: ${res?.success ? 'OK' : 'FAIL'}\n${res?.message || ''}`);
+                  await refreshDebugInfo();
+                } catch (e) {
+                  setAction(`set port error: ${e.message}`);
+                } finally {
+                  debugBusy = false;
+                }
+              });
+              portButtonsEl.appendChild(btn);
+            }
+          }
+
+          const lines = [];
+          lines.push(`connected: ${!!st?.connected}`);
+          lines.push(`serialPortAvailable: ${!!st?.serialPortAvailable}`);
+          if (st?.preferredPort) lines.push(`preferredPort: ${st.preferredPort}`);
+          if (st?.excludedPorts) lines.push(`excludedPorts: ${st.excludedPorts}`);
+          if (st?.lastPortPath) lines.push(`lastPortPath: ${st.lastPortPath}`);
+          if (st?.lastPortCloseAt) lines.push(`lastPortCloseAt: ${new Date(st.lastPortCloseAt).toLocaleString()}`);
+          if (st?.lastPortError) lines.push(`lastPortError: ${st.lastPortError}`);
+          if (st?.lastWriteError) lines.push(`lastWriteError: ${st.lastWriteError}`);
+          if (st?.error) lines.push(`error: ${st.error}`);
+          if (Array.isArray(st?.availablePorts) && st.availablePorts.length) {
+            lines.push(`ports: ${st.availablePorts.map(p => p.path || p).join(', ')}`);
+          }
+          if (infoEl) infoEl.textContent = lines.join('\n');
+        } catch (e) {
+          if (infoEl) infoEl.textContent = `status error: ${e.message}`;
+        }
+      };
+
+      if (debugBtn && debugPanel) {
+        debugBtn.addEventListener('click', async () => {
+          const next = debugPanel.style.display === 'none' ? 'block' : 'none';
+          debugPanel.style.display = next;
+          if (next === 'block') await refreshDebugInfo();
+        });
+      }
+
+      if (refreshBtn) refreshBtn.addEventListener('click', refreshDebugInfo);
+
+      if (autoBtn) {
+        autoBtn.addEventListener('click', async () => {
+          try {
+            if (!window.api || typeof window.api.setCustomerDisplayPreferredPort !== 'function') return;
+            debugBusy = true;
+            setAction('AUTO: clearing saved port...');
+            const res = await window.api.setCustomerDisplayPreferredPort('');
+            setAction(`AUTO: ${res?.success ? 'OK' : 'FAIL'}\n${res?.message || ''}`);
+            await refreshDebugInfo();
+          } catch (e) {
+            setAction(`AUTO error: ${e.message}`);
+          } finally {
+            debugBusy = false;
+          }
+        });
+      }
+
+      if (resetBtn) {
+        resetBtn.addEventListener('click', async () => {
+          try {
+            if (!window.api || typeof window.api.resetCustomerDisplayDevice !== 'function') {
+              setAction('reset API not available');
+              return;
+            }
+            debugBusy = true;
+            setAction('resetting device...');
+            const res = await window.api.resetCustomerDisplayDevice();
+            setAction(`reset: ${res?.success ? 'OK' : 'FAIL'}\n${res?.message || ''}`);
+            await refreshDebugInfo();
+          } catch (e) {
+            setAction(`reset error: ${e.message}`);
+          } finally {
+            debugBusy = false;
+          }
+        });
+      }
+
+      if (reconnectBtn) {
+        reconnectBtn.addEventListener('click', async () => {
+          try {
+            if (!window.api || typeof window.api.reconnectCustomerDisplay !== 'function') {
+              if (infoEl) infoEl.textContent = 'reconnect API not available';
+              return;
+            }
+            if (infoEl) infoEl.textContent = 'reconnecting...';
+            const res = await window.api.reconnectCustomerDisplay();
+            if (infoEl) infoEl.textContent = `reconnect: ${res?.success ? 'OK' : 'FAIL'}\n${res?.message || ''}`;
+            await refreshDebugInfo();
+          } catch (e) {
+            if (infoEl) infoEl.textContent = `reconnect error: ${e.message}`;
+          }
+        });
+      }
+
+      // Keep debug info fresh while open
+      setInterval(() => {
+        if (debugPanel && debugPanel.style.display !== 'none' && !debugBusy) refreshDebugInfo();
+      }, 2000);
+
+      return panel;
+    };
+
+    window.api.onCustomerDisplayPreview((payload) => {
+      const maxChars = Number(payload?.maxChars) || 20;
+      const line1 = (payload?.line1 ?? '').toString();
+      const line2 = (payload?.line2 ?? '').toString();
+
+      const panel = ensurePanel();
+      if (!panel) return;
+
+      panel.style.display = 'block';
+
+      const rulerEl = document.getElementById('customerDisplayPreviewRuler');
+      const l1El = document.getElementById('customerDisplayPreviewL1');
+      const l2El = document.getElementById('customerDisplayPreviewL2');
+      const ruler = '12345678901234567890'.substring(0, maxChars).padEnd(maxChars, ' ');
+      if (rulerEl) rulerEl.textContent = `|${ruler}|`;
+      if (l1El) l1El.textContent = `|${line1.substring(0, maxChars).padEnd(maxChars, ' ')}|`;
+      if (l2El) l2El.textContent = `|${line2.substring(0, maxChars).padEnd(maxChars, ' ')}|`;
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function updateAppVersionUI() {
+  try {
+    const el = document.getElementById('appVersion');
+    if (!el) return;
+    if (!window.api || typeof window.api.getAppVersion !== 'function') return;
+    const v = await window.api.getAppVersion();
+    if (v) el.textContent = String(v);
+  } catch {
+    // ignore
+  }
+}
 
 function showLoadingScreen() {
   // Update loading screen with branding
@@ -389,7 +678,7 @@ function loadViewData(view) {
       if (hasPermission('inventory')) loadInventoryView();
       break;
     case 'loans':
-      if (hasPermission('loans')) loadLoansView();
+      if (hasPermission('loans')) loadLoansView('active');
       break;
     case 'system':
       if (hasPermission('system')) loadSystemSettingsView();
@@ -704,6 +993,10 @@ function setupPaymentModal() {
   const closePaymentModal = document.getElementById('closePaymentModal');
   const paymentMethodBtns = document.querySelectorAll('.payment-method-btn');
   const checkoutBtnModal = document.querySelector('.btn-complete-sale-modal');
+
+  const cashPaymentDetails = document.getElementById('cashPaymentDetails');
+  const cashPaidInput = document.getElementById('cashPaidInput');
+  const cashNumpad = document.getElementById('cashNumpad');
   
   // Payment mode toggle buttons
   const singlePaymentModeBtn = document.getElementById('singlePaymentModeBtn');
@@ -749,6 +1042,11 @@ function setupPaymentModal() {
       splitPaymentSection.style.display = 'none';
       
       paymentMode = 'single';
+
+      // Only show cash details if CASH is currently selected
+      if (cashPaymentDetails) {
+        cashPaymentDetails.style.display = selectedPaymentMethod === 'cash' ? 'block' : 'none';
+      }
       updatePaymentModalValidation();
     });
   }
@@ -769,6 +1067,11 @@ function setupPaymentModal() {
       splitPaymentSection.style.display = 'block';
       
       paymentMode = 'split';
+
+      // Hide cash keypad/details in split mode
+      if (cashPaymentDetails) {
+        cashPaymentDetails.style.display = 'none';
+      }
       updatePaymentModalValidation();
     });
   }
@@ -806,10 +1109,128 @@ function setupPaymentModal() {
       // Set selected payment method
       selectedPaymentMethod = value;
       console.log('Payment method selected:', value);
+
+      // Toggle cash keypad/details
+      if (cashPaymentDetails) {
+        const showCash = paymentMode === 'single' && selectedPaymentMethod === 'cash';
+        cashPaymentDetails.style.display = showCash ? 'block' : 'none';
+      }
+
+      // For non-cash methods, treat payment as exact total
+      if (paymentMode === 'single') {
+        const paymentInputHidden = document.getElementById('paymentInput');
+        const total = calculateTotal();
+        if (paymentInputHidden) {
+          if (selectedPaymentMethod === 'cash') {
+            // Keep current input value (or empty) so cashier can type paid amount
+          } else {
+            paymentInputHidden.value = String(total.toFixed(2));
+          }
+        }
+        // Update summary + change display (now inside modal)
+        updateCartSummary();
+      }
+
+      if (cashPaidInput && selectedPaymentMethod === 'cash') {
+        cashPaidInput.focus();
+        cashPaidInput.select();
+      }
       
       updatePaymentModalValidation();
     });
   });
+
+  // Cash paid input sync -> hidden paymentInput + live change
+  const syncCashPaid = () => {
+    const total = calculateTotal();
+    const paymentInputHidden = document.getElementById('paymentInput');
+    const raw = cashPaidInput ? String(cashPaidInput.value || '') : '';
+    const normalized = raw.replace(/[^0-9.]/g, '');
+    const paid = parseFloat(normalized);
+
+    if (paymentInputHidden) {
+      if (Number.isFinite(paid)) {
+        paymentInputHidden.value = String(paid);
+      } else {
+        paymentInputHidden.value = '';
+      }
+    }
+
+    // Keep the modal change tile up-to-date via the existing summary updater.
+    updateCartSummary();
+
+    // Show remaining when cash is insufficient
+    const paymentRemainingAmount = document.getElementById('paymentRemainingAmount');
+    const remainingValue = document.getElementById('remainingValue');
+    if (paymentRemainingAmount && remainingValue && selectedPaymentMethod === 'cash' && paymentMode === 'single') {
+      const paidAmount = Number.isFinite(paid) ? paid : 0;
+      const remaining = Math.max(0, total - paidAmount);
+      if (paidAmount > 0 && remaining > 0.009) {
+        paymentRemainingAmount.style.display = 'block';
+        remainingValue.textContent = (systemSettings?.currency_symbol || '€') + remaining.toFixed(2);
+        remainingValue.style.color = '#dc2626';
+      } else {
+        paymentRemainingAmount.style.display = 'none';
+      }
+    }
+
+    updatePaymentModalValidation();
+  };
+
+  if (cashPaidInput) {
+    cashPaidInput.addEventListener('input', syncCashPaid);
+    cashPaidInput.addEventListener('focus', () => {
+      if (selectedPaymentMethod === 'cash') syncCashPaid();
+    });
+  }
+
+  // Modal numpad for cash
+  if (cashNumpad && cashPaidInput) {
+    cashNumpad.addEventListener('click', (e) => {
+      const btn = e.target?.closest?.('.modal-numpad-btn');
+      if (!btn) return;
+      const v = btn.dataset.value;
+      const total = calculateTotal();
+
+      const setVal = (next) => {
+        cashPaidInput.value = next;
+        syncCashPaid();
+      };
+
+      const cur = String(cashPaidInput.value || '');
+      if (v === 'clear') {
+        setVal('');
+        return;
+      }
+      if (v === 'back') {
+        setVal(cur.slice(0, -1));
+        return;
+      }
+      if (v === 'exact') {
+        setVal(total.toFixed(2));
+        return;
+      }
+      if (v === 'next') {
+        // Convenience: round up to next whole unit (e.g., 12.34 -> 13.00)
+        const next = Math.ceil(total);
+        setVal(next.toFixed(2));
+        return;
+      }
+
+      // Append digits / dot / 00
+      if (v === '.') {
+        if (cur.includes('.')) return;
+        setVal(cur === '' ? '0.' : cur + '.');
+        return;
+      }
+
+      if (/^(\d|00)$/.test(v)) {
+        // Limit length to keep it usable
+        if ((cur + v).length > 10) return;
+        setVal(cur + v);
+      }
+    });
+  }
 }
 
 function updatePaymentModalValidation() {
@@ -820,12 +1241,37 @@ function updatePaymentModalValidation() {
   if (!checkoutBtnModal) return;
   
   const total = calculateTotal();
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   if (paymentMode === 'single') {
-    // Single payment mode - require one method selected
-    checkoutBtnModal.disabled = !selectedPaymentMethod;
-    if (paymentRemainingAmount) {
-      paymentRemainingAmount.style.display = 'none';
+    // Single payment mode
+    if (!selectedPaymentMethod) {
+      checkoutBtnModal.disabled = true;
+      if (paymentRemainingAmount) paymentRemainingAmount.style.display = 'none';
+      return;
+    }
+
+    if (selectedPaymentMethod === 'cash') {
+      const cashPaidInput = document.getElementById('cashPaidInput');
+      const paid = parseFloat((cashPaidInput?.value || '').toString()) || 0;
+      const remaining = total - paid;
+
+      // Enable only if paid covers total (1 cent tolerance)
+      checkoutBtnModal.disabled = remaining > 0.009;
+
+      if (paymentRemainingAmount && remainingValue) {
+        if (paid > 0 && remaining > 0.009) {
+          paymentRemainingAmount.style.display = 'block';
+          remainingValue.textContent = currencySymbol + remaining.toFixed(2);
+          remainingValue.style.color = '#dc2626';
+        } else {
+          paymentRemainingAmount.style.display = 'none';
+        }
+      }
+    } else {
+      // CARD / PARKING: always exact, no remaining
+      checkoutBtnModal.disabled = false;
+      if (paymentRemainingAmount) paymentRemainingAmount.style.display = 'none';
     }
   } else {
     // Split payment mode - validate amounts
@@ -845,7 +1291,7 @@ function updatePaymentModalValidation() {
     if (paymentRemainingAmount && remainingValue) {
       if (totalPaid > 0) {
         paymentRemainingAmount.style.display = 'block';
-        remainingValue.textContent = '€' + remaining.toFixed(2);
+        remainingValue.textContent = currencySymbol + remaining.toFixed(2);
         
         if (remaining > 0.01) {
           remainingValue.style.color = '#dc2626'; // Red for remaining
@@ -870,6 +1316,9 @@ function updatePaymentModalValidation() {
 function openPaymentModal() {
   const paymentModal = document.getElementById('paymentModal');
   const paymentTotalAmount = document.getElementById('paymentTotalAmount');
+  const cashPaymentDetails = document.getElementById('cashPaymentDetails');
+  const cashPaidInput = document.getElementById('cashPaidInput');
+  const paymentInputHidden = document.getElementById('paymentInput');
   
   if (paymentModal) {
     paymentModal.classList.add('active');
@@ -877,13 +1326,21 @@ function openPaymentModal() {
     // Display total amount
     const total = calculateTotal();
     if (paymentTotalAmount) {
-      paymentTotalAmount.textContent = '€' + total.toFixed(2);
+      const currencySymbol = systemSettings?.currency_symbol || '€';
+      paymentTotalAmount.textContent = currencySymbol + total.toFixed(2);
     }
+    // Show total on customer display
+    updateCustomerDisplayTotal(total);
     
     // Reset single payment selections
     document.querySelectorAll('.payment-method-btn').forEach(btn => {
       btn.classList.remove('selected');
     });
+
+    // Reset cash inputs
+    if (cashPaidInput) cashPaidInput.value = '';
+    if (paymentInputHidden) paymentInputHidden.value = '';
+    if (cashPaymentDetails) cashPaymentDetails.style.display = 'none';
     
     // Reset split payment
     const splitCashAmount = document.getElementById('splitCashAmount');
@@ -925,6 +1382,9 @@ function openPaymentModal() {
     if (checkoutBtnModal) {
       checkoutBtnModal.disabled = true;
     }
+
+    // Ensure main summary is recalculated (updates change tile inside modal)
+    updateCartSummary();
   }
 }
 
@@ -1273,7 +1733,7 @@ function setupProductCardListeners() {
         clickTimer = null;
         clickedProductId = null;
         // Single-click: add to cart
-        promptForWeight(productId);
+        openProductWeightFlow(productId);
       }, 250); // 250ms delay to detect double-click
     }
   });
@@ -1977,11 +2437,150 @@ async function searchAndAddProduct(query) {
   }
   
   if (results.length === 1) {
-    promptForWeight(results[0].id);
+    openProductWeightFlow(results[0].id);
   } else {
     // Multiple results - show alert to select from products grid
     showAlert('Multiple products found. Please select from the product grid below.', 'info', 'Multiple Results');
   }
+}
+
+// For zero-price (variable-price) products: ask for unit price first, then open the existing scale/weight modal.
+function openProductWeightFlow(productId) {
+  const product = allProducts.find(p => p.id === productId);
+  if (!product) {
+    promptForWeight(productId);
+    return;
+  }
+
+  // Only intercept truly zero-priced items.
+  if (!(Number(product.price) <= 0)) {
+    promptForWeight(productId);
+    return;
+  }
+
+  // Build a lightweight modal dynamically so we don't need to touch HTML/CSS files.
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  const unitLabel = (product.unit_type === 'quantity') ? '/piece' : '/kg';
+
+  const existing = document.getElementById('unitPriceEntryOverlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'unitPriceEntryOverlay';
+  overlay.style.cssText = [
+    'position:fixed',
+    'inset:0',
+    'background:rgba(0,0,0,0.55)',
+    'padding:24px 0 330px 0',
+    'display:flex',
+    'align-items:center',
+    'justify-content:center',
+    // Keep below the on-screen keyboard (z-index: 10002) so it stays usable.
+    'z-index:10001'
+  ].join(';');
+
+  const card = document.createElement('div');
+  card.style.cssText = [
+    'width:min(520px, 92vw)',
+    'background:#fff',
+    'border-radius:22px',
+    'box-shadow:0 18px 60px rgba(0,0,0,0.35)',
+    'padding:26px 22px'
+  ].join(';');
+
+  card.innerHTML = `
+    <div style="text-align:center; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial;">
+      <div style="font-size:28px; font-weight:900; color:#0f172a; margin-bottom:6px;">Enter Price</div>
+      <div style="font-size:15px; color:#64748b; margin-bottom:18px;">${product.name}</div>
+      <div style="font-size:14px; font-weight:800; color:#334155; margin-bottom:10px;">Unit Price (${unitLabel})</div>
+      <div style="display:flex; align-items:center; justify-content:center; gap:10px; margin-bottom:18px;">
+        <div style="font-size:22px; font-weight:900; color:#334155;">${currencySymbol}</div>
+        <input id="unitPriceEntryInput" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off"
+          style="width:220px; font-size:26px; text-align:center; padding:14px 12px; border-radius:14px; border:2px solid #cbd5e1; outline:none;" />
+      </div>
+      <div style="display:flex; gap:14px; justify-content:center;">
+        <button id="unitPriceEntryCancel" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:20px; font-weight:900; background:#94a3b8; color:#fff;">Cancel</button>
+        <button id="unitPriceEntryOk" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:20px; font-weight:900; background:#0ea5e9; color:#fff;">Submit</button>
+      </div>
+    </div>
+  `;
+
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+
+  const input = document.getElementById('unitPriceEntryInput');
+  const okBtn = document.getElementById('unitPriceEntryOk');
+  const cancelBtn = document.getElementById('unitPriceEntryCancel');
+
+  if (input) {
+    // Allow both 1.5 and 1,5 without the browser clearing the field (locale-safe).
+    input.addEventListener('input', () => {
+      let v = String(input.value || '');
+      v = v.replace(/[^0-9.,]/g, '');
+      const firstSepIndex = v.search(/[.,]/);
+      if (firstSepIndex >= 0) {
+        const before = v.slice(0, firstSepIndex);
+        const sep = v[firstSepIndex];
+        const after = v.slice(firstSepIndex + 1).replace(/[.,]/g, '');
+        v = before + sep + after;
+      }
+      input.value = v;
+    });
+  }
+
+  const cleanup = () => {
+    overlay.remove();
+  };
+
+  const restoreAfterWeightModal = (originalPrice) => {
+    // Restore after the weight modal closes via OK or Cancel.
+    const ok = document.getElementById('weightOkBtn');
+    const cancel = document.getElementById('weightCancelBtn');
+    const restore = () => {
+      product.price = originalPrice;
+    };
+    if (ok) ok.addEventListener('click', restore, { once: true });
+    if (cancel) cancel.addEventListener('click', restore, { once: true });
+  };
+
+  const submit = () => {
+    const raw = (input?.value ?? '').toString().trim();
+    const unitPrice = parseFloat(raw.replace(',', '.'));
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      showAlert('Please enter a valid unit price', 'error', 'Invalid Price');
+      return;
+    }
+
+    cleanup();
+
+    const originalPrice = product.price;
+    product.price = unitPrice;
+
+    // Open the existing weight/scale popup.
+    promptForWeight(productId);
+
+    // Ensure we restore the original price once the modal closes.
+    // (Do this after promptForWeight sets up its handlers.)
+    setTimeout(() => restoreAfterWeightModal(originalPrice), 0);
+  };
+
+  if (cancelBtn) cancelBtn.addEventListener('click', cleanup, { once: true });
+  if (okBtn) okBtn.addEventListener('click', submit);
+  if (input) {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submit();
+    });
+  }
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) cleanup();
+  });
+
+  // Focus the input so the existing virtual keyboard pops up.
+  setTimeout(() => {
+    if (!input) return;
+    input.focus();
+    input.select();
+  }, 0);
 }
 
 function addToCart(productId, weight = null, customPrice = null, isWeightBased = true) {
@@ -2037,15 +2636,13 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
     cartItemId: Date.now(), // Unique ID for each cart item to allow duplicates
     discountPercent: 0 // Discount as percentage (0%, 10%, 20%, etc.)
   };
-  console.log('Cart item to add:', cartItem);
   cart.unshift(cartItem); // Add to beginning (most recent first)
   
-  console.log('Cart after update:', cart);
-  
-  console.log('Calling updateCartDisplay');
   updateCartDisplay();
-  console.log('Calling updateCartSummary');
   updateCartSummary();
+
+  // Update customer display (centralized behavior: last item like the reference POS)
+  updateCustomerDisplayData();
 }
 
 function updateCartQuantity(productId, change) {
@@ -2057,7 +2654,7 @@ function updateCartQuantity(productId, change) {
   const newQuantity = item.quantity + change;
   
   if (newQuantity <= 0) {
-    removeFromCart(productId);
+    removeFromCart(item.cartItemId);
   } else if (newQuantity <= product.stock) {
     item.quantity = newQuantity;
     item.subtotal = item.quantity * item.unitPrice;
@@ -2068,8 +2665,10 @@ function updateCartQuantity(productId, change) {
 }
 
 function removeFromCart(cartItemId) {
+  const removedItem = cart.find(item => item.cartItemId === cartItemId);
   cart = cart.filter(item => item.cartItemId !== cartItemId);
   updateCartDisplay();
+  flashCustomerDisplayRemovedItem(removedItem);
 }
 
 function setupInlineCartEditing() {
@@ -2119,6 +2718,7 @@ function setupInlineCartEditing() {
           cartItem.subtotal = newValue * cartItem.unitPrice;
         }
         updateCartDisplay();
+        flashCustomerDisplayCartItem(cartItem.cartItemId);
       };
       
       input.addEventListener('blur', (e) => {
@@ -2178,6 +2778,7 @@ function setupInlineCartEditing() {
           cartItem.subtotal = cartItem.quantity * newValue;
         } // else: do not update, just revert to previous value
         updateCartDisplay();
+        flashCustomerDisplayCartItem(cartItem.cartItemId);
       };
       
       input.addEventListener('blur', (e) => {
@@ -2228,6 +2829,7 @@ function setupInlineCartEditing() {
           cartItem.productName = newValue;
         }
         updateCartDisplay();
+        flashCustomerDisplayCartItem(cartItem.cartItemId);
       };
       
       input.addEventListener('blur', (e) => {
@@ -2284,6 +2886,7 @@ function setupInlineCartEditing() {
           alert('Discount cannot be greater than 100%');
         }
         updateCartDisplay();
+        flashCustomerDisplayCartItem(cartItem.cartItemId);
       };
       
       input.addEventListener('blur', (e) => {
@@ -2313,9 +2916,7 @@ function setupInlineCartEditing() {
 }
 
 function updateCartDisplay() {
-  console.log('updateCartDisplay called, cart:', cart);
   const cartTableBody = document.getElementById('cartTableBody');
-  console.log('cartTableBody element:', cartTableBody);
   const checkoutBtn = document.getElementById('checkoutBtn');
   const ticketBtn = document.getElementById('ticketBtn');
   const paymentBtn = document.getElementById('paymentBtn');
@@ -2334,6 +2935,11 @@ function updateCartDisplay() {
     console.log('Cart is empty, showing empty message');
     cartTableBody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 40px; color: #a0aec0;">Cart is empty</td></tr>';
     checkoutBtn.disabled = true;
+
+    // Ensure payment summary resets when the cart is cleared.
+    const paymentInput = document.getElementById('paymentInput');
+    if (paymentInput) paymentInput.value = '';
+
     // Disable TICKET and PAYMENT buttons when cart is empty
     if (ticketBtn) {
       ticketBtn.disabled = true;
@@ -2388,7 +2994,6 @@ function updateCartDisplay() {
   }
   
   updateCartSummary();
-  updateCustomerDisplayData();
 }
 
 function calculateTotal() {
@@ -2435,8 +3040,10 @@ function updateCartSummary() {
     totalBasePrice += basePrice;
     totalTaxAmount += taxAmount;
   });
-  
-  updateCustomerDisplayData();
+
+  // Do NOT update the physical customer display from here.
+  // updateCartSummary() is triggered very frequently (e.g. typing paid amount),
+  // and frequent serial writes cause buffering/flicker on the pole display.
   
   // Get payment amount from payment input field or default to total
   const paymentInput = document.getElementById('paymentInput');
@@ -2701,6 +3308,65 @@ async function completeSale() {
     return;
   }
   
+  // Check if this is a parking payment
+  const parkingPaymentInfo = sessionStorage.getItem('parkingPayment');
+  if (parkingPaymentInfo) {
+    console.log('Found parking payment info:', parkingPaymentInfo);
+    console.log('Current cart:', cart);
+    try {
+      const paymentData = JSON.parse(parkingPaymentInfo);
+      
+      // Process parking payment
+      await completeLoanPaymentFromCheckout(paymentData.receiptNumber, paymentData.amount, paymentMethod);
+      
+      // Clear parking payment data
+      sessionStorage.removeItem('parkingPayment');
+      
+      // Close payment modal
+      closePaymentModalFunc();
+      
+      // Clear cart
+      cart = [];
+      updateCartDisplay();
+      
+      // Navigate back to parking view and show only pending transactions
+      setTimeout(() => {
+        // Update active nav button
+        const navBtns = document.querySelectorAll('.tab-btn');
+        navBtns.forEach(b => b.classList.remove('active'));
+        const targetBtn = document.querySelector('[data-view="loans"]');
+        if (targetBtn) {
+          targetBtn.classList.add('active');
+        }
+        
+        // Show loans view
+        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+        document.getElementById('loansView').classList.add('active');
+        
+        // Toggle navbar visibility
+        toggleNavbarForView('loans');
+        
+        // Switch to "All PARKING" tab to show clean active transactions (no paid)
+        document.querySelectorAll('.loan-filter-tab').forEach(t => t.classList.remove('active'));
+        const allTab = document.querySelector('[data-status="all"]');
+        if (allTab) {
+          allTab.classList.add('active');
+        }
+        
+        // Load only active loans (pending + partial, excluding paid)
+        setTimeout(() => {
+          loadLoansView('active');
+        }, 500);
+      }, 1000);
+      
+      return;
+    } catch (error) {
+      console.error('Error processing parking payment:', error);
+      alert('Error processing parking payment: ' + error.message);
+      return;
+    }
+  }
+  
   const saleData = {
     subtotal,
     tax,
@@ -2716,6 +3382,9 @@ async function completeSale() {
   };
   
   try {
+    // Show payment processing on customer display
+    updateCustomerDisplayPayment(paymentMethod.toUpperCase());
+    
     const sale = await window.api.createSale(saleData);
     lastSalePaymentMethod = paymentMethod;
 
@@ -2729,6 +3398,22 @@ async function completeSale() {
 
     // Show receipt
     showReceipt(sale);
+
+    // For cash payments, show the 3-column summary like:
+    // TOTAL ENTREGA CAMBIO
+    //  1.20   5.00   3.80
+    if (paymentMethod === 'cash') {
+      await updateCustomerDisplayPaymentSummary(total, paymentAmount, changeAmount);
+      // Do not show 'Thank You' after payment summary; keep summary on display
+    } else if (changeAmount > 0) {
+      const currencySymbol = systemSettings?.currency_symbol || '€';
+      await updateCustomerDisplayChange(changeAmount, currencySymbol);
+      setTimeout(() => {
+        updateCustomerDisplayThankYou(changeAmount);
+      }, 3000);
+    } else {
+      updateCustomerDisplayThankYou(changeAmount);
+    }
 
     // Clear cart
     cart = [];
@@ -2906,6 +3591,15 @@ function openLoanModal(total, subtotal, tax) {
   modal.dataset.total = total;
   modal.dataset.subtotal = subtotal;
   modal.dataset.tax = tax;
+
+  // Ensure restaurant-only fields (including Parking Mode) are shown/hidden
+  // based on the current selection, even if the user previously selected it.
+  setTimeout(() => {
+    const typeSelect = document.getElementById('loanCustomerType');
+    if (typeSelect) {
+      typeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }, 0);
 }
 
 // ============== NOTE FUNCTIONS ==============
@@ -2926,11 +3620,15 @@ function openNoteModal() {
   }, 100);
 }
 
-async function completeLoanSale(customerType, customerName, customerPhone, restaurantName, restaurantNie, notes) {
+async function completeLoanSale(customerType, customerName, customerPhone, restaurantName, restaurantNie, notes, parkingMode = 'append', targetLoanId = null) {
   const modal = document.getElementById('loanModal');
   const total = parseFloat(modal.dataset.total);
   const subtotal = parseFloat(modal.dataset.subtotal);
   const tax = parseFloat(modal.dataset.tax);
+
+  const parkingModeNormalized = (parkingMode || document.querySelector('input[name="loanParkingMode"]:checked')?.value || 'append')
+    .toString()
+    .toLowerCase();
   
   // Generate unique receipt number
   const receiptNumber = generateReceiptNumber();
@@ -2949,14 +3647,15 @@ async function completeLoanSale(customerType, customerName, customerPhone, resta
     discount: totalDiscountAmount,
     total,
     paymentMethod: 'loan',
+    paymentAmount: 0,
+    changeAmount: 0,
     cashierId: currentUser.id,
-    items: cart
+    notes: null
   };
   
   try {
-    const sale = await window.api.createSale(saleData);
-    
-    // Create the loan record
+    // Create or append to an existing restaurant parking tab in the backend.
+    // (If a matching active restaurant loan exists, the backend will merge items into it.)
     const loanData = {
       receiptNumber,
       customerType,
@@ -2964,19 +3663,42 @@ async function completeLoanSale(customerType, customerName, customerPhone, resta
       customerPhone: customerPhone || null,
       restaurantName: restaurantName || null,
       restaurantNie: restaurantNie || null,
-      saleId: sale.id,
-      loanAmount: total,
       cashierId: currentUser.id,
-      notes: notes || null
+      notes: notes || null,
+      mergeMode: parkingModeNormalized,
+      targetLoanId: Number.isFinite(targetLoanId) ? targetLoanId : null,
+      sale: saleData,
+      items: cart
     };
-    
+
     const loan = await window.api.createLoan(loanData);
+
+    if (loan?.merged) {
+      showAlert(`Added to existing PARKING for ${restaurantName || customerName}`, 'success');
+    } else {
+      showAlert('PARKING created successfully', 'success');
+    }
     
-    // Show loan receipt
-    showLoanReceipt(sale, loan);
+    // Show loan receipt - DISABLED to prevent automatic printing for parking
+    // showLoanReceipt(sale, loan);
     
     // Clear cart
     cart = [];
+
+    // Reset any leftover payment inputs so the summary doesn't keep showing
+    // a previous amount (e.g., after creating PARKING, total becomes 0 but
+    // payment input might still display the last value).
+    const paymentInput = document.getElementById('paymentInput');
+    if (paymentInput) paymentInput.value = '';
+    const cashPaidInput = document.getElementById('cashPaidInput');
+    if (cashPaidInput) cashPaidInput.value = '';
+    const splitCashAmount = document.getElementById('splitCashAmount');
+    if (splitCashAmount) splitCashAmount.value = '';
+    const splitCardAmount = document.getElementById('splitCardAmount');
+    if (splitCardAmount) splitCardAmount.value = '';
+    selectedPaymentMethod = null;
+    paymentMode = 'single';
+
     updateCartDisplay();
     
     // Close loan modal
@@ -2986,7 +3708,7 @@ async function completeLoanSale(customerType, customerName, customerPhone, resta
     await loadAllProducts();
     displayQuickProducts();
   } catch (error) {
-    alert('Error creating Parking order: ' + error.message);
+    showAlert('Error creating Parking order: ' + error.message, 'error');
   }
 }
 
@@ -3068,6 +3790,156 @@ function showLoanReceipt(sale, loan) {
   `;
   
   modal.classList.add('active');
+}
+
+// Function to complete parking payment from checkout page
+async function completeLoanPaymentFromCheckout(receiptNumber, amount, paymentMethod) {
+  try {
+    // Get the loan by receipt number
+    const loan = await window.api.getLoanByReceipt(receiptNumber);
+    
+    if (!loan) {
+      throw new Error('PARKING not found with this receipt number');
+    }
+    
+    if (loan.status === 'paid') {
+      throw new Error('This PARKING has already been paid in full');
+    }
+    
+    // Process the payment
+    const paymentData = {
+      amount: parseFloat(amount.toFixed(2)), // Ensure proper precision
+      paymentMethod,
+      cashierId: currentUser.id
+    };
+    
+    console.log('Processing loan payment:', {
+      loanId: loan.id,
+      remainingAmount: loan.remaining_amount,
+      paymentAmount: paymentData.amount,
+      willBePaid: loan.remaining_amount <= paymentData.amount
+    });
+    
+    const result = await window.api.payLoan(loan.id, paymentData);
+    
+    console.log('Loan payment result:', result);
+    
+    // Print receipt immediately at payment time
+    await printLoanPaymentReceipt({ loanBefore: loan, loanAfter: result, amount, paymentMethod });
+    
+    // If cash payment, open cash drawer
+    if (paymentMethod === 'cash') {
+      await openCashDrawer();
+    }
+
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    
+    // Show success message
+    if (result.status === 'paid') {
+      showAlert('PARKING payment completed successfully!', 'success');
+    } else if (result.status === 'partial') {
+      showAlert(`Partial payment completed. Remaining: ${currencySymbol}${result.remaining_amount.toFixed(2)}`, 'success');
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error completing loan payment from checkout:', error);
+    throw error;
+  }
+}
+
+// Function to handle parking payment in checkout page
+async function payParkingInCheckout(receiptNumber, remainingAmount) {
+  try {
+    // Store parking payment info for checkout
+    sessionStorage.setItem('parkingPayment', JSON.stringify({
+      receiptNumber: receiptNumber,
+      amount: remainingAmount,
+      timestamp: Date.now()
+    }));
+    
+    // Navigate to checkout page using the correct method
+    // Update active nav button
+    const navBtns = document.querySelectorAll('.tab-btn');
+    navBtns.forEach(b => b.classList.remove('active'));
+    const targetBtn = document.querySelector('[data-view="checkout"]');
+    if (targetBtn) {
+      targetBtn.classList.add('active');
+    }
+    
+    // Show checkout view
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById('checkoutView').classList.add('active');
+    
+    // Toggle navbar visibility for checkout
+    toggleNavbarForView('checkout');
+    
+    // Load checkout view data
+    loadViewData('checkout');
+    
+    // Automatically select card payment and set amount
+    setTimeout(async () => {
+      try {
+        // Get the original parking/loan details to show individual items
+        const loan = await window.api.getLoanByReceipt(receiptNumber);
+        if (loan && loan.sale && loan.sale.items) {
+          // Use the original sale items from the parking transaction
+          cart = loan.sale.items.map(item => ({
+            productId: item.product_id || `parking_item_${Date.now()}_${Math.random()}`,
+            productName: item.product_name || 'Parking Item',
+            unitPrice: item.price || (item.subtotal / item.quantity),
+            taxRate: item.tax_rate || 0,
+            quantity: item.quantity || 1,
+            subtotal: item.subtotal || item.price || 0,
+            isWeightBased: item.unit_type === 'weight',
+            cartItemId: Date.now() + Math.random(), // Unique ID for each item
+            discountPercent: 0
+          }));
+        } else {
+          // Fallback to single parking payment item if we can't get original items
+          cart = [{
+            productId: 'parking_payment',
+            productName: `PARKING Payment #${receiptNumber}`,
+            unitPrice: remainingAmount,
+            taxRate: 0,
+            quantity: 1,
+            subtotal: remainingAmount,
+            isWeightBased: false,
+            cartItemId: Date.now(),
+            discountPercent: 0
+          }];
+        }
+      } catch (error) {
+        console.error('Error fetching parking details:', error);
+        // Fallback to single parking payment item
+        cart = [{
+          productId: 'parking_payment',
+          productName: `PARKING Payment #${receiptNumber}`,
+          unitPrice: remainingAmount,
+          taxRate: 0,
+          quantity: 1,
+          subtotal: remainingAmount,
+          isWeightBased: false,
+          cartItemId: Date.now(),
+          discountPercent: 0
+        }];
+      }
+      
+      updateCartDisplay();
+      
+      // Auto-open payment modal and select card
+      document.getElementById('paymentBtn')?.click();
+      
+      setTimeout(() => {
+        // Auto-select card payment
+        document.querySelector('[data-value="card"]')?.click();
+      }, 100);
+    }, 200);
+    
+  } catch (error) {
+    console.error('Error redirecting to parking payment:', error);
+    alert('Error processing parking payment: ' + error.message);
+  }
 }
 
 async function searchLoanByReceipt(receiptNumber) {
@@ -3235,6 +4107,18 @@ async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentM
       systemSettings = await window.api.getSystemSettings();
     }
 
+    // Ensure tax/category info is available for the standard receipt format.
+    try {
+      if (!Array.isArray(allProducts) || allProducts.length === 0) {
+        allProducts = await window.api.getAllProducts();
+      }
+      if (!Array.isArray(allCategories) || allCategories.length === 0) {
+        allCategories = await window.api.getAllCategories();
+      }
+    } catch {
+      // If this fails, we still print a receipt (taxBreakdown may be empty).
+    }
+
     const currencySymbol = systemSettings?.currency_symbol || '€';
     const printerName = (systemSettings?.printer_name || '').toString().toLowerCase();
     const looks80mm = printerName.includes('80mm')
@@ -3251,33 +4135,91 @@ async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentM
     const before = loanBefore || {};
     const after = loanAfter || {};
 
+    // STANDARD RECEIPT FORMAT (same as cash/card)
+    const loanReceiptNumber = after.receipt_number ?? before.receipt_number ?? '';
+    const amountPaid = Number(amount ?? 0);
+    const remainingAfter = Number(after.remaining_amount ?? 0);
+    const loanTotal = Number(after.loan_amount ?? before.loan_amount ?? 0);
+    const status = (after.status ?? before.status ?? '').toString().toLowerCase();
+    const isPartial = status === 'partial' || (Number.isFinite(remainingAfter) && remainingAfter > 0.009);
+
+    const sale = after.sale || before.sale || null;
+    const saleItems = Array.isArray(sale?.items) ? sale.items : [];
+
+    // If it's a partial payment, print a simple standard receipt for the amount paid.
+    // (A full-item invoice would be confusing if only part of the total was paid.)
+    const itemsForReceipt = isPartial
+      ? [{ name: `PARKING Payment #${loanReceiptNumber}`, quantity: 1, unitPrice: amountPaid, discountPercent: 0, subtotal: amountPaid }]
+      : (saleItems.length
+        ? saleItems.map((it) => ({
+            name: it.product_name ?? it.name ?? 'Item',
+            quantity: Number(it.quantity ?? 1),
+            unitPrice: Number(it.unit_price ?? it.unitPrice),
+            discountPercent: Number(it.discount_percent ?? it.discountPercent ?? 0),
+            subtotal: Number(it.subtotal ?? 0),
+            productId: it.product_id ?? it.productId,
+            taxRate: it.tax_rate ?? it.taxRate
+          }))
+        : [{ name: `PARKING Payment #${loanReceiptNumber}`, quantity: 1, unitPrice: loanTotal || amountPaid, discountPercent: 0, subtotal: loanTotal || amountPaid }]);
+
+    const total = isPartial ? amountPaid : (Number(sale?.total ?? 0) || itemsForReceipt.reduce((sum, i) => sum + Number(i.subtotal || 0), 0));
+
+    // Build tax breakdown similar to standard receipts.
+    const taxBreakdown = {};
+    if (!isPartial) {
+      for (const item of itemsForReceipt) {
+        const subtotal = Number(item.subtotal || 0);
+        if (!Number.isFinite(subtotal) || subtotal <= 0) continue;
+
+        let taxRate = Number(item.taxRate);
+        if (!Number.isFinite(taxRate)) {
+          const pid = item.productId;
+          const product = allProducts.find(p => p.id === pid);
+          const category = product ? allCategories.find(c => c.name === product.category) : null;
+          taxRate = category ? Number(category.tax_rate) : 0;
+        }
+        if (!Number.isFinite(taxRate) || taxRate < 0) taxRate = 0;
+
+        const taxRatePercent = Math.round(taxRate * 100);
+        const basePrice = subtotal / (1 + taxRate);
+        const taxAmount = subtotal - basePrice;
+
+        if (!taxBreakdown[taxRatePercent]) taxBreakdown[taxRatePercent] = { base: 0, tax: 0, total: 0 };
+        taxBreakdown[taxRatePercent].base += basePrice;
+        taxBreakdown[taxRatePercent].tax += taxAmount;
+        taxBreakdown[taxRatePercent].total += subtotal;
+      }
+    }
+
+    const taxBreakdownRows = Object.keys(taxBreakdown)
+      .map(r => parseInt(r, 10))
+      .filter(r => Number.isFinite(r))
+      .sort((a, b) => a - b)
+      .map(rate => ({
+        rate,
+        base: taxBreakdown[rate].base,
+        tax: taxBreakdown[rate].tax,
+        total: taxBreakdown[rate].total
+      }));
+
+    // Standard receipt payload: DO NOT send type='loanPayment' (that triggers the special Parking-only format).
     const receiptData = {
-      type: 'loanPayment',
       storeName: systemSettings?.store_name || 'SUPERMARKET POS',
       ownerName: systemSettings?.owner_name || '',
       nieNumber: systemSettings?.nie_number || '',
       companyAddress: systemSettings?.company_address || '',
-      currency: currencySymbol,
       lineWidth: looks80mm ? 48 : undefined,
 
-      date: new Date().toLocaleString('es-ES'),
-      paymentReceiptNumber: `P${Date.now()}`,
-
-      loanId: after.id ?? before.id,
-      loanReceiptNumber: after.receipt_number ?? before.receipt_number,
-      customerType: after.customer_type ?? before.customer_type,
-      customerName: after.customer_name ?? before.customer_name,
-      customerPhone: after.customer_phone ?? before.customer_phone,
-      restaurantName: after.restaurant_name ?? before.restaurant_name,
-      restaurantNie: after.restaurant_nie ?? before.restaurant_nie,
-
-      loanTotal: Number(after.loan_amount ?? before.loan_amount ?? 0),
-      remainingBefore: Number(before.remaining_amount ?? 0),
-      remainingAfter: Number(after.remaining_amount ?? 0),
-      paidAmountTotal: Number(after.paid_amount ?? 0),
-      amountPaid: Number(amount ?? 0),
+      receiptId: loanReceiptNumber,
+      date: new Date().toLocaleString(),
+      items: itemsForReceipt,
+      taxBreakdown: taxBreakdownRows,
+      total,
       paymentMethod,
-      status: after.status ?? before.status,
+      paymentAmount: amountPaid || total,
+      changeAmount: 0,
+      currency: currencySymbol,
+      footer: systemSettings?.receipt_footer || 'Thank you for shopping with us!',
       cashier: currentUser?.full_name || ''
     };
 
@@ -3338,6 +4280,7 @@ async function completeLoanPayment(loanOrId, amount, paymentMethod) {
 async function loadLoansView(status = null) {
   const loans = await window.api.getAllLoans(status);
   const tbody = document.querySelector('#loansTable tbody');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   if (loans.length === 0) {
     tbody.innerHTML = '<tr><td colspan="10" class="empty-state"><div class="icon">💳</div><p>No Parking orders found</p></td></tr>';
@@ -3345,7 +4288,9 @@ async function loadLoansView(status = null) {
   }
   
   tbody.innerHTML = loans.map(loan => {
-    const loanDate = new Date(loan.loan_date);
+    const loanDate = (loan.status === 'paid' && loan.paid_date)
+      ? new Date(loan.paid_date)
+      : new Date(loan.loan_date);
     let statusClass = 'status-pending';
     if (loan.status === 'paid') statusClass = 'status-paid';
     else if (loan.status === 'partial') statusClass = 'status-partial';
@@ -3361,17 +4306,70 @@ async function loadLoansView(status = null) {
         <td>${customerType}</td>
         <td>${displayName}</td>
         <td>${loan.customer_phone || '-'}</td>
-        <td>$${loan.loan_amount.toFixed(2)}</td>
-        <td>$${loan.paid_amount.toFixed(2)}</td>
-        <td>$${loan.remaining_amount.toFixed(2)}</td>
+        <td>${currencySymbol}${loan.loan_amount.toFixed(2)}</td>
+        <td>${currencySymbol}${loan.paid_amount.toFixed(2)}</td>
+        <td>${currencySymbol}${loan.remaining_amount.toFixed(2)}</td>
         <td><span class="status-badge ${statusClass}">${loan.status.toUpperCase()}</span></td>
         <td>${loanDate.toLocaleDateString()}</td>
         <td>
-          ${loan.status !== 'paid' ? `<button class="btn-action" onclick="searchLoanByReceipt('${loan.receipt_number}')">Pay</button>` : '-'}
+          ${loan.status !== 'paid'
+            ? `<button class="btn-action" onclick="payParkingInCheckout('${loan.receipt_number}', ${loan.remaining_amount})">Pay</button>`
+            : (loan.sale_id
+              ? `
+                <button class="btn-action" onclick="viewParkingBillForLoan(${loan.sale_id})" title="View">👁️</button>
+                <button class="btn-action" onclick="printParkingBillForLoan(${loan.sale_id})" title="Print">🖨️</button>
+              `
+              : '-')}
         </td>
       </tr>
     `;
   }).join('');
+}
+
+function normalizePaidParkingSaleForReceipt(sale) {
+  if (!sale) return sale;
+  const normalized = { ...sale };
+  const paymentMethod = (normalized.payment_method || '').toString().toLowerCase();
+  const loanStatus = (normalized.loan_status || '').toString().toLowerCase();
+  const loanPaymentMethod = (normalized.loan_payment_method || '').toString().toLowerCase();
+
+  // Paid PARKING: show the settlement method (cash/card) instead of "loan".
+  if (paymentMethod === 'loan' && loanStatus === 'paid' && (loanPaymentMethod === 'cash' || loanPaymentMethod === 'card')) {
+    normalized.payment_method = loanPaymentMethod;
+    normalized.payment_amount = Number(normalized.total || 0);
+    normalized.change_amount = 0;
+    if (normalized.loan_paid_date) {
+      normalized.sale_date = normalized.loan_paid_date;
+    }
+  }
+
+  return normalized;
+}
+
+async function viewParkingBillForLoan(saleId) {
+  try {
+    const fullSale = await window.api.getSaleById(Number(saleId));
+    if (!fullSale) {
+      showAlert('Sale not found', 'error');
+      return;
+    }
+    showReceipt(normalizePaidParkingSaleForReceipt(fullSale));
+  } catch (error) {
+    showAlert('Failed to load bill: ' + error.message, 'error');
+  }
+}
+
+async function printParkingBillForLoan(saleId) {
+  try {
+    const fullSale = await window.api.getSaleById(Number(saleId));
+    if (!fullSale) {
+      showAlert('Sale not found', 'error');
+      return;
+    }
+    await printReceiptToThermalPrinter(normalizePaidParkingSaleForReceipt(fullSale));
+  } catch (error) {
+    showAlert('Failed to print bill: ' + error.message, 'error');
+  }
 }
 
 // ============== PRODUCTS VIEW ==============
@@ -3698,32 +4696,197 @@ async function saveProduct() {
 // ============== SALES VIEW ==============
 let allSalesData = [];
 let currentPaymentFilter = 'all';
+let currentSalesFilter = { type: 'today', data: null };
+
+function isPaidLoanSale(sale) {
+  return (sale?.payment_method === 'loan')
+    && ((sale?.loan_status || '').toString().toLowerCase() === 'paid')
+    && !!sale?.loan_payment_method;
+}
+
+function getDisplayPaymentMethod(sale) {
+  return isPaidLoanSale(sale) ? sale.loan_payment_method : sale.payment_method;
+}
+
+function saleMatchesPaymentFilter(sale, filter) {
+  if (!filter || filter === 'all') {
+    // In Sales History, the default "All" view should show only paid transactions.
+    // Unpaid PARKING (loan) tabs are not settled yet, so hide them here.
+    if ((sale?.payment_method || '').toString().toLowerCase() === 'loan') {
+      return isPaidLoanSale(sale);
+    }
+    return true;
+  }
+
+  // Parking filter = original loan-origin sales
+  if (filter === 'loan') {
+    return sale?.payment_method === 'loan';
+  }
+
+  // Cash/Card filters include paid Parking based on settlement method
+  if (filter === 'cash' || filter === 'card') {
+    if (sale?.payment_method === filter) return true;
+    return isPaidLoanSale(sale) && sale.loan_payment_method === filter;
+  }
+
+  return sale?.payment_method === filter;
+}
 
 async function loadSalesView() {
-  const today = await window.api.getTodaySales();
-  allSalesData = today.sales;
+  // Initialize with today's sales
+  await loadSalesByDateFilter('today');
   
-  // Display summary
-  updateSalesSummary(today.summary);
+  // Setup date filter handlers
+  setupDateFilters();
   
-  // Display filtered sales
-  displayFilteredSales();
+  // Set initial dropdown value
+  const dateFilterSelect = document.getElementById('salesDateFilter');
+  if (dateFilterSelect) {
+    dateFilterSelect.value = 'today';
+  }
+  
+  // Hide custom date range initially
+  const customDateRange = document.getElementById('customDateRange');
+  if (customDateRange) {
+    customDateRange.style.display = 'none';
+  }
   
   // Add filter button handlers
   setupPaymentFilters();
   
   // Add print button handler
-  const printBtn = document.getElementById('printTodaySalesBtn');
+  const printBtn = document.getElementById('printSalesBtn');
   if (printBtn) {
-    printBtn.onclick = () => printTodaySales(today);
+    printBtn.onclick = () => printFilteredSales();
   }
 }
 
-function updateSalesSummary(summary) {
+async function loadSalesByDateFilter(filterType, startDate = null, endDate = null) {
+  let salesData;
+  
+  console.log('Loading sales for filter type:', filterType);
+  
+  switch (filterType) {
+    case 'today':
+      salesData = await window.api.getTodaySales();
+      console.log('Today sales data:', salesData);
+      currentSalesFilter = { type: 'today', data: salesData };
+      break;
+    case 'yesterday':
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = yesterday.toISOString().split('T')[0];
+      salesData = await window.api.getSalesByDateRange(yesterdayStr, yesterdayStr);
+      currentSalesFilter = { type: 'yesterday', data: salesData, startDate: yesterdayStr, endDate: yesterdayStr };
+      break;
+    case 'week':
+      const currentDate = new Date();
+      const dayOfWeek = currentDate.getDay(); // 0 = Sunday, 1 = Monday, etc.
+      const weekStartDate = new Date(currentDate);
+      weekStartDate.setDate(currentDate.getDate() - dayOfWeek); // Go to Sunday of this week
+      const weekEndDate = new Date(currentDate);
+      console.log('Week filter - Start:', weekStartDate.toISOString().split('T')[0], 'End:', weekEndDate.toISOString().split('T')[0]);
+      salesData = await window.api.getSalesByDateRange(
+        weekStartDate.toISOString().split('T')[0],
+        weekEndDate.toISOString().split('T')[0]
+      );
+      console.log('Week sales data:', salesData);
+      currentSalesFilter = { type: 'week', data: salesData, startDate: weekStartDate.toISOString().split('T')[0], endDate: weekEndDate.toISOString().split('T')[0] };
+      break;
+    case 'month':
+      const today = new Date();
+      const monthStartDate = new Date(today.getFullYear(), today.getMonth(), 1);
+      const monthEndDate = new Date(today);
+      salesData = await window.api.getSalesByDateRange(
+        monthStartDate.toISOString().split('T')[0],
+        monthEndDate.toISOString().split('T')[0]
+      );
+      currentSalesFilter = { type: 'month', data: salesData, startDate: monthStartDate.toISOString().split('T')[0], endDate: monthEndDate.toISOString().split('T')[0] };
+      break;
+    case 'year':
+      const todayDate = new Date();
+      const yearStartDate = new Date(todayDate.getFullYear(), 0, 1); // January 1st of current year
+      const yearEndDate = new Date(todayDate);
+      console.log('Year filter - Start:', yearStartDate.toISOString().split('T')[0], 'End:', yearEndDate.toISOString().split('T')[0]);
+      salesData = await window.api.getSalesByDateRange(
+        yearStartDate.toISOString().split('T')[0],
+        yearEndDate.toISOString().split('T')[0]
+      );
+      console.log('Year sales data:', salesData);
+      currentSalesFilter = { type: 'year', data: salesData, startDate: yearStartDate.toISOString().split('T')[0], endDate: yearEndDate.toISOString().split('T')[0] };
+      break;
+    case 'custom':
+      if (!startDate || !endDate) return;
+      salesData = await window.api.getSalesByDateRange(startDate, endDate);
+      currentSalesFilter = { type: 'custom', data: salesData, startDate, endDate };
+      break;
+    default:
+      salesData = await window.api.getTodaySales();
+      currentSalesFilter = { type: 'today', data: salesData };
+  }
+  
+  allSalesData = salesData.sales || [];
+  
+  // Update summary
+  updateSalesSummary(salesData.summary || calculateSummary(allSalesData), filterType);
+  
+  // Display filtered sales
+  displayFilteredSales();
+}
+
+function setupDateFilters() {
+  const dateFilterSelect = document.getElementById('salesDateFilter');
+  const customDateRange = document.getElementById('customDateRange');
+  const applyBtn = document.getElementById('applySalesDateFilter');
+  
+  if (dateFilterSelect) {
+    dateFilterSelect.addEventListener('change', (e) => {
+      if (e.target.value === 'custom') {
+        customDateRange.style.display = 'flex';
+      } else {
+        customDateRange.style.display = 'none';
+        loadSalesByDateFilter(e.target.value);
+      }
+    });
+  }
+  
+  if (applyBtn) {
+    applyBtn.addEventListener('click', () => {
+      const startDate = document.getElementById('salesStartDate').value;
+      const endDate = document.getElementById('salesEndDate').value;
+      if (startDate && endDate) {
+        loadSalesByDateFilter('custom', startDate, endDate);
+      } else {
+        alert('Please select both start and end dates');
+      }
+    });
+  }
+}
+
+function calculateSummary(sales) {
+  return {
+    transaction_count: sales.length,
+    total_sales: sales.reduce((sum, sale) => sum + (sale.total || 0), 0),
+    subtotal: sales.reduce((sum, sale) => sum + (sale.subtotal || 0), 0),
+    tax: sales.reduce((sum, sale) => sum + (sale.tax || 0), 0)
+  };
+}
+
+function updateSalesSummary(summary, filterType = 'today') {
   const summaryDiv = document.getElementById('todaySummary');
   const currencySymbol = systemSettings?.currency_symbol || '€';
+  
+  let periodText = 'Today\'s';
+  switch (filterType) {
+    case 'yesterday': periodText = 'Yesterday\'s'; break;
+    case 'week': periodText = 'This Week\'s'; break;
+    case 'month': periodText = 'This Month\'s'; break;
+    case 'year': periodText = 'This Year\'s'; break;
+    case 'custom': periodText = 'Filtered'; break;
+  }
+  
   summaryDiv.innerHTML = `
-    Today's Sales: <strong>${summary.transaction_count}</strong> transactions | 
+    ${periodText} Sales: <strong>${summary.transaction_count}</strong> transactions | 
     Total: <strong>${currencySymbol}${(summary.total_sales || 0).toFixed(2)}</strong>
   `;
 }
@@ -3750,8 +4913,14 @@ async function displayFilteredSales() {
   // Filter sales based on payment method
   let filteredSales = allSalesData;
   if (currentPaymentFilter !== 'all') {
-    filteredSales = allSalesData.filter(sale => sale.payment_method === currentPaymentFilter);
+    filteredSales = allSalesData.filter(sale => saleMatchesPaymentFilter(sale, currentPaymentFilter));
+  } else {
+    // Apply "All" logic too (hide unpaid loans)
+    filteredSales = allSalesData.filter(sale => saleMatchesPaymentFilter(sale, 'all'));
   }
+
+  // Keep the summary in sync with what the table shows
+  updateSalesSummary(calculateSummary(filteredSales), currentSalesFilter?.type || 'today');
   
   if (filteredSales.length === 0) {
     tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="icon">💰</div><p>No sales found</p></td></tr>';
@@ -3770,6 +4939,8 @@ async function displayFilteredSales() {
     const date = new Date(sale.sale_date);
     const itemsList = sale.items.map(item => `${item.product_name} (${item.quantity})`).join(', ');
     const itemsShort = itemsList.length > 50 ? itemsList.substring(0, 50) + '...' : itemsList;
+
+    const displayMethod = getDisplayPaymentMethod(sale);
     
     return `
       <tr>
@@ -3780,7 +4951,7 @@ async function displayFilteredSales() {
         <td>${currencySymbol}${sale.subtotal.toFixed(2)}</td>
         <td>${currencySymbol}${sale.tax.toFixed(2)}</td>
         <td style="font-weight: 700;">${currencySymbol}${sale.total.toFixed(2)}</td>
-        <td><span class="payment-badge payment-${sale.payment_method}">${sale.payment_method.toUpperCase()}</span></td>
+        <td><span class="payment-badge payment-${displayMethod}">${String(displayMethod || '').toUpperCase()}</span></td>
         <td>
           <button class="action-btn" onclick="viewSale(${sale.id})" title="View">👁️</button>
         </td>
@@ -3792,6 +4963,382 @@ async function displayFilteredSales() {
 async function viewSale(id) {
   const sale = await window.api.getSaleById(id);
   showReceipt(sale);
+}
+
+function printFilteredSales() {
+  if (!currentSalesFilter?.data) {
+    alert('No sales data to print. Please load sales data first.');
+    return;
+  }
+
+  // Print in Z-report style (thermal/raw)
+  printSalesHistoryThermal();
+}
+
+function getFilteredSales() {
+  return allSalesData.filter(sale => saleMatchesPaymentFilter(sale, currentPaymentFilter));
+}
+
+async function printSalesHistoryThermal() {
+  try {
+    if (!systemSettings) {
+      systemSettings = await window.api.getSystemSettings();
+    }
+
+    const settings = systemSettings;
+    const currencySymbol = settings?.currency_symbol || '€';
+    const printerName = (settings?.printer_name || '').toString().toLowerCase();
+
+    const inferLineWidth = (printer) => {
+      const name = String(printer || '').toLowerCase();
+      const looks80mm = name.includes('80mm')
+        || name.includes('80 mm')
+        || name.includes('posprinter')
+        || name.includes('pos-80')
+        || name.includes('pos 80')
+        || name.includes('easy 80')
+        || name.includes('tp easy 80')
+        || name.includes('tp7001')
+        || name.includes('tp 7001')
+        || name.includes('iggual')
+        || name.includes('tm-t20')
+        || name.includes('tm t20')
+        || name.includes('tm-t88')
+        || name.includes('tm t88');
+      return looks80mm ? 48 : 32;
+    };
+
+    const LINE_WIDTH = inferLineWidth(printerName);
+
+    const padRight = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(0, length) : text + ' '.repeat(length - text.length);
+    };
+
+    const padLeft = (value, length) => {
+      const text = String(value ?? '');
+      return text.length >= length ? text.slice(text.length - length) : ' '.repeat(length - text.length) + text;
+    };
+
+    const center = (value) => {
+      const text = String(value ?? '');
+      if (text.length >= LINE_WIDTH) return text.slice(0, LINE_WIDTH);
+      const left = Math.floor((LINE_WIDTH - text.length) / 2);
+      return ' '.repeat(left) + text;
+    };
+
+    const rightLabelValue = (label, value, fillChar = '.') => {
+      const labelText = String(label);
+      const valueText = String(value);
+      const gap = Math.max(1, LINE_WIDTH - labelText.length - valueText.length);
+      return labelText + fillChar.repeat(gap) + valueText;
+    };
+
+    const formatMoney = (amount) => {
+      const num = Number(amount || 0);
+      return num.toFixed(2).replace('.', ',') + currencySymbol;
+    };
+
+    const now = new Date();
+    const time = now.toLocaleTimeString('es-ES');
+
+    // Determine title + date range
+    let reportTitle = 'VENTAS';
+    let dateRange = '';
+    switch (currentSalesFilter?.type) {
+      case 'today':
+        reportTitle = 'VENTAS (HOY)';
+        dateRange = now.toLocaleDateString('es-ES');
+        break;
+      case 'yesterday': {
+        reportTitle = 'VENTAS (AYER)';
+        const d = new Date(now);
+        d.setDate(d.getDate() - 1);
+        dateRange = d.toLocaleDateString('es-ES');
+        break;
+      }
+      case 'week':
+        reportTitle = 'VENTAS (SEMANA)';
+        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        break;
+      case 'month':
+        reportTitle = 'VENTAS (MES)';
+        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        break;
+      case 'year':
+        reportTitle = 'VENTAS (ANO)';
+        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        break;
+      case 'custom':
+        reportTitle = 'VENTAS (RANGO)';
+        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        break;
+      default:
+        reportTitle = 'VENTAS';
+        dateRange = now.toLocaleDateString('es-ES');
+    }
+
+    if (currentPaymentFilter && currentPaymentFilter !== 'all') {
+      const suffix = currentPaymentFilter === 'loan' ? 'PARKING'
+        : currentPaymentFilter.toUpperCase();
+      reportTitle += ` (${suffix})`;
+    }
+
+    const filteredSales = getFilteredSales();
+    const totals = {
+      total: 0,
+      subtotal: 0,
+      tax: 0,
+      cash: 0,
+      card: 0,
+      split: 0,
+      parkingOpen: 0,
+      parkingPaid: 0,
+      count: filteredSales.length
+    };
+
+    for (const sale of filteredSales) {
+      const total = Number(sale?.total || 0);
+      const subtotal = Number(sale?.subtotal || 0);
+      const tax = Number(sale?.tax || 0);
+      totals.total += total;
+      totals.subtotal += subtotal;
+      totals.tax += tax;
+      const method = (getDisplayPaymentMethod(sale) || '').toString().toLowerCase();
+
+      if (method === 'cash') totals.cash += total;
+      else if (method === 'card') totals.card += total;
+      else if ((sale?.payment_method || '').toString().toLowerCase() === 'split') totals.split += total;
+      else if ((sale?.payment_method || '').toString().toLowerCase() === 'loan') {
+        // Outstanding parking (not yet paid)
+        const st = (sale?.loan_status || '').toString().toLowerCase();
+        if (st === 'paid') totals.parkingPaid += total;
+        else totals.parkingOpen += total;
+      }
+    }
+
+    const ESC = '\x1B';
+    const GS = '\x1D';
+    let receipt = '';
+    receipt += ESC + '@';
+
+    receipt += center((settings?.store_name || 'SUPERMARKET POS').toString().toUpperCase()) + '\n';
+    receipt += center(reportTitle) + '\n';
+    receipt += '='.repeat(LINE_WIDTH) + '\n';
+    receipt += `FECHA.....: ${dateRange}\n`;
+    receipt += `HORA......: ${time}\n`;
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    receipt += rightLabelValue('TRANSACCIONES', String(totals.count)) + '\n';
+    receipt += rightLabelValue('TOTAL', formatMoney(totals.total)) + '\n';
+    receipt += rightLabelValue('SUBTOTAL', formatMoney(totals.subtotal)) + '\n';
+    receipt += rightLabelValue('IMPUESTOS', formatMoney(totals.tax)) + '\n';
+    receipt += rightLabelValue('CASH', formatMoney(totals.cash)) + '\n';
+    receipt += rightLabelValue('CARD', formatMoney(totals.card)) + '\n';
+    if (totals.split > 0.009) {
+      receipt += rightLabelValue('SPLIT', formatMoney(totals.split)) + '\n';
+    }
+    if (totals.parkingOpen > 0.009) {
+      receipt += rightLabelValue('PARKING (OPEN)', formatMoney(totals.parkingOpen)) + '\n';
+    }
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    receipt += center('DETALLE') + '\n';
+    const timeWidth = LINE_WIDTH >= 42 ? 8 : 5; // HH:MM:SS / HH:MM
+    const payWidth = LINE_WIDTH >= 42 ? 6 : 5;
+    const amtWidth = LINE_WIDTH >= 42 ? 12 : 10;
+    const idWidth = Math.max(6, LINE_WIDTH - timeWidth - 1 - payWidth - 1 - amtWidth);
+
+    receipt += padRight('ID', idWidth) + ' '
+      + padRight('HORA', timeWidth)
+      + ' '
+      + padRight('PAGO', payWidth)
+      + ' '
+      + padLeft('IMP', amtWidth)
+      + '\n';
+    receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    const rows = filteredSales.slice(0, 60); // keep thermal output reasonable
+    for (const sale of rows) {
+      const id = String(sale?.id ?? '');
+      const dt = new Date(sale?.sale_date);
+      const t = Number.isNaN(dt.getTime())
+        ? ''
+        : (LINE_WIDTH >= 42 ? dt.toLocaleTimeString('es-ES') : dt.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }));
+      const method = (getDisplayPaymentMethod(sale) || '').toString().toUpperCase();
+      const amount = formatMoney(sale?.total || 0);
+
+      receipt += padRight(id, idWidth) + ' '
+        + padRight(t, timeWidth)
+        + ' '
+        + padRight(method.slice(0, payWidth), payWidth)
+        + ' '
+        + padLeft(amount, amtWidth)
+        + '\n';
+    }
+
+    if (filteredSales.length > rows.length) {
+      receipt += center(`... ${filteredSales.length - rows.length} MAS`) + '\n';
+    }
+
+    receipt += '\n';
+    receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(2);
+
+    const result = await window.api.printReceipt({ raw: true, text: receipt });
+    if (!result?.success) {
+      throw new Error(result?.error || 'Failed to print');
+    }
+  } catch (error) {
+    console.error('Error printing sales history:', error);
+    showAlert('Failed to print sales: ' + error.message, 'error', 'Print Error');
+  }
+}
+
+function printTodaySalesWithTitle(salesData, title, dateRange) {
+  const currency = systemSettings?.currency_symbol || '€';
+  const store = systemSettings?.store_name || 'SUPERMARKET POS';
+  
+  // Create print window
+  const printWindow = window.open('', '_blank');
+  
+  const printContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>${title}</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+          font-family: 'Segoe UI', Arial, sans-serif;
+          padding: 40px;
+          color: #1a202c;
+        }
+        .header {
+          text-align: center;
+          margin-bottom: 40px;
+          padding-bottom: 20px;
+          border-bottom: 3px solid #6E8FAF;
+        }
+        .header h1 {
+          font-size: 32px;
+          color: #6E8FAF;
+          margin-bottom: 10px;
+        }
+        .header h2 {
+          font-size: 24px;
+          color: #4a5568;
+          margin-bottom: 5px;
+        }
+        .header p {
+          font-size: 16px;
+          color: #718096;
+        }
+        .summary {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 20px;
+          margin-bottom: 40px;
+        }
+        .summary-card {
+          background: #f7fafc;
+          padding: 20px;
+          border-radius: 12px;
+          text-align: center;
+          border: 2px solid #e2e8f0;
+        }
+        .summary-card h3 {
+          color: #4a5568;
+          font-size: 14px;
+          margin-bottom: 8px;
+        }
+        .summary-card p {
+          color: #1a202c;
+          font-size: 24px;
+          font-weight: bold;
+        }
+        table {
+          width: 100%;
+          border-collapse: collapse;
+          margin-top: 20px;
+        }
+        th, td {
+          padding: 12px;
+          text-align: left;
+          border-bottom: 1px solid #e2e8f0;
+        }
+        th {
+          background: #6E8FAF;
+          color: white;
+          font-weight: 600;
+        }
+        @media print {
+          body { padding: 20px; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>${store.toUpperCase()}</h1>
+        <h2>${title}</h2>
+        <p>${dateRange}</p>
+        <p>Generated: ${new Date().toLocaleString()}</p>
+      </div>
+      
+      <div class="summary">
+        <div class="summary-card">
+          <h3>Total Sales</h3>
+          <p>${currency}${(salesData.summary.total_sales || 0).toFixed(2)}</p>
+        </div>
+        <div class="summary-card">
+          <h3>Transactions</h3>
+          <p>${salesData.summary.transaction_count || 0}</p>
+        </div>
+        <div class="summary-card">
+          <h3>Average Sale</h3>
+          <p>${currency}${((salesData.summary.total_sales || 0) / (salesData.summary.transaction_count || 1)).toFixed(2)}</p>
+        </div>
+        <div class="summary-card">
+          <h3>Tax Collected</h3>
+          <p>${currency}${(salesData.summary.tax || 0).toFixed(2)}</p>
+        </div>
+      </div>
+      
+      <table>
+        <thead>
+          <tr>
+            <th>Date/Time</th>
+            <th>Items</th>
+            <th>Subtotal</th>
+            <th>Tax</th>
+            <th>Total</th>
+            <th>Payment</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${salesData.sales.map(sale => `
+            <tr>
+              <td>${new Date(sale.sale_date).toLocaleString()}</td>
+              <td>${sale.items?.map(item => item.product_name + ' (' + item.quantity + ')').join(', ') || 'N/A'}</td>
+              <td>${currency}${(sale.subtotal || 0).toFixed(2)}</td>
+              <td>${currency}${(sale.tax || 0).toFixed(2)}</td>
+              <td><strong>${currency}${(sale.total || 0).toFixed(2)}</strong></td>
+              <td>${(sale.payment_method || 'unknown').toUpperCase()}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+      
+      <script>
+        window.onload = function() {
+          window.print();
+        }
+      </script>
+    </body>
+    </html>
+  `;
+  
+  printWindow.document.write(printContent);
+  printWindow.document.close();
 }
 
 function printTodaySales(todayData) {
@@ -5157,8 +6704,72 @@ async function loadSystemSettingsView() {
     document.getElementById('taxRate').value = (systemSettings.tax_rate * 100) || 0;
     document.getElementById('receiptFooter').value = systemSettings.receipt_footer || '';
     document.getElementById('printerName').value = systemSettings.printer_name || '';
+    // Customer display COM port (persisted)
+    await refreshCustomerDisplayPortOptions(systemSettings.customer_display_port || '');
   } catch (error) {
     alert('Error loading settings: ' + error.message);
+  }
+}
+
+async function refreshCustomerDisplayPortOptions(selectedPort = '') {
+  try {
+    const el = document.getElementById('customerDisplayPort');
+    if (!el) return;
+
+    // If the UI uses a text input (no dropdown), just set the value.
+    // Keep the old select-based behavior for backward compatibility.
+    const tag = (el.tagName || '').toUpperCase();
+    if (tag !== 'SELECT') {
+      el.value = (selectedPort || '').toString().trim().toUpperCase();
+      return;
+    }
+
+    const select = el;
+
+    // Preserve AUTO option
+    const current = (selectedPort || select.value || '').toString().trim().toUpperCase();
+    select.innerHTML = '';
+    const autoOpt = document.createElement('option');
+    autoOpt.value = '';
+    autoOpt.textContent = 'AUTO (recommended)';
+    select.appendChild(autoOpt);
+
+    if (!window.api || typeof window.api.listScalePorts !== 'function') {
+      select.value = '';
+      return;
+    }
+
+    const ports = await window.api.listScalePorts();
+    const comPorts = (ports || [])
+      .map(p => ({
+        path: (p?.path || '').toString().trim().toUpperCase(),
+        manufacturer: (p?.manufacturer || '').toString().trim()
+      }))
+      .filter(p => /^COM\d+$/.test(p.path))
+      .filter(p => !/^COM[12]$/.test(p.path));
+
+    comPorts.sort((a, b) => {
+      const na = Number(a.path.replace('COM', ''));
+      const nb = Number(b.path.replace('COM', ''));
+      return (na || 0) - (nb || 0);
+    });
+
+    for (const p of comPorts) {
+      const opt = document.createElement('option');
+      opt.value = p.path;
+      const hint = p.manufacturer ? ` (${p.manufacturer})` : '';
+      opt.textContent = `${p.path}${hint}`;
+      select.appendChild(opt);
+    }
+
+    // Select the saved/current value if present
+    if (current && Array.from(select.options).some(o => o.value === current)) {
+      select.value = current;
+    } else {
+      select.value = '';
+    }
+  } catch {
+    // ignore
   }
 }
 
@@ -5166,6 +6777,11 @@ function setupSystemSettingsHandlers() {
   document.getElementById('systemSettingsForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     await saveSystemSettings();
+  });
+
+  document.getElementById('refreshCustomerDisplayPortsBtn')?.addEventListener('click', async () => {
+    const current = (document.getElementById('customerDisplayPort')?.value || '').toString();
+    await refreshCustomerDisplayPortOptions(current);
   });
   
   // Setup logo upload handlers
@@ -5248,10 +6864,20 @@ async function saveSystemSettings() {
       currencyCode: document.getElementById('currencyCode').value,
       taxRate: parseFloat(document.getElementById('taxRate').value) / 100,
       receiptFooter: document.getElementById('receiptFooter').value,
-      printerName: document.getElementById('printerName').value
+      printerName: document.getElementById('printerName').value,
+      customerDisplayPort: (document.getElementById('customerDisplayPort')?.value || '').toString().trim().toUpperCase() || null
     };
     
     systemSettings = await window.api.updateSystemSettings(settings);
+
+    // Apply customer display port immediately so the COM is correct after restart.
+    try {
+      if (window.api && typeof window.api.setCustomerDisplayPreferredPort === 'function') {
+        await window.api.setCustomerDisplayPreferredPort(settings.customerDisplayPort || '');
+      }
+    } catch {
+      // ignore
+    }
     // Settings saved - no popup
     
     // Update logo in the app
@@ -5279,24 +6905,184 @@ async function updateSystemUI() {
 
 // ============== LOAN HANDLERS ==============
 function setupLoanHandlers() {
+  const loadExistingRestaurantParkings = async () => {
+    const selectEl = document.getElementById('loanExistingRestaurant');
+    const helpEl = document.getElementById('existingRestaurantHelp');
+    if (!selectEl) return;
+
+    selectEl.innerHTML = '';
+    if (helpEl) helpEl.textContent = 'Loading...';
+
+    try {
+      const loans = await window.api.getAllLoans('active');
+      const restaurants = (Array.isArray(loans) ? loans : [])
+        .filter(l => (l.customer_type || '').toString().toLowerCase() === 'restaurant')
+        .filter(l => (l.status || '').toString().toLowerCase() !== 'paid');
+
+      // Deduplicate by (restaurant_name + restaurant_nie)
+      const byKey = new Map();
+      for (const l of restaurants) {
+        const name = (l.restaurant_name || '').toString().trim();
+        if (!name) continue;
+        const nie = (l.restaurant_nie || '').toString().trim();
+        const key = (name.toLowerCase() + '|' + nie);
+        if (!byKey.has(key)) byKey.set(key, l);
+      }
+
+      const list = Array.from(byKey.values()).sort((a, b) => {
+        const an = (a.restaurant_name || '').toString().toLowerCase();
+        const bn = (b.restaurant_name || '').toString().toLowerCase();
+        return an.localeCompare(bn);
+      });
+
+      if (list.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = 'No active restaurant parkings found';
+        selectEl.appendChild(opt);
+        if (helpEl) helpEl.textContent = 'Choose “Create new parking” to start a new tab.';
+        return;
+      }
+
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = 'Select a restaurant...';
+      selectEl.appendChild(placeholder);
+
+      for (const l of list) {
+        const name = (l.restaurant_name || '').toString().trim();
+        const nie = (l.restaurant_nie || '').toString().trim();
+        const remaining = Number(l.remaining_amount || 0);
+        const currencySymbol = systemSettings?.currency_symbol || '€';
+        const label = `${name}${nie ? ' (' + nie + ')' : ''} — Remaining: ${currencySymbol}${remaining.toFixed(2)}`;
+        const opt = document.createElement('option');
+        opt.value = String(l.id);
+        opt.textContent = label;
+        opt.dataset.restaurantName = name;
+        opt.dataset.restaurantNie = nie;
+        opt.dataset.customerName = (l.customer_name || '').toString();
+        opt.dataset.customerPhone = (l.customer_phone || '').toString();
+        selectEl.appendChild(opt);
+      }
+
+      if (helpEl) helpEl.textContent = 'This will add the new purchase into the selected restaurant parking tab.';
+    } catch (e) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'Failed to load restaurants';
+      selectEl.appendChild(opt);
+      if (helpEl) helpEl.textContent = e?.message ? String(e.message) : 'Error loading restaurants';
+    }
+  };
+
+  const syncRestaurantParkingModeUi = async () => {
+    const type = document.getElementById('loanCustomerType')?.value;
+    const mode = document.querySelector('input[name="loanParkingMode"]:checked')?.value || 'append';
+
+    const existingField = document.getElementById('existingRestaurantSelectField');
+    const restaurantNameInput = document.getElementById('loanRestaurantName');
+    const restaurantNieInput = document.getElementById('loanRestaurantNie');
+    const customerNameInput = document.getElementById('loanCustomerName');
+    const customerPhoneInput = document.getElementById('loanCustomerPhone');
+
+    if (type !== 'restaurant') {
+      if (existingField) existingField.style.display = 'none';
+      return;
+    }
+
+    if (mode === 'append') {
+      if (existingField) existingField.style.display = 'block';
+      await loadExistingRestaurantParkings();
+
+      // In existing mode, restaurant fields are auto-filled from selection.
+      if (restaurantNameInput) {
+        restaurantNameInput.required = false;
+        restaurantNameInput.readOnly = true;
+      }
+      if (restaurantNieInput) restaurantNieInput.readOnly = true;
+      if (customerNameInput) customerNameInput.readOnly = true;
+      if (customerPhoneInput) customerPhoneInput.readOnly = true;
+    } else {
+      if (existingField) existingField.style.display = 'none';
+
+      if (restaurantNameInput) {
+        restaurantNameInput.required = true;
+        restaurantNameInput.readOnly = false;
+        restaurantNameInput.value = '';
+      }
+      if (restaurantNieInput) {
+        restaurantNieInput.readOnly = false;
+        restaurantNieInput.value = '';
+      }
+      if (customerNameInput) {
+        customerNameInput.readOnly = false;
+        customerNameInput.value = '';
+      }
+      if (customerPhoneInput) {
+        customerPhoneInput.readOnly = false;
+        customerPhoneInput.value = '';
+      }
+    }
+  };
+
   // Customer type change handler
   document.getElementById('loanCustomerType')?.addEventListener('change', (e) => {
     const type = e.target.value;
     const restaurantFields = document.getElementById('restaurantFields');
     const restaurantNieField = document.getElementById('restaurantNieField');
+    const restaurantParkingModeField = document.getElementById('restaurantParkingModeField');
+    const existingField = document.getElementById('existingRestaurantSelectField');
     const restaurantNameInput = document.getElementById('loanRestaurantName');
     
     if (type === 'restaurant') {
       restaurantFields.style.display = 'block';
       restaurantNieField.style.display = 'block';
+      if (restaurantParkingModeField) restaurantParkingModeField.style.display = 'block';
       restaurantNameInput.required = true;
+      // Default to append mode and sync UI
+      const defaultMode = document.querySelector('input[name="loanParkingMode"][value="append"]');
+      if (defaultMode) defaultMode.checked = true;
+      syncRestaurantParkingModeUi();
     } else {
       restaurantFields.style.display = 'none';
       restaurantNieField.style.display = 'none';
+      if (restaurantParkingModeField) restaurantParkingModeField.style.display = 'none';
+      if (existingField) existingField.style.display = 'none';
       restaurantNameInput.required = false;
       restaurantNameInput.value = '';
       document.getElementById('loanRestaurantNie').value = '';
+
+      // Reset parking mode choice to default
+      const defaultMode = document.querySelector('input[name="loanParkingMode"][value="append"]');
+      if (defaultMode) defaultMode.checked = true;
     }
+  });
+
+  // Parking mode change (append/new)
+  document.querySelectorAll('input[name="loanParkingMode"]').forEach((r) => {
+    r.addEventListener('change', () => {
+      syncRestaurantParkingModeUi();
+    });
+  });
+
+  // Existing restaurant selection -> auto-fill fields
+  document.getElementById('loanExistingRestaurant')?.addEventListener('change', (e) => {
+    const opt = e.target.selectedOptions?.[0];
+    if (!opt) return;
+    const restaurantNameInput = document.getElementById('loanRestaurantName');
+    const restaurantNieInput = document.getElementById('loanRestaurantNie');
+    const customerNameInput = document.getElementById('loanCustomerName');
+    const customerPhoneInput = document.getElementById('loanCustomerPhone');
+
+    if (restaurantNameInput) restaurantNameInput.value = opt.dataset.restaurantName || '';
+    if (restaurantNieInput) restaurantNieInput.value = opt.dataset.restaurantNie || '';
+    if (customerNameInput) customerNameInput.value = opt.dataset.customerName || '';
+    if (customerPhoneInput) customerPhoneInput.value = opt.dataset.customerPhone || '';
+  });
+
+  // Refresh button
+  document.getElementById('refreshExistingRestaurantBtn')?.addEventListener('click', async () => {
+    await loadExistingRestaurantParkings();
   });
 
   // Loan form submit
@@ -5308,13 +7094,35 @@ function setupLoanHandlers() {
     const restaurantName = document.getElementById('loanRestaurantName').value;
     const restaurantNie = document.getElementById('loanRestaurantNie').value;
     const notes = document.getElementById('loanNotes').value;
+
+    const parkingMode = document.querySelector('input[name="loanParkingMode"]:checked')?.value || 'append';
+
+    // If restaurant + existing mode, require selecting an existing loan id
+    let targetLoanId = null;
+    if (customerType === 'restaurant' && parkingMode === 'append') {
+      const selected = document.getElementById('loanExistingRestaurant')?.value;
+      if (!selected) {
+        showAlert('Please select an existing restaurant parking', 'warning');
+        return;
+      }
+      targetLoanId = parseInt(selected, 10);
+      if (!Number.isFinite(targetLoanId)) {
+        showAlert('Please select an existing restaurant parking', 'warning');
+        return;
+      }
+    }
     
-    await completeLoanSale(customerType, customerName, customerPhone, restaurantName, restaurantNie, notes);
+    await completeLoanSale(customerType, customerName, customerPhone, restaurantName, restaurantNie, notes, parkingMode, targetLoanId);
     
     // Reset form
     e.target.reset();
     document.getElementById('restaurantFields').style.display = 'none';
     document.getElementById('restaurantNieField').style.display = 'none';
+    const pm = document.getElementById('restaurantParkingModeField');
+    if (pm) pm.style.display = 'none';
+
+    const defaultMode = document.querySelector('input[name="loanParkingMode"][value="append"]');
+    if (defaultMode) defaultMode.checked = true;
   });
 
   // Note form submit
@@ -5355,7 +7163,8 @@ function setupLoanHandlers() {
       e.target.classList.add('active');
       
       const status = e.target.dataset.status;
-      loadLoansView(status === 'all' ? null : status);
+      // For 'all' status, exclude paid transactions to keep the list clean
+      loadLoansView(status === 'all' ? 'active' : status);
     });
   });
 }
@@ -5363,12 +7172,12 @@ function setupLoanHandlers() {
 // ============== MODALS ==============
 function setupModalHandlers() {
   // Close buttons
-  document.querySelectorAll('.close, .cancel-btn').forEach(btn => {
+  document.querySelectorAll('.close, .modal-close, .cancel-btn').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       const modal = e.target.closest('.modal');
       if (modal) {
-        // If closing the receipt modal, open cash drawer first
-        if (modal.id === 'receiptModal') {
+        // If closing the receipt modal, open cash drawer only for cash transactions
+        if (modal.id === 'receiptModal' && lastSale && lastSale.payment_method === 'cash') {
           await openCashDrawer();
         }
         closeModal(modal.id);
@@ -5465,6 +7274,9 @@ function setupVirtualKeyboard() {
   const keyboard = document.getElementById('virtualKeyboard');
   const keyButtons = document.querySelectorAll('.key-btn');
   let isShiftActive = false;
+  let isCapsLocked = false;
+  let lastShiftTapAt = 0;
+  const SHIFT_DOUBLE_TAP_MS = 350;
   let keyboardMode = 'text'; // 'text' | 'numeric'
   
   // Initialize keyboard in lowercase mode
@@ -5482,9 +7294,11 @@ function setupVirtualKeyboard() {
       if (isShiftActive) {
         shiftBtn.style.background = 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)';
         shiftBtn.style.color = 'white';
+        shiftBtn.style.boxShadow = isCapsLocked ? 'inset 0 0 0 3px rgba(0,0,0,0.18)' : 'none';
       } else {
         shiftBtn.style.background = 'white';
         shiftBtn.style.color = '#1e293b';
+        shiftBtn.style.boxShadow = 'none';
       }
     }
   }
@@ -5510,8 +7324,10 @@ function setupVirtualKeyboard() {
     keyboardMode = mode === 'numeric' ? 'numeric' : 'text';
 
     // Reset shift when switching modes
-    if (keyboardMode === 'numeric' && isShiftActive) {
+    if (keyboardMode === 'numeric' && (isShiftActive || isCapsLocked)) {
       isShiftActive = false;
+      isCapsLocked = false;
+      lastShiftTapAt = 0;
       updateKeyboardCase();
     }
 
@@ -5595,7 +7411,24 @@ function setupVirtualKeyboard() {
       }
       
       if (key === 'Shift') {
-        isShiftActive = !isShiftActive;
+        const now = Date.now();
+        const isDoubleTap = (now - lastShiftTapAt) < SHIFT_DOUBLE_TAP_MS;
+        lastShiftTapAt = now;
+
+        if (isDoubleTap) {
+          // Double-tap toggles caps-lock (sticky uppercase)
+          isCapsLocked = !isCapsLocked;
+          isShiftActive = isCapsLocked;
+        } else {
+          // Single tap: shift for next key; if caps-lock was on, turn it off
+          if (isCapsLocked) {
+            isCapsLocked = false;
+            isShiftActive = false;
+          } else {
+            isShiftActive = !isShiftActive;
+          }
+        }
+
         updateKeyboardCase();
       } else if (key === 'Backspace') {
         if (currentKeyboardInput) {
@@ -5618,6 +7451,8 @@ function setupVirtualKeyboard() {
         keyboard.classList.remove('active');
         currentKeyboardInput = null;
         isShiftActive = false;
+        isCapsLocked = false;
+        lastShiftTapAt = 0;
         updateKeyboardCase();
       } else {
         // Use the actual displayed text (respects shift state)
@@ -5646,7 +7481,7 @@ function setupVirtualKeyboard() {
           }
         }
         // Auto-turn off shift after typing one character
-        if (isShiftActive) {
+        if (isShiftActive && !isCapsLocked) {
           isShiftActive = false;
           updateKeyboardCase();
         }
@@ -5667,6 +7502,8 @@ function setupVirtualKeyboard() {
         keyboard.classList.remove('active');
         currentKeyboardInput = null;
         isShiftActive = false;
+        isCapsLocked = false;
+        lastShiftTapAt = 0;
         updateKeyboardCase();
       }
     }
@@ -5978,9 +7815,13 @@ async function openZReportModal() {
     const endDateTime = todayEnd.toISOString();
     
     // Get sales and returns for today
-    const sales = await window.api.getSalesByDateRange(startDateTime, endDateTime, currentUser.id);
-    const returns = await window.api.getReturnsByDateRange(startDateTime, endDateTime, currentUser.id);
+    const salesData = await window.api.getSalesByDateRange(startDateTime, endDateTime, currentUser.id);
+    const returnsData = await window.api.getReturnsByDateRange(startDateTime, endDateTime, currentUser.id);
     const loanPayments = await window.api.getLoanPaymentsByDateRange(startDateTime, endDateTime, currentUser.id);
+    
+    // Extract the actual arrays from the response objects
+    const sales = Array.isArray(salesData) ? salesData : (salesData?.sales || []);
+    const returns = Array.isArray(returnsData) ? returnsData : (returnsData?.returns || []);
     
     // Parse items for each sale and return
     sales.forEach(sale => {
@@ -6105,7 +7946,6 @@ async function openZReportModal() {
     
     document.getElementById('zReportCash').textContent = `${currencySymbol}${cashSales.toFixed(2)}`;
     document.getElementById('zReportCard').textContent = `${currencySymbol}${cardSales.toFixed(2)}`;
-    document.getElementById('zReportLoan').textContent = `${currencySymbol}${(loanCashPayments + loanCardPayments).toFixed(2)}`;
     
     // Calculate and display total sales amount
     const totalSalesAmount = cashSales + cardSales;
@@ -6285,10 +8125,6 @@ async function viewZReportDetails(reportId) {
             <span class="summary-label">💳 Card:</span>
             <span class="summary-value">${currencySymbol}${report.card_sales.toFixed(2)}</span>
           </div>
-          <div class="summary-item">
-            <span class="summary-label">🅿️ Loan:</span>
-            <span class="summary-value">${currencySymbol}${report.loan_sales.toFixed(2)}</span>
-          </div>
           <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
             <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
             <span class="summary-value" style="font-weight: bold; font-size: 16px; color: #059669;">${currencySymbol}${(report.total_sales_amount || 0).toFixed(2)}</span>
@@ -6450,10 +8286,14 @@ async function printZReport(report) {
     const start = report.start_datetime;
     const end = report.end_datetime;
     const cashierId = report.cashier_id || null;
-    const [sales, returns] = await Promise.all([
+    const [salesData, returnsData] = await Promise.all([
       window.api.getSalesByDateRange(start, end, cashierId),
       window.api.getReturnsByDateRange(start, end, cashierId)
     ]);
+    
+    // Extract the actual sales and returns arrays from the response objects
+    const sales = Array.isArray(salesData) ? salesData : (salesData?.sales || []);
+    const returns = Array.isArray(returnsData) ? returnsData : (returnsData?.returns || []);
 
     const safeParseItems = (record) => {
       if (!record) return [];
@@ -6557,7 +8397,6 @@ async function printZReport(report) {
     receipt += center('FORMAS PAGO') + '\n';
     receipt += rightLabelValue('CONTADO', formatMoney(cashSales)) + '\n';
     receipt += rightLabelValue('TARJETA', formatMoney(cardSales)) + '\n';
-    receipt += rightLabelValue('PARKING COBRADO', formatMoney(loanSales)) + '\n';
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
     receipt += rightLabelValue('TOTAL', formatMoney(totalSalesAmount)) + '\n';
     receipt += '\n';
@@ -6968,27 +8807,30 @@ function generateBarcodeDisplay(barcode) {
 
 // Customer Display Functions
 async function updateCustomerDisplayData() {
-  const currencySymbol = systemSettings?.currency_symbol || '€';
-  const subtotal = cart.reduce((sum, item) => sum + item.subtotal, 0);
-  const tax = cart.reduce((sum, item) => {
-    const itemTax = item.subtotal * (item.taxRate || 0.19);
-    return sum + itemTax;
-  }, 0);
-  const total = subtotal + tax;
-
-  const displayData = {
-    items: cart,
-    subtotal,
-    tax,
-    total,
-    currencySymbol
-  };
-
-  try {
-    await window.api.updateCustomerDisplay(displayData);
-  } catch (error) {
-    console.log('Customer display not open');
+  if (cart.length === 0) {
+    // Show welcome message if cart is empty
+    await showCustomerDisplayWelcome();
+    return;
   }
+
+  // Match common pole-display behavior (like the reference photo):
+  // while scanning, show the last item name on line 1 and the calculation on line 2.
+  const lastItem = cart[0];
+  if (!lastItem) {
+    await showCustomerDisplayWelcome();
+    return;
+  }
+
+  const discountPercent = lastItem.discountPercent || 0;
+  const discountAmount = lastItem.subtotal * (discountPercent / 100);
+  const finalTotal = lastItem.subtotal - discountAmount;
+
+  const unit = lastItem.isWeightBased ? 'kg' : 'pc';
+  await updateCustomerDisplayItem(lastItem.productName, finalTotal, {
+    quantity: lastItem.quantity,
+    unitPrice: lastItem.unitPrice,
+    unit
+  });
 }
 
 async function toggleCustomerDisplay() {
@@ -7182,6 +9024,8 @@ window.printProductBarcode = printProductBarcode;
 window.showAlert = showAlert;
 window.viewZReportDetails = viewZReportDetails;
 window.printSalesReportThermal = printSalesReportThermal;
+window.viewParkingBillForLoan = viewParkingBillForLoan;
+window.printParkingBillForLoan = printParkingBillForLoan;
 
 // Detect available printers
 async function detectPrinters() {
@@ -7544,3 +9388,156 @@ function displayAnalytics(data) {
 
 window.detectPrinters = detectPrinters;
 window.selectPrinter = selectPrinter;
+
+// ============== CUSTOMER DISPLAY FUNCTIONS ==============
+
+// Update customer display when item is added to cart
+async function updateCustomerDisplayItem(itemName, price, meta = null) {
+  try {
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    const quantity = meta?.quantity ?? null;
+    const unitPrice = meta?.unitPrice ?? null;
+    const unit = meta?.unit ?? null;
+    await window.api.showCurrentItem(itemName, price, currencySymbol, quantity, unitPrice, unit);
+  } catch (error) {
+    console.warn('Customer display error:', error);
+  }
+}
+
+// Update customer display with total amount
+async function updateCustomerDisplayTotal(total) {
+  try {
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    await window.api.showTotal(total, currencySymbol);
+  } catch (error) {
+    console.warn('Customer display error:', error);
+  }
+}
+
+let customerDisplayFlashTimer = null;
+
+async function flashCustomerDisplayCartItem(cartItemId, returnToTotalDelayMs = 1200) {
+  try {
+    const item = cart.find(i => i.cartItemId === cartItemId);
+    if (!item) {
+      await updateCustomerDisplayData();
+      return;
+    }
+
+    const discountPercent = item.discountPercent || 0;
+    const discountAmount = item.subtotal * (discountPercent / 100);
+    const finalTotal = item.subtotal - discountAmount;
+
+    const unit = item.isWeightBased ? 'kg' : 'pc';
+    await updateCustomerDisplayItem(item.productName, finalTotal, { quantity: item.quantity, unitPrice: item.unitPrice, unit });
+
+    if (customerDisplayFlashTimer) clearTimeout(customerDisplayFlashTimer);
+    customerDisplayFlashTimer = setTimeout(() => {
+      updateCustomerDisplayData();
+    }, returnToTotalDelayMs);
+  } catch (error) {
+    console.warn('Customer display flash error:', error);
+  }
+}
+
+async function flashCustomerDisplayRemovedItem(removedItem, returnToTotalDelayMs = 1500) {
+  try {
+    if (!removedItem) {
+      await updateCustomerDisplayData();
+      return;
+    }
+
+    const discountPercent = removedItem.discountPercent || 0;
+    const discountAmount = removedItem.subtotal * (discountPercent / 100);
+    const finalTotal = removedItem.subtotal - discountAmount;
+    const negativeTotal = -Math.abs(finalTotal);
+    const unit = removedItem.isWeightBased ? 'kg' : 'pc';
+
+    await updateCustomerDisplayItem(`!BORRAR! ${removedItem.productName}`, negativeTotal, {
+      quantity: removedItem.quantity,
+      unitPrice: removedItem.unitPrice,
+      unit
+    });
+
+    if (customerDisplayFlashTimer) clearTimeout(customerDisplayFlashTimer);
+    customerDisplayFlashTimer = setTimeout(() => {
+      updateCustomerDisplayData();
+    }, returnToTotalDelayMs);
+  } catch (error) {
+    console.warn('Customer display remove flash error:', error);
+  }
+}
+
+// Update customer display with payment processing
+async function updateCustomerDisplayPayment(paymentMethod) {
+  try {
+    await window.api.showPaymentProcessing(paymentMethod);
+  } catch (error) {
+    console.warn('Customer display error:', error);
+  }
+}
+
+// Update customer display with change amount
+async function updateCustomerDisplayChange(changeAmount, currencySymbol = '€') {
+  try {
+    await window.api.showChange(changeAmount, currencySymbol);
+  } catch (error) {
+    console.warn('Customer display change error:', error);
+  }
+}
+
+// Update customer display with TOTAL / ENTREGA / CAMBIO summary (cash)
+async function updateCustomerDisplayPaymentSummary(total, paid, changeAmount) {
+  try {
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    await window.api.showPaymentSummary(total, paid, changeAmount, currencySymbol);
+  } catch (error) {
+    console.warn('Customer display payment summary error:', error);
+  }
+}
+
+// Update customer display with thank you message
+async function updateCustomerDisplayThankYou(changeAmount = null) {
+  try {
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    await window.api.showThankYou(changeAmount, currencySymbol);
+  } catch (error) {
+    console.warn('Customer display error:', error);
+  }
+}
+
+// Initialize customer display
+async function initializeCustomerDisplay() {
+  try {
+    const result = await window.api.initializeCustomerDisplay();
+    return result;
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+}
+
+// Show welcome message on customer display
+async function showCustomerDisplayWelcome() {
+  try {
+    await window.api.showWelcomeMessage();
+  } catch (error) {
+    console.warn('Customer display error:', error);
+  }
+}
+
+// Clear customer display
+async function clearCustomerDisplay() {
+  try {
+    await window.api.clearCustomerDisplay();
+  } catch (error) {
+    console.warn('Customer display error:', error);
+  }
+}
+
+// Initialize customer display when app loads
+document.addEventListener('DOMContentLoaded', () => {
+  // Initialize customer display after a short delay
+  setTimeout(() => {
+    initializeCustomerDisplay();
+  }, 3000);
+});

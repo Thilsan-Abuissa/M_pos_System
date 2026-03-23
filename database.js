@@ -279,6 +279,15 @@ class POSDatabase {
       }
     }
 
+    // Add customer_display_port column to system_settings table if it doesn't exist
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN customer_display_port TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding customer_display_port column:', error);
+      }
+    }
+
     // Add loan_payments table for tracking PARKING payments by date
     // (CREATE TABLE IF NOT EXISTS is safe across versions)
     try {
@@ -634,7 +643,15 @@ class POSDatabase {
   }
 
   getSaleById(id) {
-    const sale = this.db.prepare('SELECT * FROM sales WHERE id = ?').get(id);
+    const sale = this.db.prepare(`
+      SELECT s.*, 
+        l.status as loan_status,
+        l.payment_method as loan_payment_method,
+        l.paid_date as loan_paid_date
+      FROM sales s
+      LEFT JOIN loans l ON l.sale_id = s.id
+      WHERE s.id = ?
+    `).get(id);
     if (sale) {
       sale.items = this.db.prepare('SELECT * FROM sale_items WHERE sale_id = ?').all(id);
       // Parse split_payments JSON if exists
@@ -652,9 +669,14 @@ class POSDatabase {
   getTodaySales() {
     const today = new Date().toISOString().split('T')[0];
     const sales = this.db.prepare(`
-      SELECT * FROM sales 
-      WHERE DATE(sale_date) = ?
-      ORDER BY sale_date DESC
+      SELECT s.*, 
+        l.status as loan_status,
+        l.payment_method as loan_payment_method,
+        l.paid_date as loan_paid_date
+      FROM sales s
+      LEFT JOIN loans l ON l.sale_id = s.id
+      WHERE DATE(s.sale_date) = ?
+      ORDER BY s.sale_date DESC
     `).all(today);
 
     const summary = this.db.prepare(`
@@ -810,6 +832,233 @@ class POSDatabase {
   }
 
   // Loan operations
+  createOrAppendLoan(loanData) {
+    const transaction = this.db.transaction((data) => {
+      const customerType = (data.customerType || 'regular').toString().toLowerCase();
+      const restaurantName = (data.restaurantName || '').toString().trim();
+      const restaurantNie = (data.restaurantNie || '').toString().trim();
+      const mergeMode = (data.mergeMode || 'append').toString().toLowerCase();
+      const forceNewParking = mergeMode === 'new' || !!data.forceNewParking;
+      const canMergeRestaurant = customerType === 'restaurant' && restaurantName.length > 0 && !forceNewParking;
+
+      const targetLoanId = Number.isFinite(Number(data.targetLoanId)) ? Number(data.targetLoanId) : null;
+
+      const sale = data.sale || null;
+      const items = Array.isArray(data.items) ? data.items : [];
+      if (!sale || !Number.isFinite(Number(sale.total)) || Number(sale.total) <= 0) {
+        throw new Error('Invalid sale data for loan');
+      }
+      if (!items.length) {
+        throw new Error('No sale items provided for loan');
+      }
+
+      const insertSaleStmt = this.db.prepare(`
+        INSERT INTO sales (subtotal, tax, discount, total, payment_method, payment_amount, change_amount, cashier_id, notes, split_payments)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const insertItemStmt = this.db.prepare(`
+        INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, discount_percent, subtotal)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const updateStockStmt = this.db.prepare(`
+        UPDATE products SET stock = stock - ? WHERE id = ?
+      `);
+
+      const updateSaleTotalsStmt = this.db.prepare(`
+        UPDATE sales
+        SET subtotal = subtotal + ?,
+            tax = tax + ?,
+            discount = discount + ?,
+            total = total + ?
+        WHERE id = ?
+      `);
+
+      const updateLoanStmt = this.db.prepare(`
+        UPDATE loans
+        SET customer_name = ?,
+            customer_phone = ?,
+            restaurant_name = ?,
+            restaurant_nie = ?,
+            loan_amount = ?,
+            remaining_amount = ?,
+            status = ?,
+            cashier_id = ?,
+            notes = ?
+        WHERE id = ?
+      `);
+
+      const findExistingRestaurantLoan = () => {
+        if (forceNewParking) return null;
+
+        // If a specific loan was selected in the UI, append to it.
+        if (targetLoanId) {
+          const chosen = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(targetLoanId);
+          if (!chosen) throw new Error('Selected restaurant parking not found');
+          if ((chosen.status || '').toString().toLowerCase() === 'paid') {
+            throw new Error('Selected restaurant parking is already paid');
+          }
+          if ((chosen.customer_type || '').toString().toLowerCase() !== 'restaurant') {
+            throw new Error('Selected parking is not a restaurant');
+          }
+          return chosen;
+        }
+
+        if (!canMergeRestaurant) return null;
+
+        if (restaurantNie) {
+          return this.db.prepare(`
+            SELECT * FROM loans
+            WHERE customer_type = 'restaurant'
+              AND status != 'paid'
+              AND LOWER(TRIM(restaurant_name)) = LOWER(TRIM(?))
+              AND TRIM(COALESCE(restaurant_nie, '')) = TRIM(?)
+            ORDER BY loan_date DESC
+            LIMIT 1
+          `).get(restaurantName, restaurantNie);
+        }
+
+        return this.db.prepare(`
+          SELECT * FROM loans
+          WHERE customer_type = 'restaurant'
+            AND status != 'paid'
+            AND LOWER(TRIM(restaurant_name)) = LOWER(TRIM(?))
+          ORDER BY loan_date DESC
+          LIMIT 1
+        `).get(restaurantName);
+      };
+
+      const existingLoan = findExistingRestaurantLoan();
+      if (existingLoan) {
+        const saleId = existingLoan.sale_id;
+
+        for (const item of items) {
+          const discountPercent = Number(item.discountPercent || 0);
+          const lineSubtotal = Number(item.subtotal || 0);
+          const discountAmount = lineSubtotal * (discountPercent / 100);
+          const finalSubtotal = lineSubtotal - discountAmount;
+
+          insertItemStmt.run(
+            saleId,
+            item.productId,
+            item.productName,
+            item.quantity,
+            item.unitPrice,
+            discountPercent,
+            finalSubtotal
+          );
+          updateStockStmt.run(item.quantity, item.productId);
+        }
+
+        updateSaleTotalsStmt.run(
+          Number(sale.subtotal || 0),
+          Number(sale.tax || 0),
+          Number(sale.discount || 0),
+          Number(sale.total || 0),
+          saleId
+        );
+
+        const newLoanAmount = Number(existingLoan.loan_amount || 0) + Number(sale.total || 0);
+        const paidAmount = Number(existingLoan.paid_amount || 0);
+        const remainingAmount = newLoanAmount - paidAmount;
+        const status = remainingAmount <= 0.01
+          ? 'paid'
+          : (paidAmount > 0.01 ? 'partial' : 'pending');
+
+        const nextNotes = (() => {
+          const prev = (existingLoan.notes || '').toString().trim();
+          const add = (data.notes || '').toString().trim();
+          if (!add) return prev || null;
+          if (!prev) return add;
+          return prev + '\n' + add;
+        })();
+
+        updateLoanStmt.run(
+          (data.customerName || existingLoan.customer_name),
+          (data.customerPhone || existingLoan.customer_phone || null),
+          (restaurantName || existingLoan.restaurant_name || null),
+          (restaurantNie || existingLoan.restaurant_nie || null),
+          newLoanAmount,
+          Math.max(0, remainingAmount),
+          status,
+          data.cashierId || null,
+          nextNotes,
+          existingLoan.id
+        );
+
+        const updated = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(existingLoan.id);
+        updated.merged = true;
+        return updated;
+      }
+
+      // Create a new sale
+      const saleResult = insertSaleStmt.run(
+        Number(sale.subtotal || 0),
+        Number(sale.tax || 0),
+        Number(sale.discount || 0),
+        Number(sale.total || 0),
+        sale.paymentMethod || 'loan',
+        Number(sale.paymentAmount || 0),
+        Number(sale.changeAmount || 0),
+        data.cashierId || null,
+        sale.notes || null,
+        sale.splitPayments ? JSON.stringify(sale.splitPayments) : null
+      );
+      const saleId = saleResult.lastInsertRowid;
+
+      for (const item of items) {
+        const discountPercent = Number(item.discountPercent || 0);
+        const lineSubtotal = Number(item.subtotal || 0);
+        const discountAmount = lineSubtotal * (discountPercent / 100);
+        const finalSubtotal = lineSubtotal - discountAmount;
+
+        insertItemStmt.run(
+          saleId,
+          item.productId,
+          item.productName,
+          item.quantity,
+          item.unitPrice,
+          discountPercent,
+          finalSubtotal
+        );
+        updateStockStmt.run(item.quantity, item.productId);
+      }
+
+      const loanStmt = this.db.prepare(`
+        INSERT INTO loans (receipt_number, customer_type, customer_name, customer_phone, restaurant_name, restaurant_nie, sale_id, loan_amount, remaining_amount, cashier_id, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const loanResult = loanStmt.run(
+        data.receiptNumber,
+        customerType || 'regular',
+        data.customerName,
+        data.customerPhone || null,
+        restaurantName || null,
+        restaurantNie || null,
+        saleId,
+        Number(sale.total || 0),
+        Number(sale.total || 0),
+        data.cashierId || null,
+        data.notes || null
+      );
+
+      const created = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(loanResult.lastInsertRowid);
+      created.merged = false;
+      return created;
+    });
+
+    const loan = transaction(loanData);
+    if (loan && loan.sale_id) {
+      try {
+        loan.sale = this.getSaleById(loan.sale_id);
+      } catch {
+        // ignore
+      }
+    }
+    return loan;
+  }
+
   createLoan(loanData) {
     const stmt = this.db.prepare(`
       INSERT INTO loans (receipt_number, customer_type, customer_name, customer_phone, restaurant_name, restaurant_nie, sale_id, loan_amount, remaining_amount, cashier_id, notes)
@@ -833,6 +1082,10 @@ class POSDatabase {
   }
 
   getAllLoans(status = null) {
+    if (status === 'active') {
+      // Return only pending and partial transactions (exclude paid)
+      return this.db.prepare('SELECT * FROM loans WHERE status != ? ORDER BY loan_date DESC').all('paid');
+    }
     if (status) {
       return this.db.prepare('SELECT * FROM loans WHERE status = ? ORDER BY loan_date DESC').all(status);
     }
@@ -866,7 +1119,16 @@ class POSDatabase {
 
       const paidAmount = loan.paid_amount + data.amount;
       const remainingAmount = loan.loan_amount - paidAmount;
-      const status = remainingAmount <= 0 ? 'paid' : 'partial';
+      const status = remainingAmount <= 0.01 ? 'paid' : 'partial'; // Use small threshold for floating point precision
+      
+      console.log('Loan payment calculation:', {
+        loanAmount: loan.loan_amount,
+        previouslyPaid: loan.paid_amount,
+        paymentAmount: data.amount,
+        newPaidAmount: paidAmount,
+        remainingAmount: remainingAmount,
+        newStatus: status
+      });
 
       const stmt = this.db.prepare(`
         UPDATE loans 
@@ -1139,6 +1401,9 @@ class POSDatabase {
   getSalesByDateRange(startDate, endDate, cashierId = null) {
     let query = `
       SELECT s.*,
+        l.status as loan_status,
+        l.payment_method as loan_payment_method,
+        l.paid_date as loan_paid_date,
         (SELECT json_group_array(json_object(
           'product_id', si.product_id,
           'product_name', si.product_name,
@@ -1149,15 +1414,41 @@ class POSDatabase {
         ))
         FROM sale_items si WHERE si.sale_id = s.id) as items
       FROM sales s
-      WHERE s.sale_date BETWEEN ? AND ?
+      LEFT JOIN loans l ON l.sale_id = s.id
+      WHERE DATE(s.sale_date) BETWEEN DATE(?) AND DATE(?)
     `;
     
     if (cashierId) {
       query += ` AND s.cashier_id = ?`;
-      return this.db.prepare(query + ` ORDER BY s.sale_date`).all(startDate, endDate, cashierId);
+      const sales = this.db.prepare(query + ` ORDER BY s.sale_date DESC`).all(startDate, endDate, cashierId);
+    } else {
+      const sales = this.db.prepare(query + ` ORDER BY s.sale_date DESC`).all(startDate, endDate);
     }
     
-    return this.db.prepare(query + ` ORDER BY s.sale_date`).all(startDate, endDate);
+    // Parse JSON items and calculate summary
+    const salesWithItems = cashierId 
+      ? this.db.prepare(query + ` ORDER BY s.sale_date DESC`).all(startDate, endDate, cashierId)
+      : this.db.prepare(query + ` ORDER BY s.sale_date DESC`).all(startDate, endDate);
+      
+    salesWithItems.forEach(sale => {
+      try {
+        sale.items = sale.items ? JSON.parse(sale.items) : [];
+      } catch (e) {
+        sale.items = [];
+      }
+    });
+
+    const summary = {
+      transaction_count: salesWithItems.length,
+      total_sales: salesWithItems.reduce((sum, sale) => sum + (sale.total || 0), 0),
+      subtotal: salesWithItems.reduce((sum, sale) => sum + (sale.subtotal || 0), 0),
+      tax: salesWithItems.reduce((sum, sale) => sum + (sale.tax || 0), 0)
+    };
+
+    return {
+      sales: salesWithItems,
+      summary: summary
+    };
   }
 
   getReturnsByDateRange(startDate, endDate, cashierId = null) {
@@ -1201,6 +1492,7 @@ class POSDatabase {
           tax_rate = ?,
           receipt_footer = ?,
           printer_name = ?,
+          customer_display_port = ?,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
     `);
@@ -1214,8 +1506,19 @@ class POSDatabase {
       settings.currencyCode,
       settings.taxRate,
       settings.receiptFooter,
-      settings.printerName || null
+      settings.printerName || null,
+      settings.customerDisplayPort || null
     );
+    return this.getSystemSettings();
+  }
+
+  setCustomerDisplayPort(portPath) {
+    const value = portPath ? String(portPath) : null;
+    this.db.prepare(`
+      UPDATE system_settings
+      SET customer_display_port = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+    `).run(value);
     return this.getSystemSettings();
   }
 

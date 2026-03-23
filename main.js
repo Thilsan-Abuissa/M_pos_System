@@ -1,6 +1,25 @@
 const { app, BrowserWindow, ipcMain, screen } = require('electron');
 const path = require('path');
 const Database = require('./database');
+const CustomerDisplay = require('./customer-display');
+
+// Prevent multiple running instances (common cause of COM port "Access denied")
+// If a second instance starts, it will steal focus and exit.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  try { app.quit(); } catch { /* ignore */ }
+} else {
+  app.on('second-instance', () => {
+    try {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+      }
+    } catch {
+      // ignore
+    }
+  });
+}
 
 // Try to load serialport modules, but don't crash if they fail
 let SerialPort = null;
@@ -31,6 +50,20 @@ let customerDisplayWindow;
 let db;
 let scalePort = null;
 let scaleParser = null;
+let customerDisplay = null;
+
+// Basic app info
+ipcMain.handle('app:getVersion', async () => {
+  try {
+    return app.getVersion();
+  } catch {
+    return null;
+  }
+});
+
+// Customer display init/reconnect throttling to avoid constant port scans
+let customerDisplayLastInitAttemptAt = 0;
+const CUSTOMER_DISPLAY_INIT_COOLDOWN_MS = 500; // 0.5s — fast reconnect if port closes unexpectedly
 
 // Track scale state for streaming (some scales output continuously)
 let scaleState = {
@@ -434,13 +467,20 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
   });
 }
 
-function pickBestScalePort(ports) {
-  const ranked = rankScalePorts(ports);
+function pickBestScalePort(ports, options = {}) {
+  const ranked = rankScalePorts(ports, options);
   return ranked.length > 0 ? ranked[0] : null;
 }
 
-function rankScalePorts(ports) {
+function rankScalePorts(ports, options = {}) {
   if (!Array.isArray(ports) || ports.length === 0) return [];
+
+  const excludePathsRaw = Array.isArray(options.excludePaths) ? options.excludePaths : [];
+  const excludePaths = new Set(
+    excludePathsRaw
+      .filter(Boolean)
+      .map((p) => String(p).toLowerCase())
+  );
 
   const scored = ports
     .map((port) => {
@@ -453,8 +493,19 @@ function rankScalePorts(ports) {
 
       let score = 0;
 
+      // Never choose an explicitly configured customer display port for the scale.
+      if (excludePaths.size > 0 && excludePaths.has(pathLower)) {
+        score -= 10000;
+      }
+
       // Strong signals for USB-serial adapters commonly used by scales
-      if (/ch340|usb.*serial|ftdi|silicon|prolific|cp210/i.test(manufacturer)) score += 200;
+      if (/ch340|usb.*serial|ftdi|silicon|cp210/i.test(manufacturer)) score += 200;
+
+      // IMPORTANT: Prolific PL2303 is very commonly used by pole/customer displays.
+      // Treat Prolific as "NOT a scale" to avoid grabbing the VFD port (COM12 in your case).
+      if (/prolific/i.test(manufacturer) || String(port.productId || '').toLowerCase() === '2303') {
+        score -= 1000;
+      }
       if (pnpIdLower.includes('usb')) score += 150;
       if (pnpIdLower.includes('vid_')) score += 50;
       if (port.vendorId || port.productId) score += 30;
@@ -476,12 +527,19 @@ function rankScalePorts(ports) {
       return { port, score };
     })
     // Keep only likely serial ports
-    .filter(({ port }) => {
+    .filter(({ port, score }) => {
       const manufacturer = (port.manufacturer || '').toString();
       const pnpId = (port.pnpId || '').toString();
       const pathVal = (port.path || '').toString();
+      const pathLower = pathVal.toLowerCase();
+
+      // Drop excluded paths completely.
+      if (excludePaths.size > 0 && excludePaths.has(pathLower)) return false;
+
+      // Drop very negative scores (e.g. Prolific / VFD ports).
+      if (score <= -500) return false;
       return (
-        /CH340|USB.*Serial|FTDI|Silicon|Prolific|CP210/i.test(manufacturer) ||
+        /CH340|USB.*Serial|FTDI|Silicon|CP210/i.test(manufacturer) ||
         /USB/i.test(pnpId) ||
         /ttyUSB|ttyACM|cu\.usbserial|cu\.wchusbserial|^COM\d+$/i.test(pathVal)
       );
@@ -675,6 +733,28 @@ function updateCustomerDisplay(data) {
 app.whenReady().then(() => {
   // Initialize database
   db = new Database();
+
+  // Load persisted customer display port (if configured)
+  try {
+    const settings = db.getSystemSettings();
+    const configuredPort = settings?.customer_display_port;
+    if (configuredPort) {
+      process.env.CUSTOMER_DISPLAY_PORT = String(configuredPort);
+      console.log('[CustomerDisplay] Using saved port from settings:', process.env.CUSTOMER_DISPLAY_PORT);
+    }
+  } catch (e) {
+    console.warn('[CustomerDisplay] Failed to load saved port setting:', e.message);
+  }
+
+  // Default: exclude the scale port from customer display probing once known.
+  // This prevents the customer display logic from ever grabbing the scale COM.
+  try {
+    if (scaleState?.portPath) {
+      process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS = String(scaleState.portPath);
+    }
+  } catch {
+    // ignore
+  }
   
   createWindow();
   
@@ -684,7 +764,8 @@ app.whenReady().then(() => {
     setTimeout(async () => {
       try {
         const ports = await SerialPort.list();
-        const bestPort = pickBestScalePort(ports);
+        const exclude = process.env.CUSTOMER_DISPLAY_PORT ? [String(process.env.CUSTOMER_DISPLAY_PORT)] : [];
+        const bestPort = pickBestScalePort(ports, { excludePaths: exclude });
         
         if (bestPort) {
           const scalePortPath = bestPort.path;
@@ -698,6 +779,13 @@ app.whenReady().then(() => {
           scaleState.config = cfg;
           scaleState.lastError = null;
           console.log('Scale auto-connected successfully');
+
+          // Ensure customer display probing never grabs the scale COM port.
+          try {
+            process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS = String(scalePortPath);
+          } catch {
+            // ignore
+          }
         } else {
           console.log('No USB scale detected');
         }
@@ -717,6 +805,21 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+// Cleanly close the customer display serial port before the process exits.
+app.on('before-quit', (event) => {
+  if (customerDisplay && customerDisplay.isDisplayConnected && customerDisplay.isDisplayConnected()) {
+    event.preventDefault();
+    // Safety timeout: if disconnect takes > 2s, exit anyway
+    const forceExit = setTimeout(() => app.exit(0), 2000);
+    customerDisplay.disconnect()
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(forceExit);
+        app.exit(0);
+      });
   }
 });
 
@@ -816,6 +919,11 @@ ipcMain.handle('users:getById', async (event, id) => {
 
 // Loans
 ipcMain.handle('loans:create', async (event, loanData) => {
+  // New behavior: if the renderer provides sale + items, create or append
+  // into an existing active restaurant parking tab.
+  if (loanData && loanData.sale && Array.isArray(loanData.items)) {
+    return db.createOrAppendLoan(loanData);
+  }
   return db.createLoan(loanData);
 });
 
@@ -1625,7 +1733,16 @@ ipcMain.handle('settings:get', async () => {
 });
 
 ipcMain.handle('settings:update', async (event, settings) => {
-  return db.updateSystemSettings(settings);
+  const updated = db.updateSystemSettings(settings);
+  try {
+    const p = (settings?.customerDisplayPort || settings?.customer_display_port || '').toString().trim().toUpperCase();
+    if (p) {
+      process.env.CUSTOMER_DISPLAY_PORT = p;
+    }
+  } catch {
+    // ignore
+  }
+  return updated;
 });
 
 // Category handlers
@@ -1803,7 +1920,8 @@ ipcMain.handle('scale:readWeight', async () => {
     try {
       const ports = await SerialPort.list();
       console.log('[Scale] All ports found:', ports.length);
-      const rankedPorts = rankScalePorts(ports);
+      const exclude = process.env.CUSTOMER_DISPLAY_PORT ? [String(process.env.CUSTOMER_DISPLAY_PORT)] : [];
+      const rankedPorts = rankScalePorts(ports, { excludePaths: exclude });
       const candidates = rankedPorts.length > 0 ? rankedPorts : [];
       
       // Build detailed port info for diagnostics
@@ -2050,4 +2168,458 @@ ipcMain.handle('scale:disconnect', async () => {
     return { success: false, message: error.message };
   }
 });
+
+// ============== CUSTOMER DISPLAY HANDLERS ==============
+
+// Initialize customer display
+async function initializeCustomerDisplay() {
+  if (!customerDisplay) {
+    customerDisplay = new CustomerDisplay();
+  }
+
+  customerDisplayLastInitAttemptAt = Date.now();
+
+  let success = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      success = await customerDisplay.initialize();
+      if (success) {
+        console.log('[CustomerDisplay] PREMIER CD-220 U connected and ready');
+        break;
+      } else {
+        console.log(`[CustomerDisplay] Attempt ${attempt + 1} failed, retrying...`);
+        await new Promise(res => setTimeout(res, 2000));
+      }
+    } catch (error) {
+      console.error(`[CustomerDisplay] Initialization error (attempt ${attempt + 1}):`, error);
+      await new Promise(res => setTimeout(res, 2000));
+    }
+  }
+  if (!success) {
+    console.log('[CustomerDisplay] Failed to initialize customer display after retries');
+  }
+  return success;
+}
+
+async function ensureCustomerDisplayConnected(force = false) {
+  if (!customerDisplay) {
+    customerDisplay = new CustomerDisplay();
+    customerDisplay.onPreviewLines = (payload) => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('customerDisplay:previewLines', payload);
+        }
+      } catch { /* ignore */ }
+    };
+  }
+
+  // If already connected, return immediately.
+  if (customerDisplay.isDisplayConnected && customerDisplay.isDisplayConnected()) {
+    return true;
+  }
+
+  // Not connected — attempt reconnect.
+  // Apply a short cooldown to avoid hammering SerialPort.list() on every
+  // rapid IPC call (e.g. multiple items scanned quickly), but only when
+  // a recent attempt was made in the last 500ms.
+  const now = Date.now();
+  const msSinceLastAttempt = now - customerDisplayLastInitAttemptAt;
+  if (!force && customerDisplayLastInitAttemptAt > 0 && msSinceLastAttempt < CUSTOMER_DISPLAY_INIT_COOLDOWN_MS) {
+    console.log(`[CustomerDisplay] Reconnect cooldown active (${msSinceLastAttempt}ms < ${CUSTOMER_DISPLAY_INIT_COOLDOWN_MS}ms), skipping`);
+    return false;
+  }
+
+  console.log('[CustomerDisplay] Not connected — attempting reconnect...');
+  customerDisplayLastInitAttemptAt = now;
+  try {
+    return await initializeCustomerDisplay();
+  } catch (err) {
+    console.error('[CustomerDisplay] Reconnect failed:', err.message);
+    return false;
+  }
+}
+
+// Customer display IPC handlers
+ipcMain.handle('customerDisplay:initialize', async () => {
+  try {
+    customerDisplayLastInitAttemptAt = Date.now();
+    const success = await initializeCustomerDisplay();
+    return { success, message: success ? 'Customer display initialized' : 'Failed to initialize customer display' };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:showWelcome', async () => {
+  try {
+    // Always compute+push preview to UI overlay (even without hardware).
+    if (!customerDisplay) {
+      customerDisplay = new CustomerDisplay();
+      customerDisplay.onPreviewLines = (payload) => {
+        try {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('customerDisplay:previewLines', payload);
+          }
+        } catch {
+          // ignore
+        }
+      };
+    }
+    const preview = customerDisplay.formatWelcomeLines();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('customerDisplay:previewLines', { ...preview, maxChars: customerDisplay.displaySize?.chars || 20 });
+    }
+
+    const connected = await ensureCustomerDisplayConnected();
+    if (!connected) {
+      return { success: false, message: 'Customer display not connected (preview shown)' };
+    }
+
+    await customerDisplay.showWelcomeMessage();
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:showItem', async (event, { itemName, price, currencySymbol, quantity = null, unitPrice = null, unit = null }) => {
+  try {
+    console.log(`[CustomerDisplay:showItem] called — item="${itemName}" price=${price} connected=${customerDisplay?.isConnected}`);
+    // Always compute+push preview to UI overlay (even without hardware).
+    if (!customerDisplay) {
+      customerDisplay = new CustomerDisplay();
+      customerDisplay.onPreviewLines = (payload) => {
+        try {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('customerDisplay:previewLines', payload);
+          }
+        } catch {
+          // ignore
+        }
+      };
+    }
+    const preview = customerDisplay.formatCurrentItemLines(itemName, price, currencySymbol, quantity, unitPrice, unit);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('customerDisplay:previewLines', { ...preview, maxChars: customerDisplay.displaySize?.chars || 20 });
+    }
+
+    const connected = await ensureCustomerDisplayConnected();
+    console.log(`[CustomerDisplay:showItem] ensureConnected=${connected}`);
+    if (!connected) {
+      console.warn('[CustomerDisplay:showItem] NOT connected — item will NOT show on hardware display');
+      return { success: false, message: 'Customer display not connected (preview shown)' };
+    }
+
+    try {
+      await customerDisplay.showCurrentItem(itemName, price, currencySymbol, quantity, unitPrice, unit);
+      console.log(`[CustomerDisplay:showItem] sent to display OK`);
+      return { success: true };
+    } catch (sendErr) {
+      // If the device dropped / driver hiccuped, try one quick reconnect+retry.
+      console.warn('[CustomerDisplay:showItem] send failed, retrying once:', sendErr.message);
+      try {
+        if (customerDisplay && typeof customerDisplay.reconnectQuick === 'function') {
+          await customerDisplay.reconnectQuick();
+        } else if (customerDisplay) {
+          await customerDisplay.disconnect().catch(() => {});
+          await initializeCustomerDisplay();
+        }
+        await customerDisplay.showCurrentItem(itemName, price, currencySymbol, quantity, unitPrice, unit);
+        console.log('[CustomerDisplay:showItem] retry succeeded');
+        return { success: true, retried: true };
+      } catch (retryErr) {
+        console.error('[CustomerDisplay:showItem] retry failed:', retryErr.message);
+        return { success: false, message: retryErr.message };
+      }
+    }
+  } catch (error) {
+    console.error('[CustomerDisplay:showItem] error:', error.message);
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:showTotal', async (event, { total, currencySymbol }) => {
+  try {
+    // Always compute+push preview to UI overlay (even without hardware).
+    if (!customerDisplay) {
+      customerDisplay = new CustomerDisplay();
+      customerDisplay.onPreviewLines = (payload) => {
+        try {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('customerDisplay:previewLines', payload);
+          }
+        } catch {
+          // ignore
+        }
+      };
+    }
+    const preview = customerDisplay.formatTotalLines(total, currencySymbol);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('customerDisplay:previewLines', { ...preview, maxChars: customerDisplay.displaySize?.chars || 20 });
+    }
+
+    const connected = await ensureCustomerDisplayConnected();
+    if (!connected) {
+      return { success: false, message: 'Customer display not connected (preview shown)' };
+    }
+
+    await customerDisplay.showTotal(total, currencySymbol);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:showChange', async (event, { changeAmount, currencySymbol }) => {
+  const connected = await ensureCustomerDisplayConnected();
+  if (!connected) {
+    return { success: false, message: 'Customer display not connected' };
+  }
+  
+  try {
+    await customerDisplay.showChange(changeAmount, currencySymbol);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:showPaymentSummary', async (event, { total, paid, change, currencySymbol }) => {
+  const connected = await ensureCustomerDisplayConnected();
+  if (!connected) {
+    return { success: false, message: 'Customer display not connected' };
+  }
+
+  try {
+    if (typeof customerDisplay.showPaymentSummary !== 'function') {
+      return { success: false, message: 'Customer display firmware command not supported' };
+    }
+    await customerDisplay.showPaymentSummary(total, paid, change, currencySymbol);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:showPayment', async (event, { paymentMethod }) => {
+  const connected = await ensureCustomerDisplayConnected();
+  if (!connected) {
+    return { success: false, message: 'Customer display not connected' };
+  }
+  
+  try {
+    await customerDisplay.showPaymentProcessing(paymentMethod);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:showThankYou', async (event, { changeAmount, currencySymbol }) => {
+  const connected = await ensureCustomerDisplayConnected();
+  if (!connected) {
+    return { success: false, message: 'Customer display not connected' };
+  }
+  
+  try {
+    await customerDisplay.showThankYou(changeAmount, currencySymbol);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:clear', async () => {
+  const connected = await ensureCustomerDisplayConnected();
+  if (!connected) {
+    return { success: false, message: 'Customer display not connected' };
+  }
+  
+  try {
+    await customerDisplay.clearDisplay();
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:getStatus', async () => {
+  if (!customerDisplay) {
+    return { 
+      connected: false, 
+      info: { 
+        model: 'PREMIER CD-220 U', 
+        lines: 2, 
+        characters: 20, 
+        connected: false,
+        serialPortAvailable: false,
+        troubleshooting: {
+          suggestions: [
+            'Make sure the customer display is plugged into a USB port',
+            'Install required modules: npm install serialport',
+            'Restart the application after connecting the display'
+          ]
+        }
+      }
+    };
+  }
+  
+  return {
+    connected: customerDisplay.isDisplayConnected(),
+    info: customerDisplay.getDisplayInfo()
+  };
+});
+
+ipcMain.handle('customerDisplay:getConnectionStatus', async () => {
+  if (!customerDisplay) {
+    return {
+      connected: false,
+      serialPortAvailable: false,
+      availablePorts: [],
+      error: 'Customer display not initialized'
+    };
+  }
+  
+  try {
+    const status = await customerDisplay.getConnectionStatus();
+    return {
+      ...status,
+      preferredPort: process.env.CUSTOMER_DISPLAY_PORT || null,
+      excludedPorts: process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS || null
+    };
+  } catch (error) {
+    return {
+      connected: false,
+      serialPortAvailable: false,
+      availablePorts: [],
+      error: error.message
+    };
+  }
+});
+
+// Touchscreen: set preferred COM port and reconnect
+ipcMain.handle('customerDisplay:setPreferredPort', async (_event, { portPath }) => {
+  try {
+    const raw = portPath ? String(portPath).trim() : '';
+    const p = raw.toUpperCase();
+
+    // Allow clearing the preference (AUTO mode)
+    if (!p) {
+      db.setCustomerDisplayPort(null);
+      delete process.env.CUSTOMER_DISPLAY_PORT;
+      if (customerDisplay) {
+        try { await customerDisplay.disconnect(); } catch { /* ignore */ }
+      }
+      const success = await initializeCustomerDisplay();
+      return { success, message: success ? 'Customer display set to AUTO' : 'AUTO: Failed to connect' };
+    }
+    if (p && !/^COM\d+$/i.test(p)) {
+      return { success: false, message: `Invalid port: ${raw}` };
+    }
+
+    // Verify port exists (best-effort) so we don't accidentally save COM1 etc.
+    if (p && SerialPort) {
+      try {
+        const ports = await SerialPort.list();
+        const exists = ports.some(x => String(x.path || '').toUpperCase() === p);
+        if (!exists) {
+          return { success: false, message: `Port not found: ${p}` };
+        }
+      } catch {
+        // ignore verification failure
+      }
+    }
+
+    db.setCustomerDisplayPort(p || null);
+    if (p) process.env.CUSTOMER_DISPLAY_PORT = p;
+    if (customerDisplay) {
+      try { await customerDisplay.disconnect(); } catch { /* ignore */ }
+    }
+    const success = await initializeCustomerDisplay();
+    return { success, message: success ? `Customer display set to ${p}` : `Failed to connect to ${p}` };
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+});
+
+// Touchscreen: attempt to reset (disable/enable) the Windows device for the selected COM port.
+// This fixes the common "Access denied" state without requiring a physical unplug/replug.
+ipcMain.handle('customerDisplay:resetDevice', async () => {
+  if (process.platform !== 'win32') {
+    return { success: false, message: 'Device reset is only supported on Windows' };
+  }
+
+  const preferred = (process.env.CUSTOMER_DISPLAY_PORT || '').toString().trim().toUpperCase();
+  if (!preferred) {
+    return { success: false, message: 'No preferred port set. Choose COM port first.' };
+  }
+
+  const { exec } = require('child_process');
+  const { promisify } = require('util');
+  const execPromise = promisify(exec);
+
+  // PowerShell: find the Ports-class device whose FriendlyName contains "(COM12)", then disable+enable it.
+  // NOTE: Disable/Enable usually requires Administrator privileges.
+  const ps = `
+$ErrorActionPreference = 'Stop'
+$port = '${preferred}'
+$dev = Get-PnpDevice -Class Ports | Where-Object { $_.FriendlyName -match '\\(' + $port + '\\)' } | Select-Object -First 1
+if (-not $dev) { throw "No Ports device found for $port" }
+Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false | Out-Null
+Start-Sleep -Milliseconds 800
+Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false | Out-Null
+"RESET_OK: $($dev.FriendlyName)"
+`;
+
+  try {
+    const { stdout } = await execPromise(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps.replace(/\n/g, '; ').replace(/"/g, '\\"')}"`);
+    // Give Windows some time to re-enumerate the COM port.
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Reconnect customer display
+    try {
+      if (customerDisplay) await customerDisplay.disconnect();
+    } catch {
+      // ignore
+    }
+    const ok = await initializeCustomerDisplay();
+    return { success: ok, message: (stdout || '').toString().trim() || (ok ? 'Reset OK' : 'Reset done, connect failed') };
+  } catch (e) {
+    const msg = e?.message || String(e);
+    // Typical failure: requires admin
+    return { success: false, message: `Reset failed: ${msg}. Try running POS as Administrator.` };
+  }
+});
+
+ipcMain.handle('customerDisplay:reconnect', async () => {
+  try {
+    if (customerDisplay) {
+      await customerDisplay.disconnect();
+    }
+    const success = await initializeCustomerDisplay();
+    return { 
+      success, 
+      message: success ? 'Customer display reconnected successfully' : 'Failed to reconnect customer display'
+    };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('customerDisplay:disconnect', async () => {
+  if (customerDisplay) {
+    try {
+      await customerDisplay.disconnect();
+      return { success: true, message: 'Customer display disconnected' };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  }
+  return { success: true, message: 'No customer display to disconnect' };
+});
+
+// Initialize customer display when app starts
+setTimeout(() => {
+  initializeCustomerDisplay();
+}, 2000); // Wait 2 seconds after app start
 

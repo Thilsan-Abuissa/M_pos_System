@@ -3,6 +3,9 @@ const { contextBridge, ipcRenderer } = require('electron');
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('api', {
+  // App
+  getAppVersion: () => ipcRenderer.invoke('app:getVersion'),
+
   // Products
   getAllProducts: () => ipcRenderer.invoke('products:getAll'),
   searchProducts: (query) => ipcRenderer.invoke('products:search', query),
@@ -101,5 +104,45 @@ contextBridge.exposeInMainWorld('api', {
   connectScale: (portPath) => ipcRenderer.invoke('scale:connect', portPath),
   readScaleWeight: () => ipcRenderer.invoke('scale:readWeight'),
   getScaleModuleStatus: () => ipcRenderer.invoke('scale:moduleStatus'),
-  disconnectScale: () => ipcRenderer.invoke('scale:disconnect')
+  disconnectScale: () => ipcRenderer.invoke('scale:disconnect'),
+  
+  // Customer Display
+  initializeCustomerDisplay: () => ipcRenderer.invoke('customerDisplay:initialize'),
+  showWelcomeMessage: () => ipcRenderer.invoke('customerDisplay:showWelcome'),
+  // showCurrentItem(itemName, totalPrice, currencySymbol, quantity?, unitPrice?, unit?)
+  showCurrentItem: (itemName, price, currencySymbol, quantity = null, unitPrice = null, unit = null) => ipcRenderer.invoke('customerDisplay:showItem', { itemName, price, currencySymbol, quantity, unitPrice, unit }),
+  showTotal: (total, currencySymbol) => ipcRenderer.invoke('customerDisplay:showTotal', { total, currencySymbol }),
+  showChange: (changeAmount, currencySymbol) => ipcRenderer.invoke('customerDisplay:showChange', { changeAmount, currencySymbol }),
+  showPaymentSummary: (total, paid, change, currencySymbol) => ipcRenderer.invoke('customerDisplay:showPaymentSummary', { total, paid, change, currencySymbol }),
+  showPaymentProcessing: (paymentMethod) => ipcRenderer.invoke('customerDisplay:showPayment', { paymentMethod }),
+  showThankYou: (changeAmount, currencySymbol) => ipcRenderer.invoke('customerDisplay:showThankYou', { changeAmount, currencySymbol }),
+  clearCustomerDisplay: () => ipcRenderer.invoke('customerDisplay:clear'),
+  getCustomerDisplayStatus: () => ipcRenderer.invoke('customerDisplay:getStatus'),
+  getCustomerDisplayConnectionStatus: () => ipcRenderer.invoke('customerDisplay:getConnectionStatus'),
+  disconnectCustomerDisplay: () => ipcRenderer.invoke('customerDisplay:disconnect')
+
+  ,
+
+  reconnectCustomerDisplay: () => ipcRenderer.invoke('customerDisplay:reconnect')
+
+  ,
+
+  setCustomerDisplayPreferredPort: (portPath) => ipcRenderer.invoke('customerDisplay:setPreferredPort', { portPath })
+
+  ,
+
+  resetCustomerDisplayDevice: () => ipcRenderer.invoke('customerDisplay:resetDevice')
+
+  ,
+
+  // Customer Display (Preview/Inspect)
+  // Subscribe to preview lines pushed from main process.
+  // Returns an unsubscribe function.
+  onCustomerDisplayPreview: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const channel = 'customerDisplay:previewLines';
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on(channel, listener);
+    return () => ipcRenderer.removeListener(channel, listener);
+  }
 });
