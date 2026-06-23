@@ -4,21 +4,39 @@ const { contextBridge, ipcRenderer } = require('electron');
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('api', {
   // App
+  getProductById: (id) => ipcRenderer.invoke('products:getById', id),
   getAppVersion: () => ipcRenderer.invoke('app:getVersion'),
+
+  // Activation
+  archiveProduct: (id) => ipcRenderer.invoke('products:archive', id),
+  getActivationStatus: () => ipcRenderer.invoke('activation:getStatus'),
+  activateApp: (key) => ipcRenderer.invoke('activation:activate', key),
 
   // Products
   getAllProducts: () => ipcRenderer.invoke('products:getAll'),
+  getAllProductsLite: () => ipcRenderer.invoke('products:getAllLite'),
   searchProducts: (query) => ipcRenderer.invoke('products:search', query),
   getProductByBarcode: (barcode) => ipcRenderer.invoke('products:getByBarcode', barcode),
   addProduct: (product) => ipcRenderer.invoke('products:add', product),
+  bulkAddProducts: (products) => ipcRenderer.invoke('products:bulkAdd', products),
   updateProduct: (id, product) => ipcRenderer.invoke('products:update', id, product),
+  setProductShowInCheckout: (id, showInCheckout) => ipcRenderer.invoke('products:setShowInCheckout', id, showInCheckout),
   deleteProduct: (id) => ipcRenderer.invoke('products:delete', id),
+  // VAT (IVA) presets
+  getVatRates: (activeOnly = true) => ipcRenderer.invoke('vatRates:getAll', activeOnly),
+  addVatRate: (percent, label = null) => ipcRenderer.invoke('vatRates:add', percent, label),
+  getProductSortOrder: (scopeCategory, scopeSubcategory) => ipcRenderer.invoke('products:getSortOrder', scopeCategory, scopeSubcategory),
+  setProductSortOrder: (scopeCategory, scopeSubcategory, productIds) => ipcRenderer.invoke('products:setSortOrder', scopeCategory, scopeSubcategory, productIds),
   
   // Sales
   createSale: (sale) => ipcRenderer.invoke('sales:create', sale),
   getAllSales: (filters) => ipcRenderer.invoke('sales:getAll', filters),
   getSaleById: (id) => ipcRenderer.invoke('sales:getById', id),
   getTodaySales: () => ipcRenderer.invoke('sales:getToday'),
+  getYesterdaySales: () => ipcRenderer.invoke('sales:getYesterday'),
+
+  // Business day (Z-report closes day)
+  getBusinessDayRange: (which) => ipcRenderer.invoke('business:getRange', which),
   
   // Reports
   getSalesReport: (startDate, endDate) => ipcRenderer.invoke('reports:sales', startDate, endDate),
@@ -39,15 +57,19 @@ contextBridge.exposeInMainWorld('api', {
   // Loans
   createLoan: (loanData) => ipcRenderer.invoke('loans:create', loanData),
   getAllLoans: (status) => ipcRenderer.invoke('loans:getAll', status),
+  searchLoans: (query, status) => ipcRenderer.invoke('loans:search', query, status),
+  listLoanParties: (query, limit) => ipcRenderer.invoke('loans:listParties', query, limit),
   getLoanByReceipt: (receiptNumber) => ipcRenderer.invoke('loans:getByReceipt', receiptNumber),
   payLoan: (loanId, paymentData) => ipcRenderer.invoke('loans:pay', loanId, paymentData),
   getLoanById: (id) => ipcRenderer.invoke('loans:getById', id),
   getMonthlyRestaurantReport: (month, year) => ipcRenderer.invoke('loans:getMonthlyRestaurantReport', month, year),
+  removeLoanSaleItem: (loanId, saleItemId) => ipcRenderer.invoke('loans:removeSaleItem', loanId, saleItemId),
   
   // Returns
   createReturn: (returnData) => ipcRenderer.invoke('returns:create', returnData),
   getAllReturns: () => ipcRenderer.invoke('returns:getAll'),
   getReturnById: (id) => ipcRenderer.invoke('returns:getById', id),
+  getReturnBySaleId: (originalSaleId) => ipcRenderer.invoke('returns:getBySaleId', originalSaleId),
   
   // Z-Reports
   createZReport: (reportData) => ipcRenderer.invoke('zreport:create', reportData),
@@ -55,12 +77,25 @@ contextBridge.exposeInMainWorld('api', {
   getZReportById: (id) => ipcRenderer.invoke('zreport:getById', id),
   getZReportByNumber: (reportNumber) => ipcRenderer.invoke('zreport:getByNumber', reportNumber),
   getSalesByDateRange: (startDate, endDate, cashierId) => ipcRenderer.invoke('zreport:getSalesByDateRange', startDate, endDate, cashierId),
+  getSalesByDateTimeRange: (startDateTime, endDateTime, cashierId) => ipcRenderer.invoke('zreport:getSalesByDateTimeRange', startDateTime, endDateTime, cashierId),
   getReturnsByDateRange: (startDate, endDate, cashierId) => ipcRenderer.invoke('zreport:getReturnsByDateRange', startDate, endDate, cashierId),
+  getReturnsByDateTimeRange: (startDateTime, endDateTime, cashierId) => ipcRenderer.invoke('zreport:getReturnsByDateTimeRange', startDateTime, endDateTime, cashierId),
   getLoanPaymentsByDateRange: (startDate, endDate, cashierId) => ipcRenderer.invoke('zreport:getLoanPaymentsByDateRange', startDate, endDate, cashierId),
-  
+  getLoanPaymentsByDateTimeRange: (startDateTime, endDateTime, cashierId) => ipcRenderer.invoke('zreport:getLoanPaymentsByDateTimeRange', startDateTime, endDateTime, cashierId),
+  getLoanPaymentsDetailedByDateTimeRange: (startDateTime, endDateTime, cashierId) => ipcRenderer.invoke('zreport:getLoanPaymentsDetailedByDateTimeRange', startDateTime, endDateTime, cashierId),
+  getMonthlySalesActualTotals: () => ipcRenderer.invoke('zreport:getMonthlySalesActualTotals'),
+
   // System Settings
   getSystemSettings: () => ipcRenderer.invoke('settings:get'),
   updateSystemSettings: (settings) => ipcRenderer.invoke('settings:update', settings),
+
+  // Printing
+  printBarcodeLabel: (barcodeData) => ipcRenderer.invoke('printer:printBarcode', barcodeData),
+
+  // Database
+  backupDatabase: () => ipcRenderer.invoke('db:backup'),
+  restoreDatabase: () => ipcRenderer.invoke('db:restore'),
+  clearTestData: () => ipcRenderer.invoke('db:clearTestData'),
   
   // Categories
   getAllCategories: () => ipcRenderer.invoke('categories:getAll'),
@@ -88,16 +123,17 @@ contextBridge.exposeInMainWorld('api', {
   // Printer
   openCashDrawer: () => ipcRenderer.invoke('printer:openDrawer'),
   printReceipt: (receiptData) => ipcRenderer.invoke('printer:printReceipt', receiptData),
-  printBarcodeLabel: (barcodeData) => ipcRenderer.invoke('printer:printBarcode', barcodeData),
   getPrinterList: () => ipcRenderer.invoke('printer:getList'),
   
   // Expenses
   createExpense: (expenseData) => ipcRenderer.invoke('expenses:create', expenseData),
   getExpenses: (startDate, endDate) => ipcRenderer.invoke('expenses:getAll', startDate, endDate),
+  getExpensesByDateTimeRange: (startDateTime, endDateTime) => ipcRenderer.invoke('expenses:getAllByDateTimeRange', startDateTime, endDateTime),
   getExpenseById: (id) => ipcRenderer.invoke('expenses:getById', id),
   updateExpense: (id, expenseData) => ipcRenderer.invoke('expenses:update', id, expenseData),
   deleteExpense: (id) => ipcRenderer.invoke('expenses:delete', id),
   getExpenseSummary: (startDate, endDate) => ipcRenderer.invoke('expenses:getSummary', startDate, endDate),
+  getExpenseSummaryByDateTimeRange: (startDateTime, endDateTime) => ipcRenderer.invoke('expenses:getSummaryByDateTimeRange', startDateTime, endDateTime),
   
   // Scale
   listScalePorts: () => ipcRenderer.invoke('scale:listPorts'),

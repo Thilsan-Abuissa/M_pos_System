@@ -1,6 +1,6 @@
 {
   "name": "supermarket-pos",
-  "version": "80.0.55",
+  "version": "80.6.7",
   "description": "Cross-platform Supermarket POS System",
   "main": "main.js",
   "scripts": {
@@ -23,14 +23,16 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^28.0.0",
+    "electron": "^28.3.3",
     "electron-builder": "^24.9.1",
     "electron-rebuild": "^3.2.9"
   },
   "dependencies": {
     "@serialport/parser-readline": "^13.0.0",
     "better-sqlite3": "^11.10.0",
+    "bwip-js": "^4.6.0",
     "iconv-lite": "^0.6.3",
+    "jsbarcode": "^3.11.6",
     "serialport": "^13.0.0"
   },
   "build": {
@@ -71,6 +73,7 @@
       "database.js",
       "customer-display.js",
       "preload.js",
+      "customer-display-preload.js",
       "node_modules/**/*",
       "!node_modules/@serialport/bindings-cpp/build/**",
       "!pos_system.db",

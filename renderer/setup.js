@@ -71,6 +71,9 @@ function setupVirtualKeyboard() {
   const closeKeyboardBtn = document.getElementById('closeKeyboard');
   const keyButtons = document.querySelectorAll('.key-btn');
   let keyboardMode = 'text'; // 'text' | 'numeric'
+
+  // Virtual keyboard removed: safely do nothing.
+  if (!keyboard || !closeKeyboardBtn || !keyButtons || keyButtons.length === 0) return;
   
   // Initialize keyboard in lowercase mode
   keyButtons.forEach(btn => {

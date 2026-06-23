@@ -5,241 +5,1112 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Customer Display</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
+    :root {
+      --bg0: #070A12;
+      --bg1: #0B1020;
+      --text: rgba(255,255,255,0.94);
+      --muted: rgba(255,255,255,0.64);
+      --muted2: rgba(255,255,255,0.44);
+      --border: rgba(255, 255, 255, 0.10);
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+      --panel: rgba(255,255,255,0.08);
+      --panel2: rgba(255,255,255,0.06);
+
+      --accentA: #2563eb;
+      --accentB: #06b6d4;
+      --accentC: #22c55e;
+      --danger: #ef4444;
+
+      --chipBg: rgba(255, 255, 255, 0.08);
+      --chipBorder: rgba(255, 255, 255, 0.16);
+      --ringA: rgba(37, 99, 235, 0.25);
+      --ringB: rgba(6, 182, 212, 0.22);
     }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body { height: 100%; }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:
+        radial-gradient(1000px 600px at 18% 22%, rgba(37, 99, 235, 0.34), transparent 60%),
+        radial-gradient(900px 560px at 86% 24%, rgba(6, 182, 212, 0.26), transparent 62%),
+        radial-gradient(900px 560px at 70% 88%, rgba(34, 197, 94, 0.10), transparent 62%),
+        linear-gradient(180deg, var(--bg1) 0%, var(--bg0) 100%);
+      color: var(--text);
       overflow: hidden;
     }
 
-    .header {
-      background: rgba(0, 0, 0, 0.3);
-      padding: 30px;
-      text-align: center;
-      border-bottom: 3px solid rgba(255, 255, 255, 0.2);
+    .bg-shape {
+      position: fixed;
+      inset: -140px -140px auto auto;
+      width: 520px;
+      height: 520px;
+      border-radius: 999px;
+      background: radial-gradient(circle at 30% 30%, rgba(37, 99, 235, 0.35), transparent 62%);
+      filter: blur(14px);
+      opacity: 0.8;
+      pointer-events: none;
+      z-index: 0;
     }
 
-    .header h1 {
-      font-size: 48px;
-      font-weight: 800;
-      text-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    .bg-shape2 {
+      position: fixed;
+      inset: auto auto -160px -160px;
+      width: 620px;
+      height: 620px;
+      border-radius: 999px;
+      background: radial-gradient(circle at 45% 40%, rgba(6, 182, 212, 0.26), transparent 62%);
+      filter: blur(16px);
+      opacity: 0.7;
+      pointer-events: none;
+      z-index: 0;
     }
 
-    .content {
-      flex: 1;
+    .topbar {
       display: flex;
-      flex-direction: column;
-      padding: 40px;
-      overflow: hidden;
-    }
-
-    .items-container {
-      flex: 1;
-      overflow-y: auto;
-      margin-bottom: 30px;
-    }
-
-    .item-row {
-      background: rgba(255, 255, 255, 0.15);
-      backdrop-filter: blur(10px);
-      padding: 20px 30px;
-      margin-bottom: 15px;
-      border-radius: 16px;
-      display: flex;
-      justify-content: space-between;
       align-items: center;
-      border: 2px solid rgba(255, 255, 255, 0.2);
-      animation: slideIn 0.3s ease-out;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 22px 28px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: linear-gradient(180deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 100%);
+      backdrop-filter: blur(12px);
+      position: relative;
+      z-index: 1;
     }
 
-    @keyframes slideIn {
-      from {
-        opacity: 0;
-        transform: translateX(-20px);
-      }
-      to {
-        opacity: 1;
-        transform: translateX(0);
-      }
+    .brand {
+      font-size: 42px;
+      font-weight: 950;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.96);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    .item-info {
-      flex: 1;
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex: 0 0 auto;
     }
 
-    .item-name {
-      font-size: 32px;
-      font-weight: 700;
-      margin-bottom: 8px;
-    }
-
-    .item-details {
-      font-size: 24px;
-      opacity: 0.9;
-    }
-
-    .item-price {
-      font-size: 36px;
-      font-weight: 800;
+    .clock {
+      font-variant-numeric: tabular-nums;
+      font-size: 22px;
+      font-weight: 900;
+      color: rgba(255,255,255,0.70);
+      min-width: 110px;
       text-align: right;
     }
 
-    .total-section {
-      background: rgba(0, 0, 0, 0.4);
-      padding: 30px 40px;
-      border-radius: 20px;
-      border: 3px solid rgba(255, 255, 255, 0.3);
+    .status-pill {
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--chipBorder);
+      background: var(--chipBg);
+      font-size: 18px;
+      font-weight: 900;
+      letter-spacing: 0.25px;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.92);
+      white-space: nowrap;
+      max-width: 520px;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    .total-row {
+    .status-pill.state-ready {
+      border-color: rgba(255, 255, 255, 0.18);
+    }
+
+    .status-pill.state-scan {
+      border-color: rgba(6, 182, 212, 0.60);
+      box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.10);
+    }
+
+    .status-pill.state-payment {
+      border-color: rgba(37, 99, 235, 0.68);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.10);
+    }
+
+    .status-pill.state-thanks {
+      border-color: rgba(34, 197, 94, 0.65);
+      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.10);
+    }
+
+    .layout {
+      height: calc(100% - 86px);
+      display: grid;
+      grid-template-columns: 1.55fr 1fr;
+      gap: 22px;
+      padding: 22px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(255,255,255,0.10) 0%, rgba(255,255,255,0.07) 100%);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(14px);
+    }
+
+    .panel-header {
+      padding: 18px 20px;
+      border-bottom: 1px solid rgba(255,255,255,0.10);
+      background: linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.03) 100%);
       display: flex;
+      align-items: baseline;
       justify-content: space-between;
-      align-items: center;
-      margin-bottom: 15px;
+      gap: 12px;
     }
 
-    .total-label {
-      font-size: 28px;
-      font-weight: 600;
+    .panel-title {
+      font-size: 22px;
+      font-weight: 950;
+      text-transform: uppercase;
+      letter-spacing: 0.35px;
+      color: rgba(255,255,255,0.88);
     }
 
-    .total-value {
-      font-size: 32px;
-      font-weight: 700;
-    }
-
-    .grand-total {
-      border-top: 3px solid rgba(255, 255, 255, 0.3);
-      padding-top: 20px;
-      margin-top: 10px;
-    }
-
-    .grand-total .total-label {
-      font-size: 36px;
+    .panel-subtitle {
+      font-size: 16px;
+      color: rgba(255,255,255,0.62);
       font-weight: 800;
     }
 
-    .grand-total .total-value {
-      font-size: 48px;
-      font-weight: 900;
-      color: #ffd700;
-      text-shadow: 0 2px 10px rgba(255, 215, 0, 0.5);
+    .items-list {
+      height: calc(100% - 64px);
+      overflow: auto;
+      padding: 10px 12px;
     }
 
-    .empty-state {
+    .items-head {
+      display: grid;
+      grid-template-columns: 1fr 130px;
+      gap: 12px;
+      padding: 10px 16px 8px;
+      color: rgba(255,255,255,0.54);
+      font-weight: 950;
+      letter-spacing: 0.22px;
+      text-transform: uppercase;
+      font-size: 13px;
+    }
+
+    .items-head .right {
+      display: flex;
+      justify-content: flex-end;
+      gap: 18px;
+    }
+
+    .item-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,0.10);
+      margin: 10px 0;
+      background: rgba(255,255,255,0.06);
+    }
+
+    .item-row.highlight {
+      background: linear-gradient(135deg, rgba(37, 99, 235, 0.22) 0%, rgba(6, 182, 212, 0.18) 100%);
+      border-color: rgba(6, 182, 212, 0.32);
+      box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.08);
+    }
+
+    @keyframes pop {
+      0% { transform: scale(1); }
+      45% { transform: scale(1.012); }
+      100% { transform: scale(1); }
+    }
+
+    .item-row.highlight.pop {
+      animation: pop 260ms ease-out;
+    }
+
+    .item-name {
+      font-size: 28px;
+      font-weight: 950;
+      line-height: 1.1;
+      word-break: break-word;
+    }
+
+    .item-meta {
+      margin-top: 6px;
+      font-size: 18px;
+      font-weight: 800;
+      color: rgba(255,255,255,0.62);
+    }
+
+    .item-row.highlight .item-meta {
+      color: rgba(255,255,255,0.75);
+    }
+
+    .item-amount {
+      font-size: 34px;
+      font-weight: 1000;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .meta-grid {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.08);
+      font-size: 14px;
+      font-weight: 950;
+      color: rgba(255,255,255,0.88);
+    }
+
+    .empty {
+      height: calc(100% - 64px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
       text-align: center;
-      padding: 60px;
-      opacity: 0.7;
+      padding: 26px;
+      color: rgba(255,255,255,0.62);
     }
 
-    .empty-state .icon {
-      font-size: 120px;
-      margin-bottom: 20px;
+    .empty h2 {
+      font-size: 42px;
+      font-weight: 1000;
+      margin-bottom: 10px;
+      color: rgba(255,255,255,0.92);
     }
 
-    .empty-state p {
-      font-size: 36px;
-      font-weight: 600;
+    .empty p {
+      font-size: 22px;
+      font-weight: 800;
+      opacity: 0.9;
     }
 
-    /* Scrollbar styles */
-    .items-container::-webkit-scrollbar {
-      width: 10px;
+    .empty .hint {
+      margin-top: 14px;
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 14px;
+      border-radius: 14px;
+      border: 1px dashed rgba(255,255,255,0.20);
+      background: rgba(255,255,255,0.06);
+      color: rgba(255,255,255,0.82);
+      font-weight: 900;
+      font-size: 16px;
     }
 
-    .items-container::-webkit-scrollbar-track {
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 10px;
+    .welcome-box {
+      width: min(560px, 92%);
+      padding: 34px 28px 26px;
+      border-radius: 26px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background:
+        radial-gradient(700px 260px at 18% 10%, rgba(37,99,235,0.22), transparent 60%),
+        radial-gradient(700px 260px at 86% 16%, rgba(6,182,212,0.18), transparent 60%),
+        rgba(255,255,255,0.06);
+      box-shadow: 0 26px 70px rgba(0,0,0,0.50);
+      backdrop-filter: blur(16px);
+      position: relative;
+      overflow: hidden;
     }
 
-    .items-container::-webkit-scrollbar-thumb {
-      background: rgba(255, 255, 255, 0.3);
-      border-radius: 10px;
+    .welcome-box::before {
+      content: '';
+      position: absolute;
+      inset: -2px;
+      background: linear-gradient(120deg, rgba(37,99,235,0.55), rgba(6,182,212,0.45), rgba(34,197,94,0.22));
+      opacity: 0.12;
+      filter: blur(18px);
+      pointer-events: none;
     }
 
-    .items-container::-webkit-scrollbar-thumb:hover {
-      background: rgba(255, 255, 255, 0.5);
+    .welcome-mark {
+      width: 74px;
+      height: 74px;
+      border-radius: 999px;
+      margin: 0 auto 18px;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at 30% 25%, rgba(255,255,255,0.30), rgba(255,255,255,0.08) 55%, rgba(255,255,255,0.06) 100%);
+      border: 1px solid rgba(255,255,255,0.18);
+      box-shadow: 0 18px 45px rgba(0,0,0,0.35);
+      position: relative;
+      z-index: 1;
+    }
+
+    .welcome-mark svg {
+      width: 36px;
+      height: 36px;
+      opacity: 0.92;
+    }
+
+    .welcome-title {
+      font-size: 46px;
+      font-weight: 1100;
+      line-height: 1.05;
+      margin: 0;
+      position: relative;
+      z-index: 1;
+      background: linear-gradient(90deg, rgba(255,255,255,0.98) 0%, rgba(255,255,255,0.88) 40%, rgba(6,182,212,0.95) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      letter-spacing: 0.2px;
+    }
+
+    .welcome-subtitle {
+      margin-top: 10px;
+      font-size: 18px;
+      font-weight: 850;
+      color: rgba(255,255,255,0.74);
+      position: relative;
+      z-index: 1;
+    }
+
+    .welcome-actions {
+      margin-top: 16px;
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      position: relative;
+      z-index: 1;
+    }
+
+    .welcome-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.07);
+      color: rgba(255,255,255,0.90);
+      font-weight: 950;
+      font-size: 16px;
+      letter-spacing: 0.15px;
+    }
+
+    .welcome-chip.primary {
+      border-color: rgba(6,182,212,0.35);
+      background: linear-gradient(135deg, rgba(37,99,235,0.22), rgba(6,182,212,0.16));
+      box-shadow: 0 0 0 3px rgba(6,182,212,0.08);
+    }
+
+    @keyframes welcomeTick {
+      0% { opacity: 0.0; transform: translateY(8px) scale(0.995); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .welcome-box.tick {
+      animation: welcomeTick 280ms ease-out;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 22px;
+      height: 100%;
+    }
+
+    .last-item {
+      padding: 20px 20px 18px;
+      position: relative;
+    }
+
+    .last-item::before {
+      content: '';
+      position: absolute;
+      inset: 0 0 auto 0;
+      height: 6px;
+      background: linear-gradient(90deg, var(--accentA) 0%, var(--accentB) 55%, rgba(34,197,94,0.85) 100%);
+    }
+
+    .last-item .label {
+      font-size: 16px;
+      font-weight: 950;
+      letter-spacing: 0.35px;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.60);
+    }
+
+    .last-item .name {
+      margin-top: 10px;
+      font-size: 34px;
+      font-weight: 1000;
+      line-height: 1.08;
+      word-break: break-word;
+    }
+
+    .last-item .meta {
+      margin-top: 10px;
+      font-size: 20px;
+      font-weight: 900;
+      color: rgba(255,255,255,0.66);
+    }
+
+    .last-item .amount {
+      margin-top: 14px;
+      font-size: 56px;
+      font-weight: 1100;
+      font-variant-numeric: tabular-nums;
+      color: rgba(255,255,255,0.96);
+    }
+
+    .totals {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .row .k {
+      font-size: 20px;
+      font-weight: 950;
+      color: rgba(255,255,255,0.60);
+      text-transform: uppercase;
+      letter-spacing: 0.25px;
+    }
+
+    .row .v {
+      font-size: 26px;
+      font-weight: 1000;
+      color: rgba(255,255,255,0.92);
+      white-space: nowrap;
+    }
+
+    .divider {
+      border-top: 1px solid var(--border);
+      margin: 6px 0 2px;
+    }
+
+    .grand {
+      margin-top: auto;
+      padding-top: 14px;
+      border-top: 1px solid rgba(255,255,255,0.12);
+    }
+
+    .grand .k {
+      color: rgba(255,255,255,0.86);
+      font-size: 22px;
+    }
+
+    .grand .v {
+      font-size: 54px;
+      font-weight: 1100;
+      background: linear-gradient(90deg, var(--accentA) 0%, var(--accentB) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .total-card {
+      margin-top: 10px;
+      border-radius: 20px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background:
+        radial-gradient(700px 220px at 10% 30%, rgba(37, 99, 235, 0.35), transparent 60%),
+        radial-gradient(700px 220px at 90% 40%, rgba(6, 182, 212, 0.25), transparent 60%),
+        rgba(255,255,255,0.06);
+      padding: 16px 16px;
+      box-shadow: 0 18px 45px rgba(0,0,0,0.35);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .total-card::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, rgba(37,99,235,0.18), rgba(6,182,212,0.18), rgba(34,197,94,0.10));
+      opacity: 0.25;
+      pointer-events: none;
+    }
+
+    .total-card .top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .total-card .label {
+      font-size: 16px;
+      font-weight: 1000;
+      letter-spacing: 0.35px;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.74);
+    }
+
+    .total-card .items {
+      font-size: 14px;
+      font-weight: 950;
+      color: rgba(255,255,255,0.62);
+      white-space: nowrap;
+    }
+
+    .total-card .amount {
+      position: relative;
+      z-index: 1;
+      margin-top: 8px;
+      font-size: 64px;
+      font-weight: 1150;
+      font-variant-numeric: tabular-nums;
+      background: linear-gradient(90deg, rgba(255,255,255,0.98) 0%, rgba(255,255,255,0.90) 35%, rgba(6,182,212,0.95) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    @keyframes pulseGlow {
+      0% { box-shadow: 0 18px 45px rgba(0,0,0,0.35); }
+      50% { box-shadow: 0 18px 45px rgba(0,0,0,0.35), 0 0 0 4px rgba(6,182,212,0.10); }
+      100% { box-shadow: 0 18px 45px rgba(0,0,0,0.35); }
+    }
+
+    .total-card.bump {
+      animation: pulseGlow 420ms ease-out;
+    }
+
+    /* Payment overlay (post-checkout) */
+    .payment-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 28px;
+      background: rgba(0,0,0,0.42);
+      backdrop-filter: blur(14px);
+    }
+
+    .payment-overlay.active {
+      display: flex;
+    }
+
+    .payment-card {
+      width: min(980px, 96vw);
+      border-radius: 28px;
+      border: 1px solid rgba(255,255,255,0.16);
+      background:
+        radial-gradient(900px 360px at 12% 16%, rgba(37,99,235,0.40), transparent 62%),
+        radial-gradient(900px 360px at 88% 18%, rgba(6,182,212,0.32), transparent 62%),
+        radial-gradient(900px 360px at 70% 92%, rgba(34,197,94,0.14), transparent 62%),
+        rgba(255,255,255,0.08);
+      box-shadow: 0 28px 90px rgba(0,0,0,0.60);
+      backdrop-filter: blur(18px);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .payment-card::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, rgba(37,99,235,0.18), rgba(6,182,212,0.16), rgba(34,197,94,0.10));
+      opacity: 0.35;
+      pointer-events: none;
+    }
+
+    .payment-head {
+      position: relative;
+      z-index: 1;
+      padding: 22px 22px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-bottom: 1px solid rgba(255,255,255,0.12);
+    }
+
+    .payment-head .title {
+      font-size: 26px;
+      font-weight: 1100;
+      letter-spacing: 0.35px;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.92);
+    }
+
+    .payment-head .hint {
+      font-size: 16px;
+      font-weight: 950;
+      color: rgba(255,255,255,0.70);
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.07);
+      border-radius: 999px;
+      padding: 10px 14px;
+      white-space: nowrap;
+    }
+
+    .payment-body {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+      padding: 22px;
+    }
+
+    .pay-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 16px 18px;
+      border-radius: 20px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.06);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .pay-row .k {
+      font-size: 18px;
+      font-weight: 1000;
+      letter-spacing: 0.32px;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.74);
+    }
+
+    .pay-row .v {
+      font-size: 40px;
+      font-weight: 1150;
+      color: rgba(255,255,255,0.96);
+      white-space: nowrap;
+    }
+
+    .pay-row.total .v {
+      background: linear-gradient(90deg, rgba(255,255,255,0.98), rgba(6,182,212,0.95));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .pay-row.change {
+      border-color: rgba(34,197,94,0.32);
+      box-shadow: 0 0 0 4px rgba(34,197,94,0.08);
+    }
+
+    .pay-row.change .v {
+      background: linear-gradient(90deg, rgba(34,197,94,0.98), rgba(255,255,255,0.90));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    @keyframes overlayIn {
+      0% { opacity: 0; transform: translateY(10px) scale(0.99); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .payment-card.in {
+      animation: overlayIn 240ms ease-out;
+    }
+
+    .payment {
+      display: none;
+    }
+
+    .payment.active {
+      display: flex;
+    }
+
+    /* Scrollbars */
+    .items-list::-webkit-scrollbar { width: 10px; }
+    .items-list::-webkit-scrollbar-track { background: rgba(2,6,23,0.06); border-radius: 10px; }
+    .items-list::-webkit-scrollbar-thumb { background: rgba(2,6,23,0.22); border-radius: 10px; }
+    .items-list::-webkit-scrollbar-thumb:hover { background: rgba(2,6,23,0.32); }
+
+    /* 15.6" screens can be 1366x768; keep readable */
+    @media (max-width: 1400px) {
+      .brand { font-size: 34px; }
+      .layout { grid-template-columns: 1.35fr 1fr; }
+      .item-name { font-size: 24px; }
+      .item-amount { font-size: 30px; }
+      .last-item .amount { font-size: 48px; }
+      .grand .v { font-size: 48px; }
+      .total-card .amount { font-size: 56px; }
     }
   </style>
 </head>
 <body>
-  <div class="header">
-    <h1 id="storeName">SUPERMARKET POS</h1>
+  <div class="bg-shape"></div>
+  <div class="bg-shape2"></div>
+  <div class="topbar">
+    <div id="storeName" class="brand">SUPERMARKET POS</div>
+    <div class="topbar-right">
+      <div id="statusText" class="status-pill">READY</div>
+      <div id="clock" class="clock">--:--</div>
+    </div>
   </div>
 
-  <div class="content">
-    <div class="items-container" id="itemsContainer">
-      <div class="empty-state">
-        <div class="icon">🛒</div>
-        <p>Scanning items...</p>
+  <div class="layout">
+    <div class="panel" id="itemsPanel">
+      <div class="panel-header">
+        <div class="panel-title">Items</div>
+        <div class="panel-subtitle" id="itemsCount">0</div>
       </div>
+      <div id="emptyState" class="empty">
+        <div class="welcome-box" id="welcomeBox">
+          <div class="welcome-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M7 7H21L19.5 14H8.5L7 7Z" stroke="white" stroke-opacity="0.92" stroke-width="1.8" stroke-linejoin="round"/>
+              <path d="M7 7L6.4 4.8C6.2 4.3 5.8 4 5.3 4H3" stroke="white" stroke-opacity="0.92" stroke-width="1.8" stroke-linecap="round"/>
+              <path d="M9 18.2C9.8 18.2 10.45 18.85 10.45 19.65C10.45 20.45 9.8 21.1 9 21.1C8.2 21.1 7.55 20.45 7.55 19.65C7.55 18.85 8.2 18.2 9 18.2Z" fill="white" fill-opacity="0.9"/>
+              <path d="M18 18.2C18.8 18.2 19.45 18.85 19.45 19.65C19.45 20.45 18.8 21.1 18 21.1C17.2 21.1 16.55 20.45 16.55 19.65C16.55 18.85 17.2 18.2 18 18.2Z" fill="white" fill-opacity="0.9"/>
+              <path d="M8.7 14H19.4" stroke="white" stroke-opacity="0.55" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </div>
+
+          <h2 id="welcomeTitle" class="welcome-title">Welcome</h2>
+          <div id="welcomeSubtitle" class="welcome-subtitle">We’re ready to serve you</div>
+
+          <div class="welcome-actions">
+            <div class="welcome-chip primary" id="welcomeHint">Scan your first item to begin</div>
+            <div class="welcome-chip" id="welcomeExtra">Prices update instantly</div>
+          </div>
+        </div>
+      </div>
+      <div id="itemsContainer" class="items-list" style="display:none"></div>
     </div>
 
-    <div class="total-section">
-      <div class="total-row">
-        <span class="total-label">Subtotal:</span>
-        <span class="total-value" id="subtotalValue">€0.00</span>
+    <div class="summary">
+      <div class="panel last-item">
+        <div class="label">Last scanned</div>
+        <div id="currentName" class="name">—</div>
+        <div id="currentMeta" class="meta"> </div>
+        <div id="currentAmount" class="amount">€0.00</div>
       </div>
-      <div class="total-row">
-        <span class="total-label">Tax:</span>
-        <span class="total-value" id="taxValue">€0.00</span>
+
+      <div class="panel totals">
+        <div class="row"><div class="k">Subtotal</div><div class="v" id="subtotalValue">€0.00</div></div>
+        <div class="row"><div class="k">Tax</div><div class="v" id="taxValue">€0.00</div></div>
+
+        <div class="row payment" id="paidRow"><div class="k">Paid</div><div class="v" id="paidValue">€0.00</div></div>
+        <div class="row payment" id="changeRow"><div class="k">Change</div><div class="v" id="changeValue">€0.00</div></div>
+
+        <div class="total-card" id="totalCard">
+          <div class="top">
+            <div class="label">Total</div>
+            <div class="items" id="totalItems">0 items</div>
+          </div>
+          <div class="amount" id="totalValue">€0.00</div>
+        </div>
       </div>
-      <div class="total-row grand-total">
-        <span class="total-label">TOTAL:</span>
-        <span class="total-value" id="totalValue">€0.00</span>
+    </div>
+  </div>
+
+  <div id="paymentOverlay" class="payment-overlay" aria-hidden="true">
+    <div id="paymentCard" class="payment-card">
+      <div class="payment-head">
+        <div class="title">Payment Summary</div>
+        <div class="hint">Please take your change</div>
+      </div>
+      <div class="payment-body">
+        <div class="pay-row total">
+          <div class="k">Total</div>
+          <div class="v" id="payTotal">€0.00</div>
+        </div>
+        <div class="pay-row">
+          <div class="k">Paid</div>
+          <div class="v" id="payPaid">€0.00</div>
+        </div>
+        <div class="pay-row change">
+          <div class="k">Change</div>
+          <div class="v" id="payChange">€0.00</div>
+        </div>
       </div>
     </div>
   </div>
 
   <script>
-    const { ipcRenderer } = require('electron');
-
-    // Update display when cart changes
-    ipcRenderer.on('update-display', (event, data) => {
-      updateDisplay(data);
-    });
-
-    function updateDisplay(data) {
-      const itemsContainer = document.getElementById('itemsContainer');
-      const currencySymbol = data.currencySymbol || '€';
-
-      if (!data.items || data.items.length === 0) {
-        itemsContainer.innerHTML = `
-          <div class="empty-state">
-            <div class="icon">🛒</div>
-            <p>Scanning items...</p>
-          </div>
-        `;
-      } else {
-        itemsContainer.innerHTML = data.items.map(item => `
-          <div class="item-row">
-            <div class="item-info">
-              <div class="item-name">${item.productName}</div>
-              <div class="item-details">${item.quantity} × ${currencySymbol}${item.unitPrice.toFixed(2)}</div>
-            </div>
-            <div class="item-price">${currencySymbol}${item.subtotal.toFixed(2)}</div>
-          </div>
-        `).join('');
-      }
-
-      document.getElementById('subtotalValue').textContent = `${currencySymbol}${data.subtotal.toFixed(2)}`;
-      document.getElementById('taxValue').textContent = `${currencySymbol}${data.tax.toFixed(2)}`;
-      document.getElementById('totalValue').textContent = `${currencySymbol}${data.total.toFixed(2)}`;
+    const api = window.customerDisplayApi;
+    if (api && typeof api.onUpdate === 'function') {
+      api.onUpdate((data) => updateDisplay(data));
     }
 
-    // Update store name
-    ipcRenderer.on('update-store-name', (event, storeName) => {
-      document.getElementById('storeName').textContent = storeName;
-    });
+    function formatMoney(currencySymbol, value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return `${currencySymbol}0.00`;
+      return `${currencySymbol}${n.toFixed(2)}`;
+    }
+
+    function updateClock() {
+      try {
+        const now = new Date();
+        const timeZone = 'Europe/Madrid';
+        const parts = new Intl.DateTimeFormat('en-GB', {
+          timeZone,
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false
+        }).formatToParts(now);
+        const hh = (parts.find(p => p.type === 'hour')?.value || '00').padStart(2, '0');
+        const mm = (parts.find(p => p.type === 'minute')?.value || '00').padStart(2, '0');
+        document.getElementById('clock').textContent = `${hh}:${mm}`;
+      } catch {
+        // ignore
+      }
+    }
+
+    updateClock();
+    setInterval(updateClock, 1000);
+
+    let welcomeTickerTimer = null;
+    let welcomeTickerIndex = 0;
+    let lastStoreNameForWelcome = 'SUPERMARKET POS';
+
+    function startWelcomeTicker() {
+      stopWelcomeTicker();
+      const titleEl = document.getElementById('welcomeTitle');
+      const subtitleEl = document.getElementById('welcomeSubtitle');
+      const hintEl = document.getElementById('welcomeHint');
+      const extraEl = document.getElementById('welcomeExtra');
+      const boxEl = document.getElementById('welcomeBox');
+      if (!titleEl || !subtitleEl || !hintEl) return;
+
+      const messages = [
+        { title: `Welcome`, subtitle: `Thank you for visiting ${lastStoreNameForWelcome}`, hint: 'Scan your first item to begin', extra: 'Prices update instantly' },
+        { title: 'Hello', subtitle: 'We’re happy to see you today', hint: 'Scan items one by one', extra: 'Your total is shown on the right' },
+        { title: 'Fast Checkout', subtitle: 'We keep it quick and simple', hint: 'Scan your next item', extra: 'Thank you for shopping with us' },
+        { title: 'Thank You', subtitle: 'We appreciate your business', hint: 'Ready when you are', extra: 'Have a wonderful day' }
+      ];
+
+      const apply = () => {
+        const m = messages[welcomeTickerIndex % messages.length];
+        titleEl.textContent = m.title;
+        subtitleEl.textContent = m.subtitle;
+        hintEl.textContent = m.hint;
+        if (extraEl) extraEl.textContent = m.extra || '';
+
+        if (boxEl) {
+          boxEl.classList.remove('tick');
+          void boxEl.offsetHeight;
+          boxEl.classList.add('tick');
+        }
+        welcomeTickerIndex += 1;
+      };
+
+      apply();
+      welcomeTickerTimer = setInterval(apply, 4200);
+    }
+
+    function stopWelcomeTicker() {
+      if (welcomeTickerTimer) {
+        clearInterval(welcomeTickerTimer);
+        welcomeTickerTimer = null;
+      }
+    }
+
+    function updateDisplay(data) {
+      const currencySymbol = data.currencySymbol || '€';
+
+      // Store name
+      if (data.storeName) {
+        document.getElementById('storeName').textContent = String(data.storeName);
+        lastStoreNameForWelcome = String(data.storeName);
+      }
+
+      // Status
+      const status = document.getElementById('statusText');
+      const bannerText = (data.bannerText || '').toString().trim();
+      const computedStatus = bannerText || ((data.items && data.items.length > 0) ? 'SCANNING' : 'WELCOME');
+      status.textContent = computedStatus;
+
+      // Status coloring
+      status.classList.remove('state-ready', 'state-scan', 'state-payment', 'state-thanks');
+      const u = computedStatus.toUpperCase();
+      if (u.includes('THANK')) status.classList.add('state-thanks');
+      else if (u.includes('PAY')) status.classList.add('state-payment');
+      else if (u.includes('SCAN')) status.classList.add('state-scan');
+      else status.classList.add('state-ready');
+
+      // Items
+      const items = Array.isArray(data.items) ? data.items : [];
+      const itemsContainer = document.getElementById('itemsContainer');
+      const emptyState = document.getElementById('emptyState');
+      document.getElementById('itemsCount').textContent = `${items.length} item${items.length === 1 ? '' : 's'}`;
+      const totalItemsEl = document.getElementById('totalItems');
+      if (totalItemsEl) totalItemsEl.textContent = `${items.length} item${items.length === 1 ? '' : 's'}`;
+
+      if (items.length === 0) {
+        emptyState.style.display = 'flex';
+        itemsContainer.style.display = 'none';
+        itemsContainer.innerHTML = '';
+        document.getElementById('currentName').textContent = '—';
+        document.getElementById('currentMeta').textContent = ' ';
+        document.getElementById('currentAmount').textContent = formatMoney(currencySymbol, 0);
+
+        // Friendly greetings / welcome messages
+        startWelcomeTicker();
+      } else {
+        emptyState.style.display = 'none';
+        itemsContainer.style.display = 'block';
+
+        stopWelcomeTicker();
+
+        // Header + rows (receipt-like)
+        const head = `
+          <div class="items-head">
+            <div>Product</div>
+            <div class="right"><span>Qty×Unit</span><span>Line</span></div>
+          </div>
+        `;
+
+        // Highlight the most recent item (index 0)
+        const rows = items.map((item, idx) => {
+          const name = String(item.productName || 'ITEM');
+          const qty = Number(item.quantity);
+          const unitPrice = Number(item.unitPrice);
+          const subtotal = Number(item.subtotal);
+          const qtyUnit = (Number.isFinite(qty) && Number.isFinite(unitPrice))
+            ? `${qty} × ${formatMoney(currencySymbol, unitPrice)}`
+            : ' ';
+          const amount = formatMoney(currencySymbol, Number.isFinite(subtotal) ? subtotal : 0);
+          const cls = idx === 0 ? 'item-row highlight' : 'item-row';
+          return `
+            <div class="${cls}" data-idx="${idx}">
+              <div>
+                <div class="item-name">${name}</div>
+                <div class="item-meta">${qtyUnit}</div>
+              </div>
+              <div class="item-amount">${amount}</div>
+            </div>
+          `;
+        }).join('');
+
+        itemsContainer.innerHTML = head + rows;
+
+        // Pop animation for the newest row
+        const newest = itemsContainer.querySelector('.item-row.highlight');
+        if (newest) {
+          newest.classList.remove('pop');
+          // trigger reflow
+          void newest.offsetHeight;
+          newest.classList.add('pop');
+        }
+
+        const first = items[0] || null;
+        const firstName = String(first?.productName || 'ITEM');
+        const firstQty = Number(first?.quantity);
+        const firstUnitPrice = Number(first?.unitPrice);
+        const firstSubtotal = Number(first?.subtotal);
+        document.getElementById('currentName').textContent = firstName;
+        document.getElementById('currentMeta').innerHTML = (Number.isFinite(firstQty) && Number.isFinite(firstUnitPrice))
+          ? `<div class="meta-grid"><span class="tag">Qty ${firstQty}</span><span class="tag">Unit ${formatMoney(currencySymbol, firstUnitPrice)}</span></div>`
+          : ' ';
+        document.getElementById('currentAmount').textContent = formatMoney(currencySymbol, Number.isFinite(firstSubtotal) ? firstSubtotal : 0);
+      }
+
+      // Totals
+      const subtotal = Number(data.subtotal);
+      const tax = Number(data.tax);
+      const total = Number(data.total);
+      document.getElementById('subtotalValue').textContent = formatMoney(currencySymbol, Number.isFinite(subtotal) ? subtotal : 0);
+      document.getElementById('taxValue').textContent = formatMoney(currencySymbol, Number.isFinite(tax) ? tax : 0);
+
+      const totalValueEl = document.getElementById('totalValue');
+      const nextTotalText = formatMoney(currencySymbol, Number.isFinite(total) ? total : 0);
+      const prevTotalText = (totalValueEl?.textContent || '').trim();
+      if (totalValueEl) totalValueEl.textContent = nextTotalText;
+
+      // Animate TOTAL card when total changes
+      if (prevTotalText && prevTotalText !== nextTotalText) {
+        const totalCard = document.getElementById('totalCard');
+        if (totalCard) {
+          totalCard.classList.remove('bump');
+          void totalCard.offsetHeight;
+          totalCard.classList.add('bump');
+        }
+      }
+
+      // Payment rows
+      const paidRow = document.getElementById('paidRow');
+      const changeRow = document.getElementById('changeRow');
+      const hasPaid = typeof data.paid === 'number' && isFinite(data.paid);
+      const hasChange = typeof data.change === 'number' && isFinite(data.change);
+
+      if (hasPaid) {
+        document.getElementById('paidValue').textContent = formatMoney(currencySymbol, data.paid);
+        paidRow.classList.add('active');
+      } else {
+        paidRow.classList.remove('active');
+      }
+
+      if (hasChange) {
+        document.getElementById('changeValue').textContent = formatMoney(currencySymbol, data.change);
+        changeRow.classList.add('active');
+      } else {
+        changeRow.classList.remove('active');
+      }
+
+      // Full-screen payment overlay (post-checkout)
+      const overlay = document.getElementById('paymentOverlay');
+      const card = document.getElementById('paymentCard');
+      const summary = data && typeof data === 'object' ? data.paymentSummary : null;
+      const shouldOverlay = !!(data?.showPaymentOverlay && summary && (typeof summary === 'object'));
+
+      if (overlay && card) {
+        if (!window.__paymentOverlayTimer) window.__paymentOverlayTimer = null;
+        if (shouldOverlay) {
+          const t = Number(summary.total);
+          const p = Number(summary.paid);
+          const c = Number(summary.change);
+          document.getElementById('payTotal').textContent = formatMoney(currencySymbol, Number.isFinite(t) ? t : 0);
+          document.getElementById('payPaid').textContent = formatMoney(currencySymbol, Number.isFinite(p) ? p : 0);
+          document.getElementById('payChange').textContent = formatMoney(currencySymbol, Number.isFinite(c) ? c : 0);
+
+          overlay.classList.add('active');
+          overlay.setAttribute('aria-hidden', 'false');
+          card.classList.remove('in');
+          void card.offsetHeight;
+          card.classList.add('in');
+
+          // Auto-hide after a short time (the main process also holds the payload for ~9s)
+          if (window.__paymentOverlayTimer) clearTimeout(window.__paymentOverlayTimer);
+          window.__paymentOverlayTimer = setTimeout(() => {
+            try {
+              overlay.classList.remove('active');
+              overlay.setAttribute('aria-hidden', 'true');
+            } catch {
+              // ignore
+            }
+          }, 6500);
+        }
+      }
+    }
   </script>
 </body>
 </html>

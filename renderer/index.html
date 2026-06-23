@@ -45,6 +45,33 @@
     </div>
   </div>
 
+  <!-- Activation Screen (first run only) -->
+  <div id="activationScreen" class="screen">
+    <div class="login-container">
+      <div class="login-logo-container">
+        <div class="login-logo">🛒</div>
+        <h1 style="color: white; margin: 0;">Supermarket POS</h1>
+      </div>
+      <div class="role-selection" style="max-width: 520px; width: 100%;">
+        <h2 style="color: white; margin-bottom: 10px; font-size: 24px;">Activation Required</h2>
+        <p style="color: rgba(255,255,255,0.85); margin: 0 0 20px 0; font-size: 14px; line-height: 1.4;">
+          Enter the activation key to unlock this POS. This is required only once on this PC.
+        </p>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <input id="activationKeyInput" type="password" autocomplete="off" placeholder="Activation Key" style="padding: 14px 16px; border-radius: 12px; border: 2px solid rgba(255,255,255,0.25); background: rgba(255,255,255,0.12); color: white; font-size: 16px; outline: none;" />
+          <button id="activateBtn" class="btn-primary" type="button" style="width: 100%; padding: 14px 16px; border-radius: 12px; font-size: 16px; font-weight: 800;">
+            Activate
+          </button>
+          <div id="activationError" style="display:none; color: #fecaca; background: rgba(239,68,68,0.18); border: 1px solid rgba(239,68,68,0.35); padding: 10px 12px; border-radius: 12px; font-weight: 700;"></div>
+          <div style="color: rgba(255,255,255,0.6); font-size: 12px; text-align: center; margin-top: 6px;">
+            Version <span id="activationAppVersion">--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Main POS Screen -->
   <div id="posScreen" class="screen">
     <!-- Top Navigation Bar - Hidden for checkout only -->
@@ -100,17 +127,63 @@
             <div class="checkout-left">
               <div class="cart-section">
                 <h2 class="section-title" style="display: none;">Shopping Cart</h2>
+
+                <div id="cashierCartSummary" class="cashier-cart-summary" aria-hidden="true">
+                  <div class="cashier-cart-summary-top">
+                    <div class="cashier-cart-summary-head">
+                      <div class="cashier-cart-summary-kicker">Cliente</div>
+                      <div class="cashier-cart-summary-title">VENTA CONTADO</div>
+                    </div>
+                    <div class="cashier-cart-summary-head cashier-cart-summary-head-right">
+                      <div class="cashier-cart-summary-title">CAMBIO</div>
+                      <div class="cashier-cart-summary-mini" id="cashierCartSummaryMethod">EFECTIVO</div>
+                    </div>
+                  </div>
+
+                  <div class="cashier-cart-summary-body">
+                    <div class="cashier-cart-amount-card cashier-cart-amount-total">
+                      <div class="cashier-cart-amount-copy">
+                        <div class="cashier-cart-amount-label">TOTAL</div>
+                        <div class="cashier-cart-amount-note">IMPORTE VENTA</div>
+                      </div>
+                      <div class="cashier-cart-amount-value" id="cashierCartTotal">€0.00</div>
+                    </div>
+
+                    <div class="cashier-cart-amount-card cashier-cart-amount-paid">
+                      <div class="cashier-cart-amount-copy">
+                        <div class="cashier-cart-amount-label">ENTREGA</div>
+                        <div class="cashier-cart-amount-note">PAGO RECIBIDO</div>
+                      </div>
+                      <div class="cashier-cart-amount-value" id="cashierCartPaid">€0.00</div>
+                    </div>
+
+                    <div class="cashier-cart-amount-card cashier-cart-amount-change">
+                      <div class="cashier-cart-amount-copy">
+                        <div class="cashier-cart-amount-label cashier-cart-amount-label-dark">CAMBIO</div>
+                        <div class="cashier-cart-amount-note cashier-cart-amount-note-dark">DEVOLVER AL CLIENTE</div>
+                      </div>
+                      <div class="cashier-cart-amount-value cashier-cart-amount-value-change" id="cashierCartChange">€0.00</div>
+                    </div>
+                  </div>
+
+                </div>
+
+                <!-- PARKING context banner (when adding items to an existing customer/restaurant tab) -->
+                <div id="parkingContextBanner" class="parking-context-banner" style="display:none;">
+                  <div class="parking-context-title" id="parkingContextTitle"></div>
+                  <div class="parking-context-sub" id="parkingContextSub"></div>
+                </div>
                 
                 <!-- Cart Items Table -->
                 <div class="cart-items-table">
                   <table class="cart-table">
                     <thead>
                       <tr>
-                        <th>ITEM</th>
-                        <th>PRICE</th>
-                        <th>WEIGHT</th>
-                        <th>DISCOUNT</th>
-                        <th>TOTAL</th>
+                        <th data-i18n="item">ITEM</th>
+                        <th data-i18n="price">PRICE</th>
+                        <th data-i18n="qty">QTY</th>
+                        <th data-i18n="discount">DISCOUNT</th>
+                        <th data-i18n="total">TOTAL</th>
                       </tr>
                     </thead>
                     <tbody id="cartTableBody">
@@ -121,44 +194,69 @@
 
                 <!-- Summary Section -->
                 <div class="cart-summary-panel">
-                  <div class="summary-left">
-                    <div class="summary-item">
-                      <span class="summary-label">Subtotal</span>
-                      <span class="summary-value" id="cartSubtotal">0.00</span>
+                  <!-- Totals Strip -->
+                  <div class="totals-strip">
+                    <div class="totals-strip-item">
+                      <span class="totals-strip-label" data-i18n="subtotal">Subtotal</span>
+                      <span class="totals-strip-value" id="cartSubtotal">€0.00</span>
                     </div>
-                    <div class="summary-item">
-                      <span class="summary-label">Discount</span>
-                      <span class="summary-value" id="cartDiscount">0.00</span>
+                    <div class="totals-strip-divider"></div>
+                    <div class="totals-strip-item">
+                      <span class="totals-strip-label" data-i18n="discount">Discount</span>
+                      <span class="totals-strip-value" id="cartDiscount">€0.00</span>
                     </div>
-                    <div class="summary-item">
-                      <span class="summary-label">Tax</span>
-                      <span class="summary-value" id="cartTax">0.00</span>
+                    <div class="totals-strip-divider"></div>
+                    <div class="totals-strip-item">
+                      <span class="totals-strip-label" data-i18n="tax">Tax</span>
+                      <span class="totals-strip-value" id="cartTax">€0.00</span>
+                    </div>
+                    <div class="totals-strip-divider"></div>
+                    <div class="totals-strip-item totals-strip-total">
+                      <span class="totals-strip-label" data-i18n="total">TOTAL</span>
+                      <span class="totals-strip-value totals-strip-total-val" id="cartTotal">€0.00</span>
                     </div>
                   </div>
-                  <div class="summary-right">
-                    <div class="total-section">
-                      <div class="total-label">Total</div>
-                      <div class="total-amount" id="cartTotal">0.00</div>
-                    </div>
-                    <div class="payment-section">
-                      <div class="payment-label">Payment</div>
-                      <div class="payment-amount" id="paymentAmount">0.00</div>
-                      <input type="hidden" id="paymentInput" value="">
-                    </div>
-                    <!-- Drawer & Note Buttons -->
-                    <div style="display: flex; gap: 8px; align-items: stretch;">
-                      <button id="openDrawerBtn" class="open-drawer-btn" style="flex: 1; min-width: 0; height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                          <rect x="2" y="5" width="20" height="14" rx="2"/>
-                          <path d="M8 12h8"/>
-                        </svg>
-                        <span style="font-size: 13px;">DRAWER</span>
-                      </button>
-                      <button id="noteBtn" class="open-drawer-btn" style="flex: 1; min-width: 0; height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); border-color: #8b5cf6;">
-                        <span style="font-size: 20px;">📝</span>
-                        <span style="font-size: 13px;">NOTE</span>
-                      </button>
-                    </div>
+
+                  <!-- Payment Amount Display -->
+                  <div class="payment-display-bar">
+                    <span class="payment-display-label" data-i18n="payment">Payment</span>
+                    <span class="payment-display-amount" id="paymentAmount">€0.00</span>
+                    <input type="hidden" id="paymentInput" value="">
+                  </div>
+
+                  <!-- Action Buttons -->
+                  <div class="action-btns-row">
+                    <button id="openDrawerBtn" class="action-btn action-btn--drawer">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <rect x="2" y="5" width="20" height="14" rx="2"/>
+                        <path d="M8 12h8"/>
+                      </svg>
+                      <span data-i18n="drawer">DRAWER</span>
+                    </button>
+                    <button id="deleteAllBtn" class="action-btn action-btn--delete" disabled>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <polyline points="3 6 5 6 21 6"/>
+                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                        <path d="M10 11v6M14 11v6"/>
+                      </svg>
+                      <span data-i18n="deleteAll">DELETE ALL</span>
+                    </button>
+                    <button id="undoScanBtn" class="action-btn action-btn--undo" disabled>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <path d="M3 7v6h6"/>
+                        <path d="M3 13C5.5 7 13 4.5 20 9"/>
+                      </svg>
+                      <span data-i18n="undo">UNDO</span>
+                    </button>
+                    <button id="noteBtn" class="action-btn action-btn--note">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <line x1="16" y1="13" x2="8" y2="13"/>
+                        <line x1="16" y1="17" x2="8" y2="17"/>
+                      </svg>
+                      <span data-i18n="note">NOTE</span>
+                    </button>
                   </div>
                 </div>
 
@@ -168,17 +266,23 @@
                     <button class="numpad-btn" data-value="1">1</button>
                     <button class="numpad-btn" data-value="2">2</button>
                     <button class="numpad-btn" data-value="3">3</button>
-                    <button class="numpad-btn numpad-clear" data-value="clear" style="background-color: #dc2626; border-color: #dc2626; color: white; font-size: 15px;">CLEAR</button>
+                    <button class="numpad-btn numpad-clear" data-value="clear" data-i18n="clear">CLEAR</button>
                     <button class="numpad-btn" data-value="4">4</button>
                     <button class="numpad-btn" data-value="5">5</button>
                     <button class="numpad-btn" data-value="6">6</button>
-                    <button id="ticketBtn" class="btn-ticket numpad-btn" style="background-color: #10b981; border-color: #10b981; color: white; font-size: 15px;">🎫 TICKET</button>
+                    <button id="ticketBtn" class="btn-ticket numpad-btn">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M2 9a3 3 0 1 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 1 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2z"/></svg>
+                      <span data-i18n="ticket">TICKET</span>
+                    </button>
                     <button class="numpad-btn" data-value="7">7</button>
                     <button class="numpad-btn" data-value="8">8</button>
                     <button class="numpad-btn" data-value="9">9</button>
-                    <button id="paymentBtn" class="btn-payment numpad-btn" style="grid-row: span 2; background-color: #f59e0b; border-color: #f59e0b; color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
-                      <span style="font-size: 48px;">💳</span>
-                      <span style="font-size: 18px; font-weight: 700;">PAYMENT</span>
+                    <button id="paymentBtn" class="btn-payment numpad-btn">
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="1" y="4" width="22" height="16" rx="2" ry="2"/>
+                        <line x1="1" y1="10" x2="23" y2="10"/>
+                      </svg>
+                      <span data-i18n="payment">PAYMENT</span>
                     </button>
                     <button class="numpad-btn numpad-dot" data-value=".">.</button>
                     <button class="numpad-btn" data-value="0">0</button>
@@ -197,10 +301,10 @@
                 </div>
                 <div class="payment-modal-body">
                   <!-- Total Amount Display -->
-                  <div style="background: #f8fafc; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
+                  <div style="background: #f8fafc; padding: 3px; border-radius: 8px; margin-bottom: 5px; text-align: center;">
                     <div style="font-size: 14px; color: #64748b; margin-bottom: 5px;">Total Amount</div>
                     <div id="paymentTotalAmount" style="font-size: 32px; font-weight: 700; color: #0f172a;">€0.00</div>
-                    <div id="paymentRemainingAmount" style="font-size: 18px; font-weight: 600; color: #dc2626; margin-top: 10px; display: none;">
+                    <div id="paymentRemainingAmount" style="font-size: 10px; font-weight: 600; color: #dc2626; margin-top: 10px; display: none;">
                       Remaining: <span id="remainingValue">€0.00</span>
                     </div>
                   </div>
@@ -240,7 +344,7 @@
                   </div>
 
                   <!-- Payment Mode Toggle -->
-                  <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+                  <div style="display: flex; gap: 10px; margin-bottom: 6px;">
                     <button id="singlePaymentModeBtn" class="payment-mode-btn active" style="flex: 1; padding: 12px; border: 2px solid #3b82f6; background: #3b82f6; color: white; border-radius: 8px; font-weight: 600; cursor: pointer;">
                       Single Payment
                     </button>
@@ -313,58 +417,22 @@
               <div class="right-panel-header">
                 <div class="header-actions">
                   <!-- Search Bar -->
-                  <div class="search-section">
-                    <input type="text" id="productSearch" placeholder="Search Product..." autocomplete="off">
-                  </div>
-                  
-                  <div class="settings-dropdown">
-                    <button class="settings-btn" id="settingsBtn">
-                      <span class="settings-icon">⚙️</span>
-                      <span class="settings-text">Settings</span>
+                  <div class="search-section" style="display:flex; gap:8px; align-items:center;">
+                    <input type="text" id="productSearch" data-i18n-placeholder="searchProduct" placeholder="Search Product..." autocomplete="off" style="flex: 1; min-width: 0;">
+                    <button id="toggleReorderBtn" type="button" class="reorder-toggle-btn" title="Reorder quick products">
+                      REORDER
                     </button>
-                    <div class="settings-menu" id="settingsMenu">
-                      <button class="settings-menu-item" data-view="checkout">
-                        <span class="menu-icon">🛒</span>
-                        <span class="menu-text">Checkout</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="products">
-                        <span class="menu-icon">🅿️</span>
-                        <span class="menu-text">Products</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="sales">
-                        <span class="menu-icon">💰</span>
-                        <span class="menu-text">Sales</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="expenses">
-                        <span class="menu-icon">💸</span>
-                        <span class="menu-text">Expenses</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="reports">
-                        <span class="menu-icon">📊</span>
-                        <span class="menu-text">Reports</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="analytics">
-                        <span class="menu-icon">📈</span>
-                        <span class="menu-text">Analytics</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="inventory">
-                        <span class="menu-icon">📋</span>
-                        <span class="menu-text">Inventory</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="categories" id="categoriesMenuBtn">
-                        <span class="menu-icon">🏷️</span>
-                        <span class="menu-text">Categories</span>
-                      </button>
-                      <button class="settings-menu-item" data-view="users" id="usersMenuBtn">
-                        <span class="menu-icon">👥</span>
-                        <span class="menu-text">Users</span>
-                      </button>
-                    </div>
                   </div>
-                  <button id="logoutBtnRight" class="logout-btn-right">
-                    <span class="logout-icon">🚪</span>
-                    <span class="logout-text">Logout</span>
-                  </button>
+
+                  <!-- Language Toggle -->
+                  <div class="lang-toggle" id="langToggle">
+                    <button class="lang-btn" id="langEN">
+                      🇬🇧 EN
+                    </button>
+                    <button class="lang-btn lang-btn--active" id="langES">
+                      🇪🇸 ES
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -385,6 +453,66 @@
                 <div class="subcategory-filters-right" id="subcategoryFilters" style="display: none;">
                   <!-- Subcategories will be loaded here when a category is selected -->
                 </div>
+              </div>
+
+              <!-- One-click checkout menu bar -->
+              <div id="checkoutMenuBar" class="cmb-grid">
+                <button class="cmb-btn" data-co-view="products">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                  <span class="cmb-label" data-i18n="products">Products</span>
+                </button>
+                <button class="cmb-btn" data-co-view="barcodes">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 5v14M7 5v14M11 5v14M15 5v8M19 5v8M15 17v2M19 17v2M3 3h4M3 21h4M17 3h4"/></svg>
+                  <span class="cmb-label" data-i18n="barcodes">Barcodes</span>
+                </button>
+                <button class="cmb-btn" data-co-view="sales">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                  <span class="cmb-label" data-i18n="sales">Sales</span>
+                </button>
+                <button class="cmb-btn" data-co-view="returns">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v6h6"/><path d="M3 13C5.5 7 13 4.5 20 9"/><path d="M20 9v6"/><path d="M14 15h6"/></svg>
+                  <span class="cmb-label" data-i18n="returns">Returns</span>
+                </button>
+                <button class="cmb-btn" data-co-view="loans">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+                  <span class="cmb-label" data-i18n="parking">Parking</span>
+                </button>
+                <button class="cmb-btn" data-co-view="expenses">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2z"/><path d="M12 6v6l4 2"/></svg>
+                  <span class="cmb-label" data-i18n="expenses">Expenses</span>
+                </button>
+                <button class="cmb-btn" data-co-view="reports">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 17V13M12 17V9M16 17v-4"/></svg>
+                  <span class="cmb-label" data-i18n="reports">Reports</span>
+                </button>
+                <button class="cmb-btn" data-co-view="inventory">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 12h6M9 16h4"/></svg>
+                  <span class="cmb-label" data-i18n="inventory">Inventory</span>
+                </button>
+                <button class="cmb-btn" data-co-view="categories">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                  <span class="cmb-label" data-i18n="categories">Categories</span>
+                </button>
+                <button class="cmb-btn" data-co-view="users" id="cmbUsersBtn">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                  <span class="cmb-label" data-i18n="users">Users</span>
+                </button>
+                <button class="cmb-btn" data-co-view="system">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>
+                  <span class="cmb-label" data-i18n="system">System</span>
+                </button>
+                <button class="cmb-btn cmb-btn--action" data-co-action="display">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                  <span class="cmb-label" data-i18n="display">Display</span>
+                </button>
+                <button class="cmb-btn cmb-btn--action" data-co-action="drawer">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M8 12h8"/></svg>
+                  <span class="cmb-label" data-i18n="drawer">Drawer</span>
+                </button>
+                <button class="cmb-btn cmb-btn--logout" data-co-action="logout">
+                  <svg class="cmb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                  <span class="cmb-label" data-i18n="logout">Logout</span>
+                </button>
               </div>
             </div>
           </div>
@@ -477,30 +605,76 @@
                 <h2>Product Management</h2>
                 <div class="header-buttons">
                   <button id="addProductBtn" class="btn-primary">+ Add Product</button>
+                  <button id="bulkUploadBarcodesBtn" class="btn-secondary">⬆ Bulk Upload</button>
+                  <button id="openBarcodeListBtn" class="btn-secondary">▦ Barcode List</button>
                   <button id="addCategoryBtnHeader" class="btn-secondary">+ Add Category</button>
+                  <button id="bulkDeleteProductsBtn" class="btn-danger" disabled>Delete Selected</button>
                 </div>
               </div>
 
               <div class="search-bar">
-                <input type="text" id="productSearch" placeholder="Search products...">
+                <input type="text" id="productsSearch" placeholder="Search products...">
               </div>
 
               <div class="table-container">
                 <table id="productsTable">
                   <thead>
                     <tr>
-                      <th>Name</th>
+                      <th>
+                        <div class="select-name-header">
+                          <input type="checkbox" id="productsSelectAll" class="table-select" aria-label="Select all products">
+                          <span>Name</span>
+                        </div>
+                      </th>
+                      <th>Barcode</th>
                       <th>Category</th>
                       <th>Unit Type</th>
                       <th>Price</th>
                       <th>Tax</th>
                       <th>Stock</th>
+                      <th style="text-align: center;">Checkout</th>
                       <th>Status</th>
                       <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody></tbody>
                 </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Barcodes View -->
+        <div id="barcodesView" class="view">
+          <div class="view-wrapper">
+            <div class="view-content">
+              <div class="view-header">
+                <h2>Barcode List</h2>
+                <div class="header-buttons">
+                  <button id="barcodeListBackBtn" class="btn-secondary">← Back</button>
+                </div>
+              </div>
+
+              <div class="search-bar">
+                <input type="text" id="barcodeListSearch" placeholder="Search by name or barcode...">
+              </div>
+
+              <div class="barcode-bulk-bar" id="barcodeBulkBar">
+                <div class="barcode-bulk-left">
+                  <div class="barcode-bulk-title">Bulk barcode print</div>
+                  <div class="barcode-bulk-meta">
+                    Selected: <span id="barcodeBulkSelected">0</span>/20 · Labels: <span id="barcodeBulkTotalLabels">0</span>
+                    <span id="barcodeBulkStatus" class="barcode-bulk-status"></span>
+                  </div>
+                </div>
+                <div class="barcode-bulk-actions">
+                  <button id="barcodeBulkClearBtn" type="button" class="btn-secondary">Clear</button>
+                  <button id="barcodeBulkPrintBtn" type="button" class="btn-primary" style="min-width: 180px;">🖨️ Print Selected</button>
+                </div>
+              </div>
+
+              <div class="table-container" style="padding: 10px;">
+                <div id="barcodeListContainer" class="barcode-list-grid"></div>
               </div>
             </div>
           </div>
@@ -542,7 +716,6 @@
                     <button id="filterAllBtn" class="btn-filter active" data-filter="all">All</button>
                     <button id="filterCashBtn" class="btn-filter" data-filter="cash">💵 Cash</button>
                     <button id="filterCardBtn" class="btn-filter" data-filter="card">💳 Card</button>
-                    <button id="filterLoanBtn" class="btn-filter" data-filter="loan">🅿️ Parking</button>
                   </div>
                   
                   <button id="printSalesBtn" class="btn-primary" style="min-width: 150px;">🖨️ Print Sales</button>
@@ -570,94 +743,8 @@
         </div>
 
         <!-- Reports View -->
-        <div id="reportsView" class="view">
-          <div class="view-wrapper">
-            <div class="view-content">
-              <div class="view-header">
-                <h2>Reports & Analytics</h2>
-                <button id="generateZReportBtn" class="btn-primary">📊 Generate Z-Report</button>
-              </div>
-
-              <div class="report-tabs">
-                <button class="report-tab active" data-tab="z-reports">Z-Reports</button>
-                <button class="report-tab" data-tab="sales-reports">Sales Reports</button>
-              </div>
-
-              <!-- Z-Reports Tab -->
-              <div id="z-reports" class="report-tab-content active">
-                <div class="table-container">
-                  <table id="zReportsTable">
-                    <thead>
-                      <tr>
-                        <th>Report #</th>
-                        <th>Date</th>
-                        <th>Cashier</th>
-                        <th>Sales</th>
-                        <th>Returns</th>
-                        <th>Net Sales</th>
-                        <th>Cash</th>
-                        <th>Card</th>
-                        <th>PARKING</th>
-                        <th>Total Amount</th>
-                        <th>Expenses</th>
-                        <th>Total Tax</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody id="zReportsTableBody"></tbody>
-                  </table>
-                </div>
-              </div>
-
-              <!-- Sales Reports Tab -->
-              <div id="sales-reports" class="report-tab-content">
-                <div class="report-filters">
-                  <div class="filter-group">
-                    <label class="filter-label">� Report Type</label>
-                    <select id="reportPeriodType" class="filter-select">
-                      <option value="daily">Daily Sales</option>
-                      <option value="weekly">Weekly Sales</option>
-                      <option value="monthly">Monthly Sales</option>
-                      <option value="yearly">Yearly Sales</option>
-                      <option value="custom">Custom Date Range</option>
-                    </select>
-                  </div>
-                  <div class="filter-group" id="customDateGroup" style="display: none;">
-                    <label class="filter-label">📅 Start Date</label>
-                    <input type="date" id="reportStartDate" class="filter-input">
-                  </div>
-                  <div class="filter-group" id="customDateGroup2" style="display: none;">
-                    <label class="filter-label">📅 End Date</label>
-                    <input type="date" id="reportEndDate" class="filter-input">
-                  </div>
-                  <div class="filter-group" id="monthYearGroup" style="display: none;">
-                    <label class="filter-label">📅 Month</label>
-                    <select id="reportMonth" class="filter-select">
-                      <option value="1">January</option>
-                      <option value="2">February</option>
-                      <option value="3">March</option>
-                      <option value="4">April</option>
-                      <option value="5">May</option>
-                      <option value="6">June</option>
-                      <option value="7">July</option>
-                      <option value="8">August</option>
-                      <option value="9">September</option>
-                      <option value="10">October</option>
-                      <option value="11">November</option>
-                      <option value="12">December</option>
-                    </select>
-                  </div>
-                  <div class="filter-group" id="yearGroup">
-                    <label class="filter-label">📅 Year</label>
-                    <select id="reportYear" class="filter-select"></select>
-                  </div>
-                  <button id="generateSalesReportBtn" class="btn-primary btn-large">📊 Generate Report</button>
-                </div>
-                <div id="reportResults" class="report-results"></div>
-              </div>
-            </div>
-          </div>
-        </div>
+        <!-- reportsView removed: clicking Reports opens the Arqueo overlay directly -->
+        <div id="reportsView" class="view" style="display:none;"></div>
 
         <!-- Expenses View -->
         <div id="expensesView" class="view">
@@ -680,7 +767,7 @@
                   <button class="filter-btn" data-period="custom" style="background: rgba(255,255,255,0.2); color: white; border: 2px solid white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease;">Custom Date</button>
                 </div>
                 
-                <div id="customDateRange" style="display: none; gap: 12px; align-items: center; flex-wrap: wrap; background: rgba(255,255,255,0.15); padding: 15px; border-radius: 10px; backdrop-filter: blur(10px);">
+                <div id="expenseCustomDateRange" style="display: none; gap: 12px; align-items: center; flex-wrap: wrap; background: rgba(255,255,255,0.15); padding: 15px; border-radius: 10px; backdrop-filter: blur(10px);">
                   <input type="date" id="expenseStartDate" class="form-control" style="width: 160px; padding: 10px; border: 2px solid white; border-radius: 8px; background: white; font-weight: 500;">
                   <span style="color: white; font-weight: 600; font-size: 16px;">to</span>
                   <input type="date" id="expenseEndDate" class="form-control" style="width: 160px; padding: 10px; border: 2px solid white; border-radius: 8px; background: white; font-weight: 500;">
@@ -907,8 +994,9 @@
               <div class="view-header">
                 <h2>PARKING Management</h2>
                 <div class="loan-search-container">
-                  <input type="text" id="loanReceiptSearch" placeholder="Search by receipt number...">
-                  <button id="searchLoanBtn" class="btn-primary">Search PARKING</button>
+                  <input type="text" id="loanReceiptSearch" placeholder="Search by receipt, customer, restaurant, or phone...">
+                  <button id="searchLoanBtn" class="btn-primary">Search</button>
+                  <button id="clearLoanSearchBtn" class="btn-secondary" type="button">Clear</button>
                 </div>
               </div>
 
@@ -1001,15 +1089,6 @@
                 </div>
 
                 <div class="settings-section">
-                  <h3>Tax Settings</h3>
-                  <div class="form-group">
-                    <label>Tax Rate (%) *</label>
-                    <input type="text" inputmode="decimal" id="taxRate" required>
-                    <small>Enter percentage (e.g., 10 for 10%)</small>
-                  </div>
-                </div>
-
-                <div class="settings-section">
                   <h3>Receipt Settings</h3>
                   <div class="form-group">
                     <label>Receipt Footer</label>
@@ -1036,6 +1115,17 @@
                     <label>Customer Display Port (optional)</label>
                     <input type="text" id="customerDisplayPort" placeholder="COM12" autocomplete="off">
                     <small>Windows example: COM12 (Prolific). Leave empty for auto-detect.</small>
+                  </div>
+                </div>
+
+                <div class="settings-section">
+                  <h3>Database Backup</h3>
+                  <div class="form-group">
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                      <button type="button" class="btn-secondary" id="backupDatabaseBtn">💾 Backup Database</button>
+                      <button type="button" class="btn-secondary" id="restoreDatabaseBtn" style="background: #fee2e2; border-color: #fecaca; color: #991b1b;">♻️ Restore Backup</button>
+                    </div>
+                    <small>Backup saves your data to a file. Restore will replace the current database and restart the app.</small>
                   </div>
                 </div>
 
@@ -1080,7 +1170,10 @@
             <div class="view-content">
               <div class="view-header">
                 <h2>Category Management</h2>
-                <button id="addCategoryBtn" class="btn-primary">+ Add Category</button>
+                <div class="header-buttons">
+                  <button id="addCategoryBtn" class="btn-primary">+ Add Category</button>
+                  <button id="bulkDeleteCategoriesBtn" class="btn-danger" disabled>Delete Selected</button>
+                </div>
               </div>
               
               <div style="background: #e3f2fd; padding: 12px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3;">
@@ -1094,9 +1187,9 @@
                 <table id="categoriesTable">
                   <thead>
                     <tr>
+                      <th style="width: 60px; text-align: center;"><input type="checkbox" id="categoriesSelectAll" aria-label="Select all categories"></th>
                       <th>Favorite</th>
                       <th>Category Name</th>
-                      <th>Tax Rate (%)</th>
                       <th>Created</th>
                       <th>Actions</th>
                     </tr>
@@ -1120,7 +1213,15 @@
       </div>
       <form id="productForm">
         <input type="hidden" id="productId">
-        <input type="hidden" id="productBarcode">
+        <div class="form-group">
+          <label>Barcode</label>
+          <input type="text" id="productBarcode" inputmode="numeric" autocomplete="off" placeholder="Scan or type barcode (optional)">
+          <small style="color: #718096; display: block; margin-top: 5px;">Optional. If left empty, the POS will generate an internal code.</small>
+          <div id="productBarcodePreviewWrap" style="margin-top: 10px; padding: 10px; border: 2px dashed #cbd5e1; border-radius: 10px; background: #f8fafc;">
+            <div style="font-size: 12px; font-weight: 800; color: #64748b; margin-bottom: 6px;">BARCODE PREVIEW</div>
+            <svg id="productBarcodePreview" style="width: 100%; height: 74px;"></svg>
+          </div>
+        </div>
         <div class="form-group">
           <label>Product Name *</label>
           <input type="text" id="productName" required>
@@ -1138,8 +1239,8 @@
           </div>
         </div>
         <div class="form-group">
-          <label>Category *</label>
-          <select id="productCategory" required>
+          <label>Category</label>
+          <select id="productCategory">
             <!-- Categories will be loaded dynamically -->
           </select>
         </div>
@@ -1151,9 +1252,21 @@
           </select>
         </div>
         <div class="form-group">
+          <div class="checkout-visibility-toggle" role="group" aria-label="Checkout visibility">
+            <div class="checkout-visibility-text">
+              <div class="checkout-visibility-title">Show in Checkout quick list</div>
+              <div class="checkout-visibility-help">Untick to hide this product from the Checkout product grid (barcode scans still work).</div>
+            </div>
+            <label class="touch-switch" aria-label="Show in Checkout">
+              <input type="checkbox" id="productShowInCheckout">
+              <span class="touch-switch-slider" aria-hidden="true"></span>
+            </label>
+          </div>
+        </div>
+        <div class="form-group">
           <label>Unit Type *</label>
           <select id="productUnitType" required>
-            <option value="weight">⚖️ Weight - For items sold by weight</option>
+            <option value="weight" disabled>⚖️ Weight - Disabled (scale not used)</option>
             <option value="quantity">🔢 Quantity - For items sold by count</option>
           </select>
           <small style="color: #718096; display: block; margin-top: 5px;">Choose how this product will be measured</small>
@@ -1188,20 +1301,40 @@
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label>Regular Price *</label>
-            <input type="text" inputmode="decimal" id="productRegularPrice" required>
+            <label>Regular Price</label>
+            <input type="text" inputmode="decimal" id="productRegularPrice" placeholder="Leave empty for 0.00">
           </div>
           <div class="form-group">
             <label>Sale Price</label>
             <input type="text" inputmode="decimal" id="productSalePrice" placeholder="Leave empty if not on sale">
           </div>
         </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label>IVA de venta *</label>
+            <select id="productSalesVat" required>
+              <option value="21">21%</option>
+              <option value="10">10%</option>
+              <option value="4">4%</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>IVA de compra *</label>
+            <select id="productPurchaseVat" required>
+              <option value="21">21%</option>
+              <option value="10">10%</option>
+              <option value="4">4%</option>
+            </select>
+          </div>
+        </div>
         <div class="form-group">
           <label>Current Stock *</label>
-          <input type="number" id="productStock" required>
+          <input type="text" id="productStock" inputmode="numeric" pattern="[0-9]*" enterkeyhint="done" autocomplete="off" required>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn-secondary cancel-btn">Cancel</button>
+          <button type="button" class="btn-secondary" id="productPrintLabelBtn" style="background:#0ea5e9; border-color:#0ea5e9; color:#fff;">Print Label</button>
           <button type="submit" class="btn-primary">Save Product</button>
         </div>
       </form>
@@ -1273,10 +1406,6 @@
           <label>Category Name *</label>
           <input type="text" id="categoryName" required>
         </div>
-        <div class="form-group">
-          <label>Tax Rate (%) *</label>
-          <input type="text" inputmode="decimal" id="categoryTaxRate" required>
-        </div>
         <div class="form-group" id="subcategoriesSection" style="display: none;">
           <label>Subcategories</label>
           <div id="subcategoriesList" class="subcategories-list"></div>
@@ -1335,10 +1464,6 @@
         <div class="form-group">
           <label>Category *</label>
           <input type="text" id="expenseCategory" required placeholder="Enter category name">
-        </div>
-        <div class="form-group">
-          <label>Description *</label>
-          <textarea id="expenseDescription" rows="3" required placeholder="Enter expense details"></textarea>
         </div>
         <div class="form-group">
           <label>Amount (€) *</label>
@@ -1402,6 +1527,19 @@
             <option value="regular">Regular Customer</option>
             <option value="restaurant">Restaurant</option>
           </select>
+        </div>
+
+        <div class="form-group" id="loanQuickSelectField" style="display:none;">
+          <label>Quick Select (Optional)</label>
+          <div class="existing-restaurant-row" style="margin-top: 0;">
+            <input type="text" id="loanPartySearch" class="existing-restaurant-select" placeholder="Type customer/restaurant name or phone..." autocomplete="off">
+            <button type="button" class="btn-secondary" id="loanPartySearchBtn">Find</button>
+          </div>
+          <div class="existing-restaurant-row" style="margin-top: 10px;">
+            <select id="loanPartySelect" class="existing-restaurant-select"></select>
+            <button type="button" class="btn-secondary" id="loanPartyRefreshBtn">Refresh</button>
+          </div>
+          <div id="loanPartyHelp" class="existing-restaurant-help"></div>
         </div>
         <div class="form-group" id="restaurantFields" style="display: none;">
           <label>Restaurant Name *</label>
@@ -1561,7 +1699,7 @@
   <div id="zReportModal" class="modal">
     <div class="modal-content modal-large">
       <div class="modal-header">
-        <h3>Generate Z-Report (End of Day)</h3>
+        <h3>Generate Z-Report</h3>
         <button class="modal-close" onclick="closeModal('zReportModal')">&times;</button>
       </div>
       
@@ -1569,6 +1707,38 @@
         <div class="modal-body">
           <div class="z-report-summary">
             <h4>Report Summary</h4>
+
+            <div class="form-row" style="margin-bottom: 18px;">
+              <div class="form-group" style="margin-bottom: 0;">
+                <label>Report Range</label>
+                <select id="zReportRangeType">
+                  <option value="today">Today</option>
+                  <option value="month">This Month</option>
+                  <option value="year">Yearly</option>
+                  <option value="custom">Custom Range</option>
+                </select>
+              </div>
+              <div class="form-group" id="zReportMonthGroup" style="margin-bottom: 0; display: none;">
+                <label>Month</label>
+                <input type="month" id="zReportRangeMonth">
+              </div>
+              <div class="form-group" id="zReportYearGroup" style="margin-bottom: 0; display: none;">
+                <label>Year</label>
+                <select id="zReportRangeYear"></select>
+              </div>
+            </div>
+
+            <div class="form-row" id="zReportCustomRangeRow" style="margin-bottom: 18px; display: none;">
+              <div class="form-group" style="margin-bottom: 0;">
+                <label>Start Date</label>
+                <input type="date" id="zReportRangeStart">
+              </div>
+              <div class="form-group" style="margin-bottom: 0;">
+                <label>End Date</label>
+                <input type="date" id="zReportRangeEnd">
+              </div>
+            </div>
+
             <div class="summary-grid">
               <div class="summary-item">
                 <span class="summary-label">Period:</span>
@@ -1619,7 +1789,7 @@
                 <span class="summary-value" id="zReportCard">€0.00</span>
               </div>
               <div class="summary-item" style="grid-column: span 2; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
-                <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
+                <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL COLLECTED (Cash + Card):</span>
                 <span class="summary-value" style="font-weight: bold; font-size: 16px; color: #059669;" id="zReportTotalAmount">€0.00</span>
               </div>
             </div>
@@ -1631,6 +1801,10 @@
               <div class="summary-item" style="grid-column: span 3;">
                 <span class="summary-label">Total Expenses:</span>
                 <span class="summary-value" style="color: #dc2626;" id="zReportTotalExpenses">€0.00</span>
+              </div>
+              <div class="summary-item" style="grid-column: span 3;">
+                <span class="summary-label">Balance (Net Sales - Expenses):</span>
+                <span class="summary-value" id="zReportBalance">€0.00</span>
               </div>
             </div>
             <div class="form-group">
@@ -1646,28 +1820,7 @@
 
           <div class="z-report-section">
             <h4>Tax Breakdown</h4>
-            <div class="summary-grid">
-              <div class="summary-item">
-                <span class="summary-label">7% Tax Base:</span>
-                <span class="summary-value" id="zReportTax7Base">€0.00</span>
-              </div>
-              <div class="summary-item">
-                <span class="summary-label">7% Tax Amount:</span>
-                <span class="summary-value" id="zReportTax7Amount">€0.00</span>
-              </div>
-              <div class="summary-item">
-                <span class="summary-label">19% Tax Base:</span>
-                <span class="summary-value" id="zReportTax19Base">€0.00</span>
-              </div>
-              <div class="summary-item">
-                <span class="summary-label">19% Tax Amount:</span>
-                <span class="summary-value" id="zReportTax19Amount">€0.00</span>
-              </div>
-              <div class="summary-item">
-                <span class="summary-label">Total Tax:</span>
-                <span class="summary-value" id="zReportTotalTax">€0.00</span>
-              </div>
-            </div>
+            <div class="summary-grid" id="zReportTaxBreakdownGrid"></div>
           </div>
 
           <div class="z-report-section">
@@ -1678,7 +1831,7 @@
             </div>
             <div class="form-group">
               <label>Actual Cash Count:</label>
-              <input type="text" inputmode="decimal" id="zReportActualCash" required>
+              <input type="text" inputmode="decimal" id="zReportActualCash" placeholder="Optional">
             </div>
             <div class="form-group">
               <label>Difference:</label>
@@ -1715,89 +1868,6 @@
       <div class="modal-footer">
         <button type="button" class="btn-secondary cancel-btn">Close</button>
         <button type="button" class="btn-primary" id="printZReportBtn">Print Report</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Virtual Keyboard -->
-  <div id="virtualKeyboard" class="virtual-keyboard">
-    <div class="keyboard-buttons">
-      <!-- Row 1: Numbers -->
-      <div class="keyboard-row">
-        <button class="key-btn key-mode-switch" data-mode="text">ABC</button>
-        <button class="key-btn key-number" data-key="1">1</button>
-        <button class="key-btn key-number" data-key="2">2</button>
-        <button class="key-btn key-number" data-key="3">3</button>
-        <button class="key-btn key-number" data-key="4">4</button>
-        <button class="key-btn key-number" data-key="5">5</button>
-        <button class="key-btn key-number" data-key="6">6</button>
-        <button class="key-btn key-number" data-key="7">7</button>
-        <button class="key-btn key-number" data-key="8">8</button>
-        <button class="key-btn key-number" data-key="9">9</button>
-        <button class="key-btn key-number" data-key="0">0</button>
-        <button class="key-btn key-backspace key-backspace-numeric" data-key="Backspace">⌫</button>
-      </div>
-      
-      <!-- Row 2: QWERTY -->
-      <div class="keyboard-row">
-        <button class="key-btn key-letter" data-key="Q">q</button>
-        <button class="key-btn key-letter" data-key="W">w</button>
-        <button class="key-btn key-letter" data-key="E">e</button>
-        <button class="key-btn key-letter" data-key="R">r</button>
-        <button class="key-btn key-letter" data-key="T">t</button>
-        <button class="key-btn key-letter" data-key="Y">y</button>
-        <button class="key-btn key-letter" data-key="U">u</button>
-        <button class="key-btn key-letter" data-key="I">i</button>
-        <button class="key-btn key-letter" data-key="O">o</button>
-        <button class="key-btn key-letter" data-key="P">p</button>
-      </div>
-      
-      <!-- Row 3: ASDF -->
-      <div class="keyboard-row">
-        <button class="key-btn key-letter" data-key="A">a</button>
-        <button class="key-btn key-letter" data-key="S">s</button>
-        <button class="key-btn key-letter" data-key="D">d</button>
-        <button class="key-btn key-letter" data-key="F">f</button>
-        <button class="key-btn key-letter" data-key="G">g</button>
-        <button class="key-btn key-letter" data-key="H">h</button>
-        <button class="key-btn key-letter" data-key="J">j</button>
-        <button class="key-btn key-letter" data-key="K">k</button>
-        <button class="key-btn key-letter" data-key="L">l</button>
-      </div>
-      
-      <!-- Row 4: ZXCV -->
-      <div class="keyboard-row">
-        <button class="key-btn key-shift" data-key="Shift">⇧</button>
-        <button class="key-btn key-letter" data-key="Z">z</button>
-        <button class="key-btn key-letter" data-key="X">x</button>
-        <button class="key-btn key-letter" data-key="C">c</button>
-        <button class="key-btn key-letter" data-key="V">v</button>
-        <button class="key-btn key-letter" data-key="B">b</button>
-        <button class="key-btn key-letter" data-key="N">n</button>
-        <button class="key-btn key-letter" data-key="M">m</button>
-        <button class="key-btn key-backspace key-backspace-text" data-key="Backspace">⌫</button>
-      </div>
-      
-      <!-- Row 5: Symbols and space -->
-      <div class="keyboard-row">
-        <button class="key-btn key-mode-switch" data-mode="numeric">123</button>
-        <button class="key-btn key-special" data-key="@">@</button>
-        <button class="key-btn key-special" data-key="-">-</button>
-        <button class="key-btn key-special" data-key="=">=</button>
-        <button class="key-btn key-special" data-key="[">[</button>
-        <button class="key-btn key-special" data-key="]">]</button>
-        <button class="key-btn key-special" data-key=";">;</button>
-        <button class="key-btn key-special" data-key="'">'</button>
-        <button class="key-btn key-special" data-key="#">#</button>
-        <button class="key-btn key-special" data-key=",">,</button>
-        <button class="key-btn key-special" data-key=".">.</button>
-        <button class="key-btn key-special" data-key="/">/</button>
-        <button class="key-btn key-special" data-key="(">(</button>
-        <button class="key-btn key-special" data-key=")">)</button>
-        <button class="key-btn key-special" data-key="&">&</button>
-        <button class="key-btn key-special" data-key="%">%</button>
-        <button class="key-btn key-space" data-key=" ">SPACE</button>
-        <button class="key-btn key-done" data-key="Done">✓ DONE</button>
       </div>
     </div>
   </div>
@@ -1860,8 +1930,434 @@
     </div>
   </div>
 
+  <!-- Cashier Payment Summary Overlay (after CASH payment) -->
+  <div id="cashierPayOverlay" class="cashier-pay-overlay" aria-hidden="true">
+    <div class="cashier-pay-card" role="dialog" aria-label="Payment Summary">
+      <div class="cashier-pay-head">
+        <div class="cashier-pay-title">Payment Summary</div>
+        <div class="cashier-pay-sub">Give customer the change</div>
+      </div>
+      <div class="cashier-pay-body">
+        <div class="cashier-pay-row total">
+          <div class="k">TOTAL</div>
+          <div class="v" id="cashierPayTotal">€0.00</div>
+        </div>
+        <div class="cashier-pay-row">
+          <div class="k">PAID</div>
+          <div class="v" id="cashierPayPaid">€0.00</div>
+        </div>
+        <div class="cashier-pay-row change">
+          <div class="k">CHANGE</div>
+          <div class="v" id="cashierPayChange">€0.00</div>
+        </div>
+      </div>
+      <div class="cashier-pay-foot">
+        <button type="button" id="cashierPayClose" class="cashier-pay-close">OK</button>
+      </div>
+    </div>
+  </div>
 
+  <!-- Virtual Keyboard (On-screen keyboard for touchscreen / kiosk) -->
+  <div id="virtualKeyboard" class="virtual-keyboard" aria-hidden="true">
+    <div class="keyboard-header">
+      <div class="keyboard-title">KEYBOARD</div>
+      <button type="button" class="keyboard-close" id="virtualKeyboardClose" aria-label="Close Keyboard">×</button>
+    </div>
+    <div class="keyboard-buttons">
+      <div class="keyboard-row">
+        <button type="button" class="key-btn key-number" data-key="1">1</button>
+        <button type="button" class="key-btn key-number" data-key="2">2</button>
+        <button type="button" class="key-btn key-number" data-key="3">3</button>
+        <button type="button" class="key-btn key-number" data-key="4">4</button>
+        <button type="button" class="key-btn key-number" data-key="5">5</button>
+        <button type="button" class="key-btn key-number" data-key="6">6</button>
+        <button type="button" class="key-btn key-number" data-key="7">7</button>
+        <button type="button" class="key-btn key-number" data-key="8">8</button>
+        <button type="button" class="key-btn key-number" data-key="9">9</button>
+        <button type="button" class="key-btn key-number" data-key="0">0</button>
+        <button type="button" class="key-btn key-special" data-key="-">-</button>
+        <button type="button" class="key-btn key-special" data-key="_">_</button>
+        <button type="button" class="key-btn key-special" data-key="@">@</button>
+        <button type="button" class="key-btn key-special" data-key="/">/</button>
+      </div>
 
+      <div class="keyboard-row">
+        <button type="button" class="key-btn key-letter" data-key="Q">Q</button>
+        <button type="button" class="key-btn key-letter" data-key="W">W</button>
+        <button type="button" class="key-btn key-letter" data-key="E">E</button>
+        <button type="button" class="key-btn key-letter" data-key="R">R</button>
+        <button type="button" class="key-btn key-letter" data-key="T">T</button>
+        <button type="button" class="key-btn key-letter" data-key="Y">Y</button>
+        <button type="button" class="key-btn key-letter" data-key="U">U</button>
+        <button type="button" class="key-btn key-letter" data-key="I">I</button>
+        <button type="button" class="key-btn key-letter" data-key="O">O</button>
+        <button type="button" class="key-btn key-letter" data-key="P">P</button>
+        <button type="button" class="key-btn key-backspace key-backspace-text" data-key="Backspace">⌫</button>
+      </div>
+
+      <div class="keyboard-row">
+        <button type="button" class="key-btn key-letter" data-key="A">A</button>
+        <button type="button" class="key-btn key-letter" data-key="S">S</button>
+        <button type="button" class="key-btn key-letter" data-key="D">D</button>
+        <button type="button" class="key-btn key-letter" data-key="F">F</button>
+        <button type="button" class="key-btn key-letter" data-key="G">G</button>
+        <button type="button" class="key-btn key-letter" data-key="H">H</button>
+        <button type="button" class="key-btn key-letter" data-key="J">J</button>
+        <button type="button" class="key-btn key-letter" data-key="K">K</button>
+        <button type="button" class="key-btn key-letter" data-key="L">L</button>
+        <button type="button" class="key-btn key-special" data-key=",">,</button>
+        <button type="button" class="key-btn key-special" data-key=".">.</button>
+        <button type="button" class="key-btn key-backspace key-backspace-numeric" data-key="Backspace">⌫</button>
+      </div>
+
+      <div class="keyboard-row">
+        <button type="button" class="key-btn key-shift" data-key="Shift">SHIFT</button>
+        <button type="button" class="key-btn key-letter" data-key="Z">Z</button>
+        <button type="button" class="key-btn key-letter" data-key="X">X</button>
+        <button type="button" class="key-btn key-letter" data-key="C">C</button>
+        <button type="button" class="key-btn key-letter" data-key="V">V</button>
+        <button type="button" class="key-btn key-letter" data-key="B">B</button>
+        <button type="button" class="key-btn key-letter" data-key="N">N</button>
+        <button type="button" class="key-btn key-letter" data-key="M">M</button>
+        <button type="button" class="key-btn key-space" data-key=" ">SPACE</button>
+        <button type="button" class="key-btn key-mode-switch" data-mode="numeric">123</button>
+        <button type="button" class="key-btn key-mode-switch" data-mode="text">ABC</button>
+        <button type="button" class="key-btn key-done" data-key="Done">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- In-checkout slide panel (opens any view without leaving checkout) -->
+  <div id="coPanel" class="co-panel" aria-hidden="true">
+    <div class="co-panel-hdr">
+      <button id="coPanelClose" class="co-panel-close">&#8592; CHECKOUT</button>
+      <span id="coPanelTitle" class="co-panel-title"></span>
+    </div>
+    <div id="coPanelContent" class="co-panel-content"></div>
+  </div>
+
+  <!-- ========== ARQUEO DE CAJA OVERLAY ========== -->
+  <div id="arqueoOverlay" style="display:none; position:fixed; inset:0; z-index:9999; background:#1a3a4a; flex-direction:row;">
+
+    <!-- Global X close button -->
+    <button onclick="arqueoClose()" title="Cerrar" style="position:absolute; top:10px; right:14px; z-index:10001; background:rgba(239,68,68,0.85); color:white; border:none; border-radius:50%; width:36px; height:36px; font-size:20px; font-weight:900; cursor:pointer; display:flex; align-items:center; justify-content:center; line-height:1;">✕</button>
+
+    <!-- LEFT PANEL -->
+    <div id="arqueoLeftPanel" style="width:220px; min-width:220px; background:#1e2d38; display:flex; flex-direction:column; padding:18px 12px; gap:10px; border-right:2px solid #0f4c75; overflow-y:auto;">
+      <div style="text-align:center; color:#7ecef4; font-size:20px; font-weight:900; letter-spacing:3px; padding:8px 0; border-bottom:2px solid #2a4a5e;">ARQUEOS</div>
+
+      <button style="background:linear-gradient(135deg,#2ecc71,#27ae60); color:white; border:none; border-radius:8px; padding:10px; font-size:13px; font-weight:800; cursor:pointer; letter-spacing:1px;">CAJA PRINCIPAL</button>
+
+      <!-- Period selector -->
+      <div style="background:#0f2130; border-radius:10px; padding:10px 8px; display:flex; flex-direction:column; gap:6px;">
+        <div style="color:#94a3b8; font-size:10px; font-weight:700; letter-spacing:1px; text-align:center; margin-bottom:2px;">PERÍODO</div>
+        <button id="arqueoPeriodHoy"      onclick="arqueoSetPeriod('today')"   style="background:#2ecc71; color:white; border:none; border-radius:7px; padding:9px 6px; font-size:12px; font-weight:800; cursor:pointer; letter-spacing:.5px;">📅 HOY</button>
+        <button id="arqueoPeriodAyer"     onclick="arqueoSetPeriod('yesterday')" style="background:#2a4a5e; color:#94a3b8; border:none; border-radius:7px; padding:9px 6px; font-size:12px; font-weight:700; cursor:pointer;">⏮ AYER</button>
+        <button id="arqueoPeriodMensual"   onclick="arqueoSetPeriod('month')"     style="background:#2a4a5e; color:#94a3b8; border:none; border-radius:7px; padding:9px 6px; font-size:12px; font-weight:700; cursor:pointer;">📆 MENSUAL</button>
+        <button id="arqueoPeriodTrimestre" onclick="arqueoSetPeriod('quarter')"   style="background:#2a4a5e; color:#94a3b8; border:none; border-radius:7px; padding:9px 6px; font-size:12px; font-weight:700; cursor:pointer;">📋 TRIMESTRE</button>
+        <button id="arqueoPeriodAnual"     onclick="arqueoSetPeriod('year')"      style="background:#2a4a5e; color:#94a3b8; border:none; border-radius:7px; padding:9px 6px; font-size:12px; font-weight:700; cursor:pointer;">📊 ANUAL</button>
+        <button id="arqueoPeriodCustom"   onclick="arqueoSetPeriod('custom')"  style="background:#2a4a5e; color:#94a3b8; border:none; border-radius:7px; padding:9px 6px; font-size:12px; font-weight:700; cursor:pointer;">✏️ CUSTOM</button>
+        <!-- Custom date range (hidden by default) -->
+        <div id="arqueoCustomRange" style="display:none; flex-direction:column; gap:5px; margin-top:2px;">
+          <input id="arqueoCustomStart" type="date" style="width:100%; padding:6px 8px; border-radius:6px; border:1px solid #2a4a5e; background:#1a3a4a; color:white; font-size:12px;" />
+          <input id="arqueoCustomEnd"   type="date" style="width:100%; padding:6px 8px; border-radius:6px; border:1px solid #2a4a5e; background:#1a3a4a; color:white; font-size:12px;" />
+          <button onclick="arqueoLoadCustomRange()" style="background:#0ea5e9; color:white; border:none; border-radius:6px; padding:8px; font-size:12px; font-weight:800; cursor:pointer;">▶ CARGAR</button>
+        </div>
+        <!-- Month/Year pickers (hidden by default) -->
+        <div id="arqueoMonthPicker" style="display:none; margin-top:2px;">
+          <input id="arqueoMonthInput" type="month" style="width:100%; padding:6px 8px; border-radius:6px; border:1px solid #2a4a5e; background:#1a3a4a; color:white; font-size:12px;" onchange="arqueoLoadMonthRange()" />
+        </div>
+        <div id="arqueoYearPicker" style="display:none; margin-top:2px;">
+          <select id="arqueoYearInput" style="width:100%; padding:6px 8px; border-radius:6px; border:1px solid #2a4a5e; background:#1a3a4a; color:white; font-size:12px;" onchange="arqueoLoadYearRange()"></select>
+        </div>
+      </div>
+
+      <!-- Arrow navigation (saved reports) -->
+      <div style="display:flex; flex-direction:column; align-items:center; gap:5px;">
+        <div style="color:#64748b; font-size:10px; font-weight:600; letter-spacing:.5px;">HISTÓRICO GUARDADO</div>
+        <div style="display:flex; align-items:center; gap:4px; width:100%;">
+          <button id="arqueoNavPrev" onclick="arqueoNavigate(1)" title="Día anterior" style="background:#2a4a5e; color:white; border:none; border-radius:6px; width:36px; height:40px; font-size:18px; cursor:pointer; flex-shrink:0;">◄</button>
+          <div style="flex:1; background:#1a3a4a; border:2px solid #2ecc71; border-radius:8px; padding:6px 4px; text-align:center;">
+            <div style="color:#2ecc71; font-size:10px; font-weight:700; letter-spacing:1px;">ARQUEO</div>
+            <div id="arqueoNavNumber" style="color:white; font-size:12px; font-weight:900; word-break:break-all; line-height:1.2; margin-top:2px;">-</div>
+          </div>
+          <button id="arqueoNavNext" onclick="arqueoNavigate(-1)" title="Día siguiente / Hoy" style="background:#2a4a5e; color:white; border:none; border-radius:6px; width:36px; height:40px; font-size:18px; cursor:pointer; flex-shrink:0;">►</button>
+        </div>
+        <div id="arqueoNavDate" style="color:#7ecef4; font-size:11px; font-weight:700; text-align:center; line-height:1.4;">-</div>
+        <div id="arqueoNavIndex" style="color:#64748b; font-size:10px; text-align:center;">-</div>
+      </div>
+
+      <!-- Status info -->
+      <div style="background:#0f2130; border-radius:8px; padding:8px; font-size:11px; color:#7ecef4; line-height:1.9;">
+        <div><span style="color:#94a3b8;">CAJA:</span> PRINCIPAL</div>
+        <div id="arqueoSideUser"><span style="color:#94a3b8;">USUARIO:</span> -</div>
+        <div id="arqueoSideTime"><span style="color:#94a3b8;">HORA X:</span> -</div>
+      </div>
+
+      <div style="flex:1;"></div>
+
+      <!-- Navigation hint -->
+      <div style="background:#0f2130; border-radius:8px; padding:6px; text-align:center; font-size:10px; color:#475569; line-height:1.6;">
+        ◄ anterior &nbsp;|&nbsp; siguiente ►
+      </div>
+    </div>
+
+    <!-- CENTER PANEL (receipt OR list) -->
+    <div style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+
+      <!-- LIST VIEW (monthly / yearly) -->
+      <div id="arqueoListView" style="display:none; flex:1; overflow:hidden; flex-direction:column;">
+        <!-- Header bar -->
+        <div style="background:#0f2130; padding:12px 18px; display:flex; align-items:center; justify-content:space-between; border-bottom:2px solid #2a4a5e; flex-shrink:0;">
+          <div id="arqueoListTitle" style="color:#7ecef4; font-size:16px; font-weight:900; letter-spacing:1px;">CAJA PRINCIPAL</div>
+          <div style="display:flex; align-items:center; gap:14px;">
+            <div id="arqueoListTotal" style="color:#2ecc71; font-size:16px; font-weight:900;"></div>
+            <div style="display:flex; gap:8px;">
+              <button onclick="arqueoListBack()" style="background:#2a4a5e; color:#94a3b8; border:none; border-radius:6px; padding:6px 12px; font-size:13px; font-weight:700; cursor:pointer;" onmouseenter="this.style.color='white'" onmouseleave="this.style.color='#94a3b8'">← Volver</button>
+              <button onclick="arqueoClose()" style="background:#dc2626; color:white; border:none; border-radius:6px; padding:6px 12px; font-size:13px; font-weight:700; cursor:pointer;">✕ Salir</button>
+            </div>
+          </div>
+        </div>
+        <!-- Table header -->
+        <div style="background:#1565c0; padding:0 10px; flex-shrink:0;">
+          <table style="width:100%; border-collapse:collapse; font-family:'Courier New',monospace; font-size:13px; table-layout:fixed;">
+            <colgroup>
+              <col style="width:40%;">
+              <col style="width:7%;">
+              <col style="width:18%;">
+              <col style="width:18%;">
+              <col style="width:17%;">
+            </colgroup>
+            <thead>
+              <tr style="color:#ffffff; font-weight:700; border-bottom:2px solid #0d47a1;">
+                <th style="padding:10px 8px; text-align:left;">Arqueo</th>
+                <th style="padding:10px 8px; text-align:center;">Nº</th>
+                <th style="padding:10px 8px; text-align:left;">Desde</th>
+                <th style="padding:10px 8px; text-align:left;">Hasta</th>
+                <th style="padding:10px 8px; text-align:right;">Total</th>
+              </tr>
+            </thead>
+          </table>
+        </div>
+        <!-- Scrollable rows -->
+        <div style="flex:1; overflow-y:auto; padding:0 10px 0 10px; background:#e8f0f6;">
+          <table style="width:100%; border-collapse:collapse; font-family:'Courier New',monospace; font-size:13px; table-layout:fixed;">
+            <colgroup>
+              <col style="width:40%;">
+              <col style="width:7%;">
+              <col style="width:18%;">
+              <col style="width:18%;">
+              <col style="width:17%;">
+            </colgroup>
+            <tbody id="arqueoListBody"></tbody>
+          </table>
+        </div>
+        <!-- Pagination bar -->
+        <div id="arqueoListPager" style="background:#1a2f40; padding:8px 14px; display:flex; align-items:center; justify-content:space-between; flex-shrink:0; border-top:1px solid #2a4a5e;">
+          <button onclick="arqueoPageNav(-1)" id="arqueoPagePrev" style="background:#2a4a5e; color:white; border:none; border-radius:6px; padding:6px 16px; font-size:14px; font-weight:900; cursor:pointer;">◄</button>
+          <span id="arqueoPageInfo" style="color:#e2e8f0; font-size:13px; font-weight:700; font-family:'Courier New',monospace;"></span>
+          <button onclick="arqueoPageNav(1)"  id="arqueoPageNext" style="background:#2a4a5e; color:white; border:none; border-radius:6px; padding:6px 16px; font-size:14px; font-weight:900; cursor:pointer;">►</button>
+        </div>
+        <!-- Summary footer -->
+        <div id="arqueoListSummary" style="background:#1565c0; padding:12px 14px; font-family:'Courier New',monospace; font-size:13px; color:#e2e8f0; flex-shrink:0;"></div>
+      </div>
+
+      <!-- RECEIPT VIEW (today / single report) -->
+      <div id="arqueoReceiptView" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+        <div id="arqueoReceiptScroll">
+          <div id="arqueoReceiptPaper">
+            <!-- Receipt HTML generated by JS -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <div style="width:160px; min-width:160px; background:#1e2d38; display:flex; flex-direction:column; padding:18px 10px; gap:14px; border-left:2px solid #0f4c75; align-items:center;">
+
+      <!-- Z / Cerrar Caja -->
+      <button id="arqueoCloseBtn" onclick="arqueoClose()" style="width:100%; background:linear-gradient(135deg,#0ea5e9,#0284c7); color:white; border:none; border-radius:10px; padding:16px 8px; font-size:13px; font-weight:900; cursor:pointer; line-height:1.3; letter-spacing:1px;">
+        <div style="font-size:28px; font-weight:900;">Z</div>
+        <div>Cerrar<br>Caja</div>
+      </button>
+
+      <!-- Print -->
+      <button id="arqueoNewPrint" onclick="arqueoActionPrint()" style="width:100%; background:linear-gradient(135deg,#8b5cf6,#7c3aed); color:white; border:none; border-radius:10px; padding:14px 8px; font-size:13px; font-weight:800; cursor:pointer; letter-spacing:1px;">
+        🖨️<br>IMPRIMIR
+      </button>
+
+      <div style="flex:1;"></div>
+
+      <!-- CONTAR button -->
+      <button id="arqueoContarBtn" onclick="arqueoShowContar()" style="width:130px; height:130px; background:linear-gradient(135deg,#2ecc71,#16a34a); color:white; border:4px solid #4ade80; border-radius:50%; font-size:15px; font-weight:900; cursor:pointer; letter-spacing:2px; box-shadow:0 0 0 6px rgba(46,204,113,0.25); display:flex; align-items:center; justify-content:center; flex-direction:column; gap:4px;">
+        <span style="font-size:22px;">💵</span>
+        <span>CONTAR</span>
+      </button>
+
+      <div style="flex:1;"></div>
+
+      <!-- Done / confirm -->
+      <button id="arqueoNewDone" onclick="arqueoActionDone()" style="width:100%; background:linear-gradient(135deg,#f59e0b,#d97706); color:white; border:none; border-radius:10px; padding:14px 8px; font-size:14px; font-weight:900; cursor:pointer; letter-spacing:1px;">
+        ✅ DONE
+      </button>
+
+      <!-- Cancel / back to checkout -->
+      <button onclick="arqueoActionCancel()" style="width:100%; background:linear-gradient(135deg,#0ea5e9,#0284c7); color:white; border:none; border-radius:8px; padding:10px; font-size:12px; font-weight:700; cursor:pointer;">
+        ← CHECKOUT
+      </button>
+    </div>
+  </div>
+
+  <!-- CONTAR (Cash Count) panel overlay -->
+  <div id="arqueoContarOverlay" style="display:none; position:fixed; inset:0; z-index:10001; background:rgba(0,0,0,0.85); align-items:center; justify-content:center;">
+    <div style="background:white; border-radius:20px; padding:24px 22px 20px 22px; width:380px; max-width:96vw; box-shadow:0 20px 60px rgba(0,0,0,0.55);">
+      <h3 style="margin:0 0 4px 0; font-size:20px; color:#0f172a;">💵 CONTAR — Cash Count</h3>
+      <p style="color:#64748b; font-size:12px; margin:0 0 14px 0;">Enter the actual cash amount in the drawer.</p>
+
+      <!-- Expected -->
+      <div style="margin-bottom:10px;">
+        <label style="font-weight:700; color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:.5px;">Expected Cash</label>
+        <div id="arqueoContarExpected" style="background:#f1f5f9; border:2px solid #e2e8f0; border-radius:10px; padding:10px 14px; font-size:20px; font-weight:900; color:#0f172a; margin-top:4px;">€0.00</div>
+      </div>
+
+      <!-- Display of entered amount -->
+      <div style="margin-bottom:10px;">
+        <label style="font-weight:700; color:#334155; font-size:11px; text-transform:uppercase; letter-spacing:.5px;">Actual Cash Count</label>
+        <div id="arqueoContarDisplay" style="background:#f0fdf4; border:2px solid #2ecc71; border-radius:10px; padding:10px 14px; font-size:28px; font-weight:900; color:#0f172a; margin-top:4px; text-align:right; min-height:54px; letter-spacing:1px;">0</div>
+        <!-- hidden input kept for JS compat -->
+        <input id="arqueoContarActual" type="hidden" value="" data-no-vk="1" />
+      </div>
+
+      <!-- Difference -->
+      <div style="margin-bottom:14px;">
+        <label style="font-weight:700; color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:.5px;">Difference</label>
+        <div id="arqueoContarDiff" style="background:#f1f5f9; border:2px solid #e2e8f0; border-radius:10px; padding:10px 14px; font-size:20px; font-weight:900; color:#0f172a; margin-top:4px;">-</div>
+      </div>
+
+      <!-- Built-in number pad -->
+      <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:14px;">
+        <button onclick="arqueoContarKey('7')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">7</button>
+        <button onclick="arqueoContarKey('8')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">8</button>
+        <button onclick="arqueoContarKey('9')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">9</button>
+        <button onclick="arqueoContarKey('4')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">4</button>
+        <button onclick="arqueoContarKey('5')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">5</button>
+        <button onclick="arqueoContarKey('6')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">6</button>
+        <button onclick="arqueoContarKey('1')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">1</button>
+        <button onclick="arqueoContarKey('2')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">2</button>
+        <button onclick="arqueoContarKey('3')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">3</button>
+        <button onclick="arqueoContarKey('.')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">.</button>
+        <button onclick="arqueoContarKey('0')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #e2e8f0; border-radius:12px; background:#f8fafc; cursor:pointer; touch-action:manipulation;">0</button>
+        <button onclick="arqueoContarKey('back')" style="padding:16px; font-size:22px; font-weight:700; border:2px solid #fecaca; border-radius:12px; background:#fff5f5; color:#dc2626; cursor:pointer; touch-action:manipulation;">⌫</button>
+      </div>
+
+      <!-- Confirm / Cancel -->
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        <button onclick="arqueoContarConfirm()" style="background:linear-gradient(135deg,#2ecc71,#16a34a); color:white; border:none; border-radius:12px; padding:16px; font-size:17px; font-weight:900; cursor:pointer; touch-action:manipulation;">✅ Confirm</button>
+        <button onclick="document.getElementById('arqueoContarOverlay').style.display='none';" style="background:#e2e8f0; color:#334155; border:none; border-radius:12px; padding:16px; font-size:16px; font-weight:700; cursor:pointer; touch-action:manipulation;">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Barcode rendering (offline/local). Used for on-screen previews and barcode screens. -->
+  <script src="../node_modules/jsbarcode/dist/JsBarcode.all.min.js"></script>
   <script src="app.js"></script>
+
+  <!-- Bulk Barcode Upload Overlay -->
+  <div id="bulkUploadOverlay" style="display:none; position:fixed; inset:0; z-index:10500; background:rgba(15,23,42,0.7); align-items:center; justify-content:center; padding:20px;">
+    <div style="background:#fff; border-radius:20px; box-shadow:0 24px 80px rgba(0,0,0,0.4); width:min(860px,98vw); max-height:92vh; display:flex; flex-direction:column; overflow:hidden;">
+      <div style="background:linear-gradient(135deg,#1e40af,#3b82f6); padding:18px 24px; display:flex; align-items:center; justify-content:space-between; flex-shrink:0;">
+        <div>
+          <div style="color:#fff; font-size:20px; font-weight:900; letter-spacing:.5px;">&#x2B06; Bulk Product Upload</div>
+          <div style="color:#bfdbfe; font-size:12px; margin-top:2px;">Create multiple products via CSV, Excel or barcode images</div>
+        </div>
+        <button onclick="closeBulkUploadOverlay()" style="background:rgba(255,255,255,0.2); border:none; color:#fff; width:36px; height:36px; border-radius:50%; font-size:20px; cursor:pointer;">&#x2715;</button>
+      </div>
+      <div style="display:flex; border-bottom:2px solid #e2e8f0; background:#f8fafc; flex-shrink:0;">
+        <button id="bulkTabCsv" onclick="switchBulkTab('csv')" style="flex:1; padding:12px; font-size:13px; font-weight:800; border:none; border-bottom:3px solid #2563eb; background:transparent; color:#2563eb; cursor:pointer;">&#x1F4C4; CSV / Excel</button>
+        <button id="bulkTabImg" onclick="switchBulkTab('img')" style="flex:1; padding:12px; font-size:13px; font-weight:800; border:none; border-bottom:3px solid transparent; background:transparent; color:#64748b; cursor:pointer;">&#x1F4F7; Barcode Images</button>
+      </div>
+      <div style="padding:20px 24px; overflow-y:auto; flex:1;">
+        <div id="bulkPanelCsv">
+          <div style="background:#f0f9ff; border:1.5px solid #bae6fd; border-radius:12px; padding:14px 16px; margin-bottom:18px;">
+            <div style="font-weight:800; color:#0369a1; font-size:14px; margin-bottom:8px;">&#x1F4CB; CSV / Excel Format</div>
+            <div style="font-size:13px; color:#0c4a6e; line-height:1.7;"><b>Required column:</b> <code>barcode</code> &nbsp; <b>Optional:</b> <code>name</code>, <code>price</code>, <code>category</code>, <code>tax</code> (%), <code>stock</code>, <code>cost</code>, <code>unit_type</code><br>First row = header. Existing barcodes are skipped automatically.</div>
+            <button onclick="downloadBulkUploadTemplate()" style="margin-top:10px; background:#0ea5e9; color:#fff; border:none; border-radius:8px; padding:7px 16px; font-size:12px; font-weight:700; cursor:pointer;">&#x2B07; Download Template</button>
+          </div>
+          <div id="bulkUploadDropzone" style="border:2.5px dashed #93c5fd; border-radius:14px; padding:32px 20px; text-align:center; background:#f8faff; cursor:pointer;" onclick="document.getElementById('bulkUploadFileInput').click()">
+            <div style="font-size:40px; margin-bottom:8px;">&#x1F4C1;</div>
+            <div style="font-size:15px; font-weight:700; color:#1e40af;">Click to choose a CSV or Excel (.xlsx) file</div>
+            <div style="font-size:12px; color:#64748b; margin-top:4px;">Supports <b>.csv</b> and <b>.xlsx</b> &mdash; drag &amp; drop also works</div>
+            <input id="bulkUploadFileInput" type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" onchange="handleBulkUploadFile(this.files[0])">
+          </div>
+          <div id="bulkUploadPreviewWrap" style="display:none; margin-top:18px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+              <div id="bulkUploadPreviewTitle" style="font-weight:800; font-size:14px; color:#0f172a;"></div>
+              <button onclick="clearBulkCsv()" style="background:#e2e8f0; border:none; border-radius:8px; padding:5px 12px; font-size:12px; font-weight:700; cursor:pointer;">&#x2715; Clear</button>
+            </div>
+            <div style="overflow-x:auto; max-height:260px; border:1.5px solid #e2e8f0; border-radius:10px;">
+              <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                <thead id="bulkUploadPreviewHead" style="background:#1e40af; color:#fff; position:sticky; top:0;"></thead>
+                <tbody id="bulkUploadPreviewBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div id="bulkPanelImg" style="display:none;">
+          <div style="background:#fdf4ff; border:1.5px solid #e9d5ff; border-radius:12px; padding:14px 16px; margin-bottom:18px;">
+            <div style="font-weight:800; color:#6b21a8; font-size:14px; margin-bottom:6px;">&#x1F4F7; How it works</div>
+            <div style="font-size:13px; color:#581c87; line-height:1.7;">Upload <b>one or many barcode images</b> (JPG, PNG, WebP).<br>The system <b>reads the barcode</b> from each image automatically, looks up the product name on <b>Open Food Facts</b>, then lets you import all at once.</div>
+          </div>
+          <div id="imgDropzone" style="border:2.5px dashed #c4b5fd; border-radius:14px; padding:28px 20px; text-align:center; background:#faf5ff; cursor:pointer;" onclick="document.getElementById('bulkImgFileInput').click()">
+            <div style="font-size:40px; margin-bottom:8px;">&#x1F5BC;</div>
+            <div style="font-size:15px; font-weight:700; color:#7c3aed;">Click to choose barcode images</div>
+            <div style="font-size:12px; color:#64748b; margin-top:4px;">JPG, PNG, WebP &mdash; multiple files allowed &mdash; drag &amp; drop works too</div>
+            <input id="bulkImgFileInput" type="file" accept="image/*" multiple style="display:none;" onchange="handleBulkImageFiles(this.files)">
+          </div>
+          <div id="imgScanProgress" style="display:none; margin-top:14px;">
+            <div style="display:flex; justify-content:space-between; font-size:12px; font-weight:700; color:#334155; margin-bottom:5px;">
+              <span id="imgScanProgressLabel">Scanning images...</span>
+              <span id="imgScanProgressCount">0 / 0</span>
+            </div>
+            <div style="background:#e2e8f0; border-radius:99px; height:8px; overflow:hidden;">
+              <div id="imgScanProgressBar" style="height:100%; background:linear-gradient(90deg,#7c3aed,#a855f7); width:0%; transition:width .2s;"></div>
+            </div>
+          </div>
+          <div id="imgScanResults" style="display:none; margin-top:16px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+              <div id="imgScanTitle" style="font-weight:800; font-size:14px; color:#0f172a;"></div>
+              <button onclick="clearBulkImages()" style="background:#e2e8f0; border:none; border-radius:8px; padding:5px 12px; font-size:12px; font-weight:700; cursor:pointer;">&#x2715; Clear</button>
+            </div>
+            <div style="overflow-x:auto; max-height:300px; border:1.5px solid #e2e8f0; border-radius:10px;">
+              <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                <thead style="background:#6d28d9; color:#fff; position:sticky; top:0;">
+                  <tr>
+                    <th style="padding:8px 10px; text-align:left; font-weight:800;">Image</th>
+                    <th style="padding:8px 10px; font-weight:800;">Barcode Detected</th>
+                    <th style="padding:8px 10px; font-weight:800;">Product Name (lookup)</th>
+                    <th style="padding:8px 10px; font-weight:800;">Status</th>
+                  </tr>
+                </thead>
+                <tbody id="imgScanBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div id="bulkUploadProgress" style="display:none; margin-top:16px;">
+          <div style="display:flex; justify-content:space-between; font-size:12px; font-weight:700; color:#334155; margin-bottom:6px;">
+            <span id="bulkUploadProgressLabel">Importing...</span>
+            <span id="bulkUploadProgressCount">0 / 0</span>
+          </div>
+          <div style="background:#e2e8f0; border-radius:99px; height:10px; overflow:hidden;">
+            <div id="bulkUploadProgressBar" style="height:100%; background:linear-gradient(90deg,#2563eb,#06b6d4); width:0%; transition:width .2s;"></div>
+          </div>
+          <div id="bulkUploadProgressResults" style="margin-top:10px; font-size:12px; max-height:120px; overflow-y:auto;"></div>
+        </div>
+      </div>
+      <div style="padding:14px 24px; border-top:1.5px solid #e2e8f0; display:flex; align-items:center; justify-content:flex-end; gap:10px; background:#f8fafc; flex-shrink:0;">
+        <button onclick="closeBulkUploadOverlay()" style="background:#e2e8f0; color:#334155; border:none; border-radius:10px; padding:10px 22px; font-size:14px; font-weight:700; cursor:pointer;">Cancel</button>
+        <button id="bulkUploadImportBtn" onclick="startBulkUpload()" disabled style="background:linear-gradient(135deg,#1e40af,#3b82f6); color:#fff; border:none; border-radius:10px; padding:10px 28px; font-size:14px; font-weight:800; cursor:pointer; opacity:0.5;">&#x2B06; Import Products</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>

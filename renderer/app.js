@@ -2,9 +2,12 @@
 let currentUser = null;
 let cart = [];
 let allProducts = [];
+let allProductsById = new Map();
 let allCategories = [];
+let allCategoriesByName = new Map();
 let selectedPaymentMethod = null; // No default - must select payment method
 let paymentMode = 'single'; // 'single' or 'split'
+let cashDrawerOpenedInPaymentFlow = false; // Prevent double drawer-open (CASH select + complete sale)
 let systemSettings = null; // System settings
 let currentLogoData = ''; // Current logo data
 let scaleConnected = false; // Scale connection status
@@ -17,9 +20,1357 @@ let isWeightModalOpen = false; // Flag to prevent multiple modal opens
 let currentInvoiceNote = ''; // Store note for current invoice
 let currentSalesReportPrintContext = null; // Store last generated sales report for thermal printing
 
+// Barcode scanner capture (works even if the search box isn't focused)
+let barcodeScanCaptureState = {
+  buffer: '',
+  lastKeyAt: 0,
+  startedAt: 0
+};
+
+function isTextInputElement(el) {
+  if (!el) return false;
+  const tag = String(el.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+  if (el.isContentEditable) return true;
+  return false;
+}
+
+function isCheckoutViewActive() {
+  const v = document.getElementById('checkoutView');
+  return !!(v && v.classList.contains('active'));
+}
+
+function isBlockingOverlayOpen() {
+  // If a modal/overlay is open, do not hijack keystrokes.
+  if (document.querySelector('.modal.active')) return true;
+  if (document.getElementById('copilotConfirmOverlay')) return true;
+  if (document.getElementById('quickAddProductOverlay')) return true;
+  if (document.getElementById('quickVatPromptOverlay')) return true;
+  if (document.getElementById('barcodePreviewOverlay')) return true;
+  if (document.getElementById('unitPriceEntryOverlay')) return true;
+  return false;
+}
+
+function cacheProductRecord(product) {
+  try {
+    const id = parseInt(product?.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return;
+    if (!(allProductsById instanceof Map)) allProductsById = new Map();
+    // Ensure lowercase cache fields exist for fast filtering
+    if (product && typeof product._lcName !== 'string') product._lcName = String(product.name || '').toLowerCase();
+    if (product && typeof product._lcCategory !== 'string') product._lcCategory = String(product.category || '').toLowerCase();
+    if (product && typeof product._lcBarcode !== 'string') product._lcBarcode = String(product.barcode || '').toLowerCase();
+    allProductsById.set(id, product);
+  } catch {
+    // ignore
+  }
+}
+
+function setupGlobalBarcodeScannerCapture() {
+  if (setupGlobalBarcodeScannerCapture._attached) return;
+  setupGlobalBarcodeScannerCapture._attached = true;
+
+  const SCAN_GAP_MS = 65; // if time between keys is larger, treat as new input
+
+  document.addEventListener('keydown', async (e) => {
+    try {
+      if (!isCheckoutViewActive()) return;
+      if (isBlockingOverlayOpen()) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      const active = document.activeElement;
+      // Let normal typing work in inputs (especially the checkout search input).
+      if (isTextInputElement(active)) {
+        return;
+      }
+
+      const key = e.key;
+      const now = Date.now();
+
+      if (key === 'Escape') {
+        barcodeScanCaptureState.buffer = '';
+        barcodeScanCaptureState.lastKeyAt = 0;
+        barcodeScanCaptureState.startedAt = 0;
+        return;
+      }
+
+      if (key === 'Enter') {
+        const q = String(barcodeScanCaptureState.buffer || '').trim();
+        barcodeScanCaptureState.buffer = '';
+        barcodeScanCaptureState.lastKeyAt = 0;
+        barcodeScanCaptureState.startedAt = 0;
+        if (!q) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        hideCashierPaymentSummaryOverlay();
+        await searchAndAddProduct(q);
+        return;
+      }
+
+      // Only collect typical barcode characters (digits/letters and a few safe symbols)
+      if (typeof key === 'string' && key.length === 1 && /^[0-9A-Za-z\-_.]+$/.test(key)) {
+        if (!barcodeScanCaptureState.startedAt || (now - barcodeScanCaptureState.lastKeyAt) > SCAN_GAP_MS) {
+          barcodeScanCaptureState.buffer = key;
+          barcodeScanCaptureState.startedAt = now;
+          barcodeScanCaptureState.lastKeyAt = now;
+        } else {
+          barcodeScanCaptureState.buffer += key;
+          barcodeScanCaptureState.lastKeyAt = now;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, true);
+}
+
+// This workspace is now configured for barcode-only POS (no scale/weight flow).
+// Keep the legacy weight code paths for backward compatibility, but do not invoke them.
+const POS_DISABLE_SCALE_AND_WEIGHT = true;
+
+// Checkout: Undo last scan (either remove last added line, or revert a quantity-increase).
+let lastScanUndoAction = null;
+
+function setLastScanUndoAction(action) {
+  lastScanUndoAction = action || null;
+  try {
+    updateUndoScanButton();
+  } catch {
+    // ignore
+  }
+
+  // Live barcode preview in the modal
+  try {
+    const barcodeEl = document.getElementById('productBarcode');
+    const previewSvg = document.getElementById('productBarcodePreview');
+    if (barcodeEl && previewSvg) {
+      const render = () => renderBarcodeToSvg(previewSvg, barcodeEl.value, { height: 56, width: 2, displayValue: true, textMargin: 2 });
+      render();
+
+      if (!barcodeEl.dataset.previewAttached) {
+        barcodeEl.dataset.previewAttached = '1';
+        barcodeEl.addEventListener('input', () => {
+          try {
+            clearTimeout(barcodeEl.__barcodePreviewTimer);
+            barcodeEl.__barcodePreviewTimer = setTimeout(render, 40);
+          } catch {
+            // ignore
+          }
+        });
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function updateUndoScanButton() {
+  const btn = document.getElementById('undoScanBtn');
+  if (!btn) return;
+  const enabled = !!(lastScanUndoAction && cart && cart.length > 0);
+  btn.disabled = !enabled;
+  btn.style.opacity = enabled ? '1' : '0.6';
+  btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+}
+
+function updateDeleteAllButton() {
+  const btn = document.getElementById('deleteAllBtn');
+  if (!btn) return;
+  const enabled = !!(cart && cart.length > 0);
+  btn.disabled = !enabled;
+  btn.style.opacity = enabled ? '1' : '0.6';
+  btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+}
+
+function clearCurrentCart() {
+  if (!Array.isArray(cart) || cart.length === 0) {
+    updateDeleteAllButton();
+    return;
+  }
+
+  cart = [];
+  currentInvoiceNote = '';
+  selectedPaymentMethod = null;
+  paymentMode = 'single';
+  cashDrawerOpenedInPaymentFlow = false;
+
+  const paymentInput = document.getElementById('paymentInput');
+  if (paymentInput) paymentInput.value = '';
+
+  const cashPaidInput = document.getElementById('cashPaidInput');
+  if (cashPaidInput) cashPaidInput.value = '';
+
+  const splitCashAmount = document.getElementById('splitCashAmount');
+  if (splitCashAmount) splitCashAmount.value = '';
+
+  const splitCardAmount = document.getElementById('splitCardAmount');
+  if (splitCardAmount) splitCardAmount.value = '';
+
+  try {
+    closePaymentModalFunc();
+  } catch {
+    // ignore
+  }
+
+  updateCartDisplay();
+  showAlert('Cart cleared', 'success');
+}
+
+function undoLastScan() {
+  const action = lastScanUndoAction;
+  if (!action) {
+    showAlert('Nothing to undo', 'info');
+    return;
+  }
+
+  // Clear first to avoid double-tap repeating the undo.
+  setLastScanUndoAction(null);
+
+  try {
+    if (action.type === 'add') {
+      const id = Number(action.cartItemId);
+      if (!Number.isFinite(id)) throw new Error('Invalid undo item id');
+      const exists = cart.some(i => i && i.cartItemId === id);
+      if (!exists) {
+        showAlert('Last item is no longer in cart', 'warning');
+        return;
+      }
+      removeFromCart(id);
+      showAlert('Last scan removed', 'success');
+      return;
+    }
+
+    if (action.type === 'merge') {
+      const id = Number(action.cartItemId);
+      const prevQty = Number(action.prevQty);
+      if (!Number.isFinite(id) || !Number.isFinite(prevQty)) throw new Error('Invalid undo merge');
+      const item = cart.find(i => i && i.cartItemId === id);
+      if (!item) {
+        showAlert('Last item is no longer in cart', 'warning');
+        return;
+      }
+
+      // Restore previous quantity
+      if (prevQty <= 0) {
+        removeFromCart(id);
+      } else {
+        item.quantity = prevQty;
+        item.quantityGrams = null;
+        try { recalcCartItemMoney(item); } catch { /* ignore */ }
+        updateCartDisplay();
+      }
+
+      showAlert('Last scan undone', 'success');
+      return;
+    }
+  } catch (e) {
+    const msg = String(e?.message || e || 'Undo failed');
+    showAlert(msg, 'error', 'Undo');
+  }
+}
+
+// ============== BARCODE RENDERING (JsBarcode) ==============
+function getBarcodeFormatForValue(value) {
+  const v = String(value || '').replace(/\s+/g, '').trim();
+  if (/^\d{13}$/.test(v)) return 'ean13';
+  if (/^\d{12}$/.test(v)) return 'upc';
+  return 'code128';
+}
+
+function renderBarcodeToSvg(svgEl, value, { height = 62, width = 2, displayValue = true, textMargin = 2 } = {}) {
+  if (!svgEl) return false;
+  const v = String(value || '').replace(/\s+/g, '').trim();
+  if (!v) {
+    try { svgEl.innerHTML = ''; } catch { /* ignore */ }
+    return false;
+  }
+
+  const JsBarcode = window.JsBarcode;
+  if (typeof JsBarcode !== 'function') {
+    try {
+      svgEl.innerHTML = '<text x="0" y="16" fill="#64748b" font-size="12">Barcode renderer not loaded</text>';
+    } catch {
+      // ignore
+    }
+    return false;
+  }
+
+  const format = getBarcodeFormatForValue(v);
+  try {
+    svgEl.innerHTML = '';
+    JsBarcode(svgEl, v, {
+      format,
+      height,
+      width,
+      displayValue,
+      textMargin,
+      font: 'monospace',
+      fontSize: 14,
+      margin: 0,
+      background: '#ffffff',
+      lineColor: '#0f172a'
+    });
+    return true;
+  } catch {
+    // EAN/UPC can fail if check-digit is wrong; fall back to CODE128.
+    try {
+      svgEl.innerHTML = '';
+      JsBarcode(svgEl, v, {
+        format: 'code128',
+        height,
+        width,
+        displayValue,
+        textMargin,
+        font: 'monospace',
+        fontSize: 14,
+        margin: 0,
+        background: '#ffffff',
+        lineColor: '#0f172a'
+      });
+      return true;
+    } catch {
+      try {
+        svgEl.innerHTML = `<text x="0" y="16" fill="#dc2626" font-size="12">Invalid barcode: ${v}</text>`;
+      } catch {
+        // ignore
+      }
+      return false;
+    }
+  }
+}
+
+function showBarcodeOverlay({ barcode, name } = {}) {
+  const bc = String(barcode || '').replace(/\s+/g, '').trim();
+  const titleName = String(name || '').trim();
+  if (!bc) {
+    showAlert('Missing barcode', 'warning');
+    return;
+  }
+
+  const existing = document.getElementById('barcodePreviewOverlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'barcodePreviewOverlay';
+  overlay.style.cssText = [
+    'position:fixed',
+    'inset:0',
+    'background:rgba(0,0,0,0.55)',
+    'display:flex',
+    'align-items:center',
+    'justify-content:center',
+    'padding:18px',
+    'z-index:10050'
+  ].join(';');
+
+  const card = document.createElement('div');
+  card.style.cssText = [
+    'width:min(640px, 94vw)',
+    'background:#fff',
+    'border-radius:22px',
+    'box-shadow:0 18px 60px rgba(0,0,0,0.35)',
+    'overflow:hidden'
+  ].join(';');
+
+  const header = document.createElement('div');
+  header.style.cssText = [
+    'background:#6E8FAF',
+    'color:#fff',
+    'padding:18px 20px',
+    'display:flex',
+    'align-items:center',
+    'justify-content:space-between',
+    'gap:12px'
+  ].join(';');
+  header.innerHTML = `
+    <div style="font-size:22px; font-weight:900; letter-spacing:0.12em;">BARCODE</div>
+    <button id="barcodeOverlayClose" style="border:none; background:rgba(255,255,255,0.18); color:#fff; width:42px; height:42px; border-radius:14px; font-size:22px; font-weight:900; cursor:pointer;">×</button>
+  `;
+
+  const body = document.createElement('div');
+  body.style.cssText = 'padding:18px 20px 20px 20px;';
+  body.innerHTML = `
+    <div style="font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial;">
+      ${titleName ? `<div style="font-size:16px; font-weight:800; color:#0f172a; margin-bottom:10px;">${titleName}</div>` : ''}
+      <div style="border:2px dashed #cbd5e1; border-radius:16px; padding:16px; background:#f8fafc;">
+        <svg id="barcodeOverlaySvg" style="width:100%; height:160px;"></svg>
+      </div>
+      <div style="margin-top:12px; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:18px; font-weight:900; color:#334155; text-align:center;">${bc}</div>
+    </div>
+  `;
+
+  card.appendChild(header);
+  card.appendChild(body);
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    try { overlay.remove(); } catch { /* ignore */ }
+  };
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) close();
+  });
+  header.querySelector('#barcodeOverlayClose')?.addEventListener('click', close);
+
+  const svg = body.querySelector('#barcodeOverlaySvg');
+  renderBarcodeToSvg(svg, bc, { height: 120, width: 2, displayValue: false });
+}
+
+// Receipt reprint tracking (sale.id -> number of times printed in this session)
+const printedReceiptCounts = new Map();
+
+// PARKING (Loans) list filters
+let currentLoansStatus = 'active';
+let currentLoansSearchQuery = '';
+
+// Checkout banner for active PARKING context
+let parkingContextHydrateInFlight = false;
+let parkingContextLastHydratedReceipt = '';
+
+function getParkingPaymentContext() {
+  try {
+    const raw = sessionStorage.getItem('parkingPayment');
+    if (!raw) return null;
+    const ctx = JSON.parse(raw);
+    if (!ctx || !ctx.receiptNumber) return null;
+    return ctx;
+  } catch {
+    return null;
+  }
+}
+
+function setParkingPaymentContext(nextCtx) {
+  try {
+    if (!nextCtx) {
+      sessionStorage.removeItem('parkingPayment');
+      return;
+    }
+    sessionStorage.setItem('parkingPayment', JSON.stringify(nextCtx));
+  } catch {
+    // ignore
+  }
+}
+
+async function hydrateParkingPaymentContextIfNeeded(ctx) {
+  try {
+    if (!ctx || !ctx.receiptNumber) return;
+    const receiptNumber = String(ctx.receiptNumber || '').trim();
+    if (!receiptNumber) return;
+
+    const hasNames = !!((ctx.restaurantName || ctx.customerName) && ctx.customerType);
+    if (hasNames && ctx.remainingAmount !== undefined) return;
+    if (parkingContextHydrateInFlight) return;
+    if (parkingContextLastHydratedReceipt === receiptNumber) return;
+
+    parkingContextHydrateInFlight = true;
+    parkingContextLastHydratedReceipt = receiptNumber;
+
+    const loan = await window.api.getLoanByReceipt(receiptNumber);
+    if (!loan) return;
+
+    const updated = {
+      ...ctx,
+      receiptNumber,
+      remainingAmount: Number(loan.remaining_amount || 0),
+      status: (loan.status || '').toString().toLowerCase(),
+      customerType: (loan.customer_type || '').toString().toLowerCase(),
+      restaurantName: loan.restaurant_name || null,
+      customerName: loan.customer_name || null,
+      customerPhone: loan.customer_phone || null
+    };
+    setParkingPaymentContext(updated);
+  } catch {
+    // ignore
+  } finally {
+    parkingContextHydrateInFlight = false;
+  }
+}
+
+function updateParkingContextBanner() {
+  const banner = document.getElementById('parkingContextBanner');
+  const titleEl = document.getElementById('parkingContextTitle');
+  const subEl = document.getElementById('parkingContextSub');
+  if (!banner || !titleEl || !subEl) return;
+
+  const ctx = getParkingPaymentContext();
+  if (!ctx || !ctx.receiptNumber) {
+    banner.style.display = 'none';
+    return;
+  }
+
+  const receiptNumber = String(ctx.receiptNumber || '').trim();
+  const type = (ctx.customerType || '').toString().toLowerCase();
+  const restaurantName = (ctx.restaurantName || '').toString().trim();
+  const customerName = (ctx.customerName || '').toString().trim();
+  const remaining = Number(ctx.remainingAmount);
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+
+  let partyLine = '';
+  if (type === 'restaurant' && restaurantName) {
+    partyLine = `RESTAURANT: ${restaurantName}`;
+  } else if (customerName) {
+    partyLine = `CUSTOMER: ${customerName}`;
+  } else {
+    partyLine = 'PARKING CUSTOMER';
+  }
+
+  const remainingText = Number.isFinite(remaining)
+    ? ` | REMAINING: ${currencySymbol}${remaining.toFixed(2)}`
+    : '';
+
+  titleEl.textContent = partyLine;
+  subEl.textContent = `PARKING TAB: ${receiptNumber}${remainingText}`;
+  banner.style.display = 'flex';
+
+  // Hydrate missing details asynchronously (best effort)
+  if (!ctx.customerType || (!ctx.restaurantName && !ctx.customerName) || !Number.isFinite(remaining)) {
+    hydrateParkingPaymentContextIfNeeded(ctx).finally(() => {
+      try { updateParkingContextBanner(); } catch { /* ignore */ }
+    });
+  }
+}
+
+// Logging: keep production fast (console logging can slow down over long sessions)
+const DEBUG_LOGS = false;
+function debugLog(...args) {
+  if (DEBUG_LOGS) console.log(...args);
+}
+
+function shouldUseKeyboardModeUi() {
+  try {
+    const qs = new URLSearchParams(window.location.search || '');
+    const forced = qs.get('keyboard');
+    if (forced === '1') return true;
+    if (forced === '0') return false;
+
+    const ls = (localStorage.getItem('posKeyboardMode') || '').toString();
+    if (ls === '1') return true;
+    if (ls === '0') return false;
+
+    const finePointer = window.matchMedia && window.matchMedia('(pointer: fine)').matches;
+    const coarsePointer = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+    const touchPoints = Number(navigator.maxTouchPoints || 0);
+    const touchLikely = coarsePointer || touchPoints > 0;
+
+    // Auto-enable on desktop PCs (mouse/trackpad, no touch).
+    return !!finePointer && !touchLikely;
+  } catch {
+    return false;
+  }
+}
+
+function applyKeyboardModeUi() {
+  try {
+    if (shouldUseKeyboardModeUi()) {
+      document.body.classList.add('keyboard-mode');
+    } else {
+      document.body.classList.remove('keyboard-mode');
+    }
+  } catch {
+    // ignore
+  }
+}
+
+// In production builds, silence noisy logs to keep the UI responsive.
+// (Keep warn/error so operational issues still surface.)
+if (!DEBUG_LOGS) {
+  try {
+    console.log = () => {};
+    console.debug = () => {};
+    console.info = () => {};
+  } catch {
+    // ignore
+  }
+}
+
+function showConfirmDialog({
+  title = 'Confirm',
+  message = 'Are you sure?',
+  confirmText = 'OK',
+  cancelText = 'Cancel',
+  tone = 'warning' // 'warning' | 'danger' | 'info'
+} = {}) {
+  return new Promise((resolve) => {
+    const existing = document.getElementById('copilotConfirmOverlay');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'copilotConfirmOverlay';
+    overlay.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'background:rgba(15, 23, 42, 0.55)',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'padding:24px',
+      'z-index:10050'
+    ].join(';');
+
+    const accent = tone === 'danger' ? '#ef4444' : (tone === 'info' ? '#0ea5e9' : '#f59e0b');
+    const confirmBg = tone === 'danger' ? 'linear-gradient(135deg,#ef4444,#dc2626)' : 'linear-gradient(135deg,#2563eb,#06b6d4)';
+
+    const card = document.createElement('div');
+    card.style.cssText = [
+      'width:min(520px, 94vw)',
+      'background:#ffffff',
+      'border-radius:22px',
+      'box-shadow:0 22px 70px rgba(0,0,0,0.35)',
+      'border:1px solid rgba(148,163,184,0.55)',
+      'padding:22px 20px',
+      'font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial'
+    ].join(';');
+
+    card.innerHTML = `
+      <div style="display:flex; gap:14px; align-items:flex-start;">
+        <div style="width:46px; height:46px; border-radius:14px; background:${accent}22; display:flex; align-items:center; justify-content:center; flex:0 0 auto;">
+          <div style="width:18px; height:18px; border-radius:999px; background:${accent};"></div>
+        </div>
+        <div style="flex:1 1 auto; min-width:0;">
+          <div style="font-size:20px; font-weight:900; color:#0f172a; margin:2px 0 8px;">${String(title)}</div>
+          <div style="font-size:15px; line-height:1.35; color:#475569; white-space:pre-wrap;">${String(message)}</div>
+        </div>
+      </div>
+      <div style="display:flex; gap:12px; margin-top:18px;">
+        <button id="copilotConfirmCancel" style="flex:1; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:#e2e8f0; color:#0f172a;">${String(cancelText)}</button>
+        <button id="copilotConfirmOk" style="flex:1; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:${confirmBg}; color:#ffffff;">${String(confirmText)}</button>
+      </div>
+    `;
+
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    const cleanup = () => {
+      try { overlay.remove(); } catch { /* ignore */ }
+    };
+    const onCancel = () => {
+      cleanup();
+      resolve(false);
+    };
+    const onOk = () => {
+      cleanup();
+      resolve(true);
+    };
+
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) onCancel();
+    });
+    document.getElementById('copilotConfirmCancel')?.addEventListener('click', onCancel, { once: true });
+    document.getElementById('copilotConfirmOk')?.addEventListener('click', onOk, { once: true });
+    document.addEventListener('keydown', function escHandler(e) {
+      if (e.key === 'Escape') {
+        document.removeEventListener('keydown', escHandler);
+        onCancel();
+      }
+    });
+  });
+}
+
+// Prompt the cashier for a VAT percent (0-100). Returns number or null.
+function promptForVatPercent() {
+  return new Promise((res) => {
+    const existingPrompt = document.getElementById('quickVatPromptOverlay');
+    if (existingPrompt) existingPrompt.remove();
+
+    const o = document.createElement('div');
+    o.id = 'quickVatPromptOverlay';
+    o.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'background:rgba(15, 23, 42, 0.55)',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'padding:24px',
+      'z-index:10070'
+    ].join(';');
+
+    const c = document.createElement('div');
+    c.style.cssText = [
+      'width:min(460px, 94vw)',
+      'background:#fff',
+      'border-radius:20px',
+      'box-shadow:0 22px 70px rgba(0,0,0,0.35)',
+      'border:1px solid rgba(148,163,184,0.55)',
+      'padding:18px 18px 16px 18px',
+      'font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial'
+    ].join(';');
+
+    c.innerHTML = `
+      <div style="font-size:18px; font-weight:950; color:#0f172a;">Add VAT Rate</div>
+      <div style="font-size:14px; color:#64748b; margin-top:4px;">Enter VAT percent (0-100)</div>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:12px;">
+        <input id="quickVatPromptInput" type="text" inputmode="decimal" placeholder="e.g., 8" style="flex:1; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; font-size:16px;" />
+        <div style="font-weight:950; color:#334155;">%</div>
+      </div>
+      <div style="display:flex; gap:12px; margin-top:14px;">
+        <button id="quickVatPromptCancel" style="flex:1; border:none; border-radius:16px; padding:12px 10px; font-size:16px; font-weight:900; background:#e2e8f0; color:#0f172a;">Cancel</button>
+        <button id="quickVatPromptOk" style="flex:1; border:none; border-radius:16px; padding:12px 10px; font-size:16px; font-weight:900; background:linear-gradient(135deg,#2563eb,#06b6d4); color:#fff;">Add</button>
+      </div>
+    `;
+
+    o.appendChild(c);
+    document.body.appendChild(o);
+
+    const closePrompt = (val = null) => {
+      try { o.remove(); } catch { /* ignore */ }
+      res(val);
+    };
+
+    const parsePercent = (value) => {
+      const v = String(value || '').trim().replace(',', '.');
+      const n = parseFloat(v);
+      if (!Number.isFinite(n)) return null;
+      if (n < 0 || n > 100) return null;
+      return n;
+    };
+
+    o.addEventListener('click', (e) => {
+      if (e.target === o) closePrompt(null);
+    });
+
+    document.getElementById('quickVatPromptCancel')?.addEventListener('click', () => closePrompt(null), { once: true });
+    document.getElementById('quickVatPromptOk')?.addEventListener('click', () => {
+      const v = document.getElementById('quickVatPromptInput')?.value;
+      const pct = parsePercent(v);
+      closePrompt(pct);
+    });
+
+    setTimeout(() => {
+      try {
+        const inp = document.getElementById('quickVatPromptInput');
+        inp?.focus?.();
+        inp?.select?.();
+      } catch {
+        // ignore
+      }
+    }, 0);
+  });
+}
+
+async function getVatPercentOptions() {
+  try {
+    if (typeof window.api.getVatRates === 'function') {
+      const rows = await window.api.getVatRates(true);
+      const opts = (Array.isArray(rows) ? rows : [])
+        .map(r => Math.round(Number(r?.percent)))
+        .filter(p => Number.isFinite(p) && p >= 0 && p <= 100)
+        .sort((a, b) => a - b);
+      if (opts.length) return Array.from(new Set(opts));
+    }
+  } catch {
+    // ignore
+  }
+  return [4, 10, 21];
+}
+
+function fillVatSelect(selectEl, options, selectedPct) {
+  if (!selectEl) return;
+  const selected = Math.round(Number(selectedPct));
+  const safeOptions = (Array.isArray(options) ? options : [4, 10, 21])
+    .map(v => Math.round(Number(v)))
+    .filter(v => Number.isFinite(v) && v >= 0 && v <= 100);
+
+  selectEl.innerHTML = safeOptions
+    .map(pct => `<option value="${pct}" ${pct === selected ? 'selected' : ''}>${pct}%</option>`)
+    .join('')
+    + '<option value="__add__">+ Add VAT…</option>';
+
+  // Ensure a valid value is selected
+  if (!safeOptions.includes(selected)) {
+    const fallback = safeOptions.includes(21) ? 21 : (safeOptions[0] ?? 21);
+    selectEl.value = String(fallback);
+  }
+}
+
+function attachVatAddHandler(selectEl, { onAdded } = {}) {
+  if (!selectEl) return;
+  if (selectEl.dataset.vatAddAttached === '1') return;
+  selectEl.dataset.vatAddAttached = '1';
+
+  selectEl.addEventListener('change', async () => {
+    const v = String(selectEl.value || '');
+    if (v !== '__add__') return;
+
+    // Reset to first valid option while prompting
+    const firstOpt = Array.from(selectEl.options || []).find(o => o && o.value !== '__add__');
+    if (firstOpt) selectEl.value = String(firstOpt.value);
+
+    const pct = await promptForVatPercent();
+    if (pct === null) return;
+    if (!Number.isFinite(pct)) {
+      showAlert('Please enter a valid VAT percent', 'error', 'Invalid VAT');
+      return;
+    }
+
+    try {
+      if (typeof window.api.addVatRate !== 'function') {
+        showAlert('VAT presets are not available in this build', 'error');
+        return;
+      }
+      const created = await window.api.addVatRate(pct, null);
+      const createdPct = Math.round(Number(created?.percent ?? pct));
+      showAlert(`VAT ${createdPct}% added`, 'success');
+      if (typeof onAdded === 'function') {
+        await onAdded(createdPct);
+      }
+    } catch (e) {
+      showAlert('Failed to add VAT: ' + (e?.message || e), 'error', 'VAT');
+    }
+  });
+}
+
+// Quick-add product dialog (optimized for barcode scan flow in Checkout)
+// Fields: barcode (prefilled), name, price, sales VAT, purchase VAT, stock (optional)
+async function showQuickAddProductDialog({ barcode, defaults = {} } = {}) {
+  let vatRates = [];
+  try {
+    if (typeof window.api.getVatRates === 'function') {
+      vatRates = await window.api.getVatRates(true);
+    }
+  } catch {
+    vatRates = [];
+  }
+
+  const VAT_OPTIONS = Array.isArray(vatRates) && vatRates.length
+    ? vatRates
+        .map(r => Number(r?.percent))
+        .filter(p => Number.isFinite(p) && p >= 0 && p <= 100)
+        .sort((a, b) => a - b)
+    : [4, 10, 21];
+
+  const normalizeVatDefault = (v, fallback = 21) => {
+    const n = Math.round(Number(v));
+    if (VAT_OPTIONS.includes(n)) return n;
+    // Pick closest if not in list
+    let closest = fallback;
+    let bestDist = Infinity;
+    for (const opt of VAT_OPTIONS) {
+      const d = Math.abs(opt - n);
+      if (d < bestDist) {
+        bestDist = d;
+        closest = opt;
+      }
+    }
+    return closest;
+  };
+
+  return new Promise((resolve) => {
+    const bc = String(barcode || '').replace(/\s+/g, '').trim();
+    if (!bc) {
+      resolve({ ok: false, reason: 'missing_barcode' });
+      return;
+    }
+
+    const existing = document.getElementById('quickAddProductOverlay');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'quickAddProductOverlay';
+    overlay.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'background:rgba(15, 23, 42, 0.55)',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'padding:24px',
+      'z-index:10000'
+    ].join(';');
+
+    const card = document.createElement('div');
+    card.style.cssText = [
+      'width:min(720px, 96vw)',
+      'background:#ffffff',
+      'border-radius:22px',
+      'box-shadow:0 22px 70px rgba(0,0,0,0.35)',
+      'border:1px solid rgba(148,163,184,0.55)',
+      'padding:20px 20px 18px 20px',
+      'font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial'
+    ].join(';');
+
+    const rawSalesVat = Number.isFinite(Number(defaults.salesVatPercent)) ? Number(defaults.salesVatPercent) : 21;
+    const rawPurchaseVat = Number.isFinite(Number(defaults.purchaseVatPercent)) ? Number(defaults.purchaseVatPercent) : rawSalesVat;
+    const defaultSalesVat = normalizeVatDefault(rawSalesVat, 21);
+    const defaultPurchaseVat = normalizeVatDefault(rawPurchaseVat, defaultSalesVat);
+    const defaultStock = (defaults.stock === '' || defaults.stock === null || defaults.stock === undefined) ? '' : String(defaults.stock);
+
+    const vatOptionsHtml = (selectedPct) => {
+      const options = VAT_OPTIONS
+        .map(pct => `<option value="${pct}" ${Number(pct) === Number(selectedPct) ? 'selected' : ''}>${pct}%</option>`)
+        .join('');
+      // Add action at bottom
+      return options + '<option value="__add__">+ Add VAT…</option>';
+    };
+
+    card.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:14px;">
+        <div>
+          <div style="font-size:22px; font-weight:950; color:#0f172a;">Add New Product</div>
+          <div style="font-size:14px; color:#64748b; margin-top:4px;">Barcode not found. Enter details and save.</div>
+        </div>
+        <button id="quickAddProductClose" style="border:none; background:#e2e8f0; color:#0f172a; width:44px; height:44px; border-radius:14px; font-size:20px; font-weight:900; cursor:pointer;">×</button>
+      </div>
+
+      <div style="display:grid; grid-template-columns: 1.2fr 1fr; gap:14px; margin-top:16px;">
+        <div>
+          <div style="font-size:13px; font-weight:900; color:#334155; margin-bottom:6px;">Barcode</div>
+          <input id="quickAddBarcode" type="text" value="${bc}" readonly
+            style="width:100%; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; font-size:16px; font-weight:900; background:#f8fafc; color:#0f172a;" />
+        </div>
+        <div>
+          <div style="font-size:13px; font-weight:900; color:#334155; margin-bottom:6px;">Stock (optional)</div>
+          <input id="quickAddStock" type="text" inputmode="numeric" placeholder="e.g., 10" value="${defaultStock}"
+            style="width:100%; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; font-size:16px;" />
+        </div>
+
+        <div style="grid-column: 1 / -1;">
+          <div style="font-size:13px; font-weight:900; color:#334155; margin-bottom:6px;">Product Name</div>
+          <input id="quickAddName" type="text" placeholder="e.g., Coca Cola 330ml"
+            style="width:100%; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; font-size:16px;" />
+        </div>
+
+        <div>
+          <div style="font-size:13px; font-weight:900; color:#334155; margin-bottom:6px;">Price (€)</div>
+          <input id="quickAddPrice" type="text" inputmode="decimal" placeholder="0.00"
+            style="width:100%; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; font-size:16px; text-align:right;" />
+        </div>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px;">
+          <div>
+            <div style="font-size:13px; font-weight:900; color:#334155; margin-bottom:6px;">IVA de venta</div>
+            <select id="quickAddSalesVat"
+              style="width:100%; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; font-size:16px; font-weight:900; background:#ffffff;">
+              ${vatOptionsHtml(defaultSalesVat)}
+            </select>
+          </div>
+          <div>
+            <div style="font-size:13px; font-weight:900; color:#334155; margin-bottom:6px;">IVA de compra</div>
+            <select id="quickAddPurchaseVat"
+              style="width:100%; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; font-size:16px; font-weight:900; background:#ffffff;">
+              ${vatOptionsHtml(defaultPurchaseVat)}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="checkout-visibility-toggle" style="margin-top:14px;" role="group" aria-label="Checkout visibility">
+        <div class="checkout-visibility-text">
+          <div class="checkout-visibility-title">Show in Checkout quick list</div>
+          <div class="checkout-visibility-help">Keep this off if you don’t want it in the quick grid.</div>
+        </div>
+        <label class="touch-switch" aria-label="Show in Checkout">
+          <input id="quickAddShowInCheckout" type="checkbox" />
+          <span class="touch-switch-slider" aria-hidden="true"></span>
+        </label>
+      </div>
+
+      <div style="display:flex; gap:12px; margin-top:16px;">
+        <button id="quickAddCancel" style="flex:1; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:#e2e8f0; color:#0f172a;">Cancel</button>
+        <button id="quickAddSave" style="flex:1; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:linear-gradient(135deg,#16a34a,#22c55e); color:#ffffff;">Save & Add</button>
+      </div>
+    `;
+
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    const cleanup = () => {
+      try { overlay.remove(); } catch { /* ignore */ }
+    };
+
+    const close = () => {
+      cleanup();
+      resolve({ ok: false, reason: 'cancel' });
+    };
+
+    const normalizeDecimal = (value) => String(value || '').trim().replace(',', '.');
+    const parsePercent = (value) => {
+      const v = normalizeDecimal(value);
+      const n = parseFloat(v);
+      if (!Number.isFinite(n)) return null;
+      if (n < 0 || n > 100) return null;
+      return n;
+    };
+
+    const attachVatAddHandler = (selectEl, fallbackValue) => {
+      if (!selectEl) return;
+      selectEl.addEventListener('change', async () => {
+        const v = String(selectEl.value || '');
+        if (v !== '__add__') return;
+
+        // Reset to previous value while we prompt
+        selectEl.value = String(fallbackValue);
+
+        const pct = await promptForVatPercent();
+        if (pct === null) return;
+
+        if (!Number.isFinite(pct)) {
+          showAlert('Please enter a valid VAT percent', 'error', 'Invalid VAT');
+          return;
+        }
+
+        try {
+          if (typeof window.api.addVatRate !== 'function') {
+            showAlert('VAT presets are not available in this build', 'error');
+            return;
+          }
+          const created = await window.api.addVatRate(pct, null);
+          const createdPct = Math.round(Number(created?.percent ?? pct));
+
+          // Add to all VAT selects in this dialog and select it
+          const salesSel = document.getElementById('quickAddSalesVat');
+          const purchaseSel = document.getElementById('quickAddPurchaseVat');
+
+          for (const sel of [salesSel, purchaseSel]) {
+            if (!sel) continue;
+            const exists = Array.from(sel.options || []).some(o => String(o.value) === String(createdPct));
+            if (!exists) {
+              const opt = document.createElement('option');
+              opt.value = String(createdPct);
+              opt.textContent = `${createdPct}%`;
+              // Insert before the add option if present
+              const addOpt = Array.from(sel.options || []).find(o => String(o.value) === '__add__');
+              if (addOpt && addOpt.parentElement) {
+                sel.insertBefore(opt, addOpt);
+              } else {
+                sel.appendChild(opt);
+              }
+            }
+          }
+
+          // Select new VAT in the dropdown that triggered it
+          selectEl.value = String(createdPct);
+          showAlert(`VAT ${createdPct}% added`, 'success');
+        } catch (e) {
+          showAlert('Failed to add VAT: ' + (e?.message || e), 'error', 'VAT');
+        }
+      });
+    };
+
+    const parsePrice = (value) => {
+      const raw = String(value ?? '').trim();
+      if (!raw) return 0;
+      const v = normalizeDecimal(raw);
+      const n = parseFloat(v);
+      if (!Number.isFinite(n) || n < 0) return null;
+      return n;
+    };
+
+    const parseStock = (value) => {
+      const raw = String(value ?? '').trim();
+      if (!raw) return 0;
+      const n = parseInt(raw, 10);
+      if (!Number.isFinite(n) || n < 0) return null;
+      return n;
+    };
+
+    const onSave = async () => {
+      const name = String(document.getElementById('quickAddName')?.value || '').trim();
+      const price = parsePrice(document.getElementById('quickAddPrice')?.value);
+      const salesVatPercent = parsePercent(document.getElementById('quickAddSalesVat')?.value);
+      const purchaseVatPercent = parsePercent(document.getElementById('quickAddPurchaseVat')?.value);
+      const stock = parseStock(document.getElementById('quickAddStock')?.value);
+      const showInCheckout = document.getElementById('quickAddShowInCheckout')?.checked !== false;
+
+      if (!name) {
+        showAlert('Please enter a product name', 'error', 'Missing Name');
+        return;
+      }
+      if (price === null) {
+        showAlert('Please enter a valid price (0 or more)', 'error', 'Invalid Price');
+        return;
+      }
+      if (salesVatPercent === null) {
+        showAlert('Please enter a valid IVA de venta (0-100)', 'error', 'Invalid VAT');
+        return;
+      }
+      if (purchaseVatPercent === null) {
+        showAlert('Please enter a valid IVA de compra (0-100)', 'error', 'Invalid VAT');
+        return;
+      }
+      if (stock === null) {
+        showAlert('Stock must be a number (0 or more)', 'error', 'Invalid Stock');
+        return;
+      }
+
+      // Prevent duplicate barcode
+      try {
+        if (typeof window.api.getProductByBarcode === 'function') {
+          const existing = await window.api.getProductByBarcode(bc);
+          if (existing && existing.id) {
+            showAlert(`Barcode already exists for: ${existing.name || 'another product'}`, 'error', 'Duplicate Barcode');
+            return;
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      const product = {
+        barcode: bc,
+        name,
+        description: '',
+        category: null,
+        subcategory: null,
+        show_in_checkout: showInCheckout ? 1 : 0,
+        unit_type: 'quantity',
+        weight_unit: 'kg',
+        quantity_unit: 'piece',
+        weight_amount: null,
+        quantity_amount: null,
+        regular_price: price,
+        sale_price: null,
+        discount_percent: 0,
+        price,
+        tax_rate: salesVatPercent / 100,
+        purchase_tax_rate: purchaseVatPercent / 100,
+        cost: 0,
+        stock,
+        min_stock: 5,
+        image: null
+      };
+
+      const saveBtn = document.getElementById('quickAddSave');
+      if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.style.opacity = '0.7';
+      }
+
+      try {
+        const res = await window.api.addProduct(product);
+        cleanup();
+        resolve({ ok: true, productId: res?.id, barcode: bc });
+      } catch (e) {
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.style.opacity = '1';
+        }
+        showAlert('Error saving product: ' + (e?.message || e), 'error', 'Error');
+      }
+    };
+
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) close();
+    });
+    document.getElementById('quickAddCancel')?.addEventListener('click', close, { once: true });
+    document.getElementById('quickAddProductClose')?.addEventListener('click', close, { once: true });
+    document.getElementById('quickAddSave')?.addEventListener('click', onSave);
+
+    // Allow adding VAT rates from within the dropdown
+    attachVatAddHandler(document.getElementById('quickAddSalesVat'), defaultSalesVat);
+    attachVatAddHandler(document.getElementById('quickAddPurchaseVat'), defaultPurchaseVat);
+
+    // Focus name field for fastest data entry
+    setTimeout(() => {
+      try {
+        const nameEl = document.getElementById('quickAddName');
+        if (nameEl) {
+          nameEl.focus();
+          nameEl.select?.();
+        }
+      } catch {
+        // ignore
+      }
+    }, 0);
+
+    document.addEventListener('keydown', function escHandler(e) {
+      if (e.key === 'Escape') {
+        document.removeEventListener('keydown', escHandler);
+        close();
+      }
+    });
+  });
+}
+
+// ============== PAGINATION HELPERS (Products & Categories) ==============
+function ensurePaginationBar({
+  containerSelector,
+  barId,
+  onPrev,
+  onNext,
+  onPerPage,
+  perPageOptions = [25, 50, 100, 200]
+}) {
+  const container = document.querySelector(containerSelector);
+  if (!container) return null;
+
+  let bar = document.getElementById(barId);
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = barId;
+    bar.className = 'pagination-bar';
+    bar.innerHTML = `
+      <div class="pagination-info" data-role="info"></div>
+      <div class="pagination-controls">
+        <button type="button" class="btn-secondary pagination-btn" data-role="prev">Prev</button>
+        <div class="pagination-page" data-role="page"></div>
+        <button type="button" class="btn-secondary pagination-btn" data-role="next">Next</button>
+        <select class="pagination-size" data-role="perPage"></select>
+      </div>
+    `;
+
+    // Insert above the table
+    container.insertBefore(bar, container.firstChild);
+
+    // Populate per-page options
+    const select = bar.querySelector('[data-role="perPage"]');
+    if (select) {
+      select.innerHTML = perPageOptions.map(v => `<option value="${v}">${v}/page</option>`).join('');
+    }
+
+    // Wire events once
+    bar.querySelector('[data-role="prev"]')?.addEventListener('click', () => onPrev?.());
+    bar.querySelector('[data-role="next"]')?.addEventListener('click', () => onNext?.());
+    bar.querySelector('[data-role="perPage"]')?.addEventListener('change', (e) => {
+      const v = parseInt(e.target.value, 10);
+      if (Number.isFinite(v)) onPerPage?.(v);
+    });
+  }
+
+  return bar;
+}
+
+function updatePaginationBar(barId, { page, perPage, total }) {
+  const bar = document.getElementById(barId);
+  if (!bar) return;
+  const totalPages = Math.max(1, Math.ceil((total || 0) / (perPage || 1)));
+  const safePage = Math.min(Math.max(1, page || 1), totalPages);
+  const start = total === 0 ? 0 : ((safePage - 1) * perPage + 1);
+  const end = total === 0 ? 0 : Math.min(total, safePage * perPage);
+
+  const info = bar.querySelector('[data-role="info"]');
+  const pageEl = bar.querySelector('[data-role="page"]');
+  const prevBtn = bar.querySelector('[data-role="prev"]');
+  const nextBtn = bar.querySelector('[data-role="next"]');
+  const select = bar.querySelector('[data-role="perPage"]');
+
+  if (info) info.textContent = `Showing ${start}-${end} of ${total}`;
+  if (pageEl) pageEl.textContent = `Page ${safePage} / ${totalPages}`;
+  if (prevBtn) prevBtn.disabled = safePage <= 1;
+  if (nextBtn) nextBtn.disabled = safePage >= totalPages;
+  if (select) select.value = String(perPage);
+}
+
+// Money/quantity helpers
+function moneyToCents(amount) {
+  const num = Number(amount);
+  if (!Number.isFinite(num)) return 0;
+  return Math.round((num + Number.EPSILON) * 100);
+}
+
+function centsToMoney(cents) {
+  const num = Number(cents);
+  if (!Number.isFinite(num)) return 0;
+  return num / 100;
+}
+
+function formatMoneyForUi(amount, currencySymbol = '€') {
+  const n = Number(amount);
+  const v = Number.isFinite(n) ? n : 0;
+  return `${currencySymbol}${v.toFixed(2)}`;
+}
+
+let cashierPayOverlayTimer = null;
+let pendingCashierPaySummary = null;
+function showCashierPaymentSummaryOverlay({ total, paid, change, currencySymbol = '€', autoHideMs = 8000 } = {}) {
+  try {
+    const overlay = document.getElementById('cashierCartSummary');
+    if (!overlay) return;
+
+    const totalEl = document.getElementById('cashierCartTotal');
+    const paidEl = document.getElementById('cashierCartPaid');
+    const changeEl = document.getElementById('cashierCartChange');
+    const methodEl = document.getElementById('cashierCartSummaryMethod');
+
+    if (totalEl) totalEl.textContent = formatMoneyForUi(total, currencySymbol);
+    if (paidEl) paidEl.textContent = formatMoneyForUi(paid, currencySymbol);
+    if (changeEl) changeEl.textContent = formatMoneyForUi(change, currencySymbol);
+    if (methodEl) methodEl.textContent = 'EFECTIVO';
+
+    overlay.classList.add('active');
+    overlay.setAttribute('aria-hidden', 'false');
+
+    if (cashierPayOverlayTimer) clearTimeout(cashierPayOverlayTimer);
+    cashierPayOverlayTimer = null;
+  } catch {
+    // ignore
+  }
+}
+
+function hideCashierPaymentSummaryOverlay() {
+  try {
+    const overlay = document.getElementById('cashierCartSummary');
+    if (!overlay) return;
+    overlay.classList.remove('active');
+    overlay.setAttribute('aria-hidden', 'true');
+  } catch {
+    // ignore
+  }
+}
+
+function queueCashierPaymentSummaryOverlay({ total, paid, change, currencySymbol = '€', autoHideMs = 8000 } = {}) {
+  pendingCashierPaySummary = {
+    total,
+    paid,
+    change,
+    currencySymbol,
+    autoHideMs
+  };
+}
+
+function kgToGrams(kg) {
+  const num = Number(kg);
+  if (!Number.isFinite(num)) return 0;
+  return Math.round((num + Number.EPSILON) * 1000);
+}
+
+function gramsToKg(grams) {
+  const num = Number(grams);
+  if (!Number.isFinite(num)) return 0;
+  return num / 1000;
+}
+
+function calcDiscountCents(lineSubtotalCents, discountPercent) {
+  const pct = Number(discountPercent || 0);
+  if (!Number.isFinite(pct) || pct <= 0) return 0;
+  return Math.round(lineSubtotalCents * (pct / 100));
+}
+
+function recalcCartItemMoney(cartItem) {
+  if (!cartItem) return;
+
+  // Normalize weight to integer grams for stable math
+  if (cartItem.isWeightBased) {
+    const grams = typeof cartItem.quantityGrams === 'number'
+      ? cartItem.quantityGrams
+      : kgToGrams(cartItem.quantity);
+    cartItem.quantityGrams = grams;
+    cartItem.quantity = gramsToKg(grams);
+  }
+
+  const unitPriceCents = typeof cartItem.unitPriceCents === 'number'
+    ? cartItem.unitPriceCents
+    : moneyToCents(cartItem.unitPrice);
+  cartItem.unitPriceCents = unitPriceCents;
+  cartItem.unitPrice = centsToMoney(unitPriceCents);
+
+  let subtotalCents = 0;
+  if (cartItem.isWeightBased) {
+    const grams = cartItem.quantityGrams || 0;
+    subtotalCents = Math.round((unitPriceCents * grams) / 1000);
+  } else {
+    const qty = Number(cartItem.quantity);
+    subtotalCents = Number.isFinite(qty) ? Math.round(unitPriceCents * qty) : 0;
+  }
+
+  cartItem.subtotalCents = subtotalCents;
+  cartItem.subtotal = centsToMoney(subtotalCents);
+}
+
 // Scale Debug Functions for Touchscreen
 function addScaleDebugLog(message, type = 'info') {
-  const timestamp = new Date().toLocaleTimeString();
+  const timestamp = formatTimeWithDisplayTimeZone(new Date());
   const colors = {
     info: '#0ff',
     success: '#0f0',
@@ -72,9 +1423,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Role-based permissions - Only admin can manage users and system settings
 const PERMISSIONS = {
-  cashier: ['checkout', 'products', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
-  manager: ['checkout', 'products', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
-  admin: ['checkout', 'products', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'users', 'system', 'categories', 'settings']
+  cashier: ['checkout', 'products', 'barcodes', 'sales', 'expenses', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  manager: ['checkout', 'products', 'barcodes', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'categories', 'settings'],
+  admin: ['checkout', 'products', 'barcodes', 'sales', 'expenses', 'reports', 'analytics', 'returns', 'inventory', 'loans', 'users', 'system', 'categories', 'settings']
 };
 
 // Initialize app
@@ -82,6 +1433,23 @@ document.addEventListener('DOMContentLoaded', () => {
   showLoadingScreen();
   updateAppVersionUI();
   setupCustomerDisplayPreviewOverlay();
+  setupGlobalBarcodeScannerCapture();
+
+  // Cashier payment overlay close handlers
+  try {
+    const overlay = document.getElementById('cashierCartSummary');
+    const closeBtn = document.getElementById('cashierCartSummaryClose');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => hideCashierPaymentSummaryOverlay());
+    }
+    if (overlay) {
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) hideCashierPaymentSummaryOverlay();
+      });
+    }
+  } catch {
+    // ignore
+  }
 });
 
 function setupCustomerDisplayPreviewOverlay() {
@@ -251,7 +1619,15 @@ function setupCustomerDisplayPreviewOverlay() {
           if (st?.preferredPort) lines.push(`preferredPort: ${st.preferredPort}`);
           if (st?.excludedPorts) lines.push(`excludedPorts: ${st.excludedPorts}`);
           if (st?.lastPortPath) lines.push(`lastPortPath: ${st.lastPortPath}`);
-          if (st?.lastPortCloseAt) lines.push(`lastPortCloseAt: ${new Date(st.lastPortCloseAt).toLocaleString()}`);
+          if (st?.lastPortCloseAt) lines.push(`lastPortCloseAt: ${formatDateTimeWithDisplayTimeZone(new Date(st.lastPortCloseAt), 'en-GB', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+          })}`);
           if (st?.lastPortError) lines.push(`lastPortError: ${st.lastPortError}`);
           if (st?.lastWriteError) lines.push(`lastWriteError: ${st.lastWriteError}`);
           if (st?.error) lines.push(`error: ${st.error}`);
@@ -377,12 +1753,11 @@ function showLoadingScreen() {
   
   // Show loading screen for 3 seconds
   setTimeout(() => {
-    // Hide loading screen and show login screen
+    // Hide loading screen
     document.getElementById('loadingScreen').classList.remove('active');
-    document.getElementById('loginScreen').classList.add('active');
-    
+
     // Initialize app after loading screen
-    initializeApp();
+    initializeApp().catch((e) => console.error('Init error:', e));
   }, 3000); // 3 seconds
 }
 
@@ -418,7 +1793,111 @@ async function updateLoadingBranding() {
   }
 }
 
-function initializeApp() {
+let appInitialized = false;
+
+function setupActivationHandlers() {
+  const input = document.getElementById('activationKeyInput');
+  const btn = document.getElementById('activateBtn');
+  const err = document.getElementById('activationError');
+
+  const setError = (text) => {
+    if (!err) return;
+    if (!text) {
+      err.style.display = 'none';
+      err.textContent = '';
+      return;
+    }
+    err.style.display = 'block';
+    err.textContent = String(text);
+  };
+
+  const doActivate = async () => {
+    setError('');
+    if (!window.api || typeof window.api.activateApp !== 'function') {
+      setError('Activation API not available.');
+      return;
+    }
+    const key = (input?.value || '').toString().trim();
+    const result = await window.api.activateApp(key);
+    if (result?.success) {
+      setError('');
+      // Continue boot into login
+      await initializeApp();
+    } else {
+      setError(result?.error || 'Activation failed');
+    }
+  };
+
+  if (btn) {
+    btn.onclick = () => {
+      doActivate().catch((e) => setError(e.message));
+    };
+  }
+
+  if (input) {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        doActivate().catch((err) => setError(err.message));
+      }
+    });
+  }
+}
+
+async function initializeApp() {
+  applyKeyboardModeUi();
+  // On-screen keyboard (safe if DOM doesn't include it)
+  try { setupVirtualKeyboard(); } catch { /* ignore */ }
+  // Always wire activation handlers (safe to call multiple times)
+  setupActivationHandlers();
+  await updateAppVersionUI();
+  try {
+    const el = document.getElementById('activationAppVersion');
+    if (el && window.api && typeof window.api.getAppVersion === 'function') {
+      const v = await window.api.getAppVersion();
+      if (v) el.textContent = String(v);
+    }
+  } catch {
+    // ignore
+  }
+
+  // Check activation status
+  try {
+    if (window.api && typeof window.api.getActivationStatus === 'function') {
+      const st = await window.api.getActivationStatus();
+      if (!st?.activated) {
+        showScreen('activationScreen');
+        const input = document.getElementById('activationKeyInput');
+        if (input) {
+          // Ensure the on-screen keyboard appears reliably on touch devices.
+          setTimeout(() => {
+            try {
+              window.__virtualKeyboardForceOpen = true;
+              input.focus();
+              input.dispatchEvent(new Event('focusin', { bubbles: true }));
+            } catch {
+              // ignore
+            }
+          }, 50);
+        }
+        return;
+      }
+    }
+  } catch {
+    // If activation check fails, default to requiring activation
+    showScreen('activationScreen');
+    return;
+  }
+
+  // Proceed with normal app init only once
+  if (appInitialized) {
+    showScreen('loginScreen');
+    return;
+  }
+  appInitialized = true;
+
+  showScreen('loginScreen');
+
   loadUserRoles(); // Load users dynamically for role selection
   setupLoginHandlers();
   setupNavigationHandlers();
@@ -540,7 +2019,12 @@ async function loadUserRoles() {
       `;
       
       // Add click handler
-      button.addEventListener('click', () => selectUser(user));
+      button.addEventListener('click', () => {
+        selectUser(user).catch((e) => {
+          console.error('Select user error:', e);
+          showAlert('Login failed. Please try again.', 'error', 'Error');
+        });
+      });
       
       container.appendChild(button);
     });
@@ -551,7 +2035,232 @@ async function loadUserRoles() {
 }
 
 // ============== USER SELECTION ==============
-function selectUser(user) {
+// Master password (requested): if entered for Admin/Manager login, bypasses per-user password.
+// WARNING: Anyone who knows this value can access admin/manager features.
+const MASTER_ROLE_BYPASS_PASSWORD = '1@23';
+
+async function promptForRolePassword(user) {
+  const role = String(user?.role || '').toLowerCase();
+  const roleLabel = role ? role.toUpperCase() : 'USER';
+  const name = (user?.full_name || user?.username || '').toString();
+
+  const existing = document.getElementById('rolePasswordOverlay');
+  if (existing) existing.remove();
+
+  return await new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.id = 'rolePasswordOverlay';
+    overlay.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'background:rgba(0,0,0,0.55)',
+      'padding:18px',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      // Keep below the on-screen keyboard so it remains tappable/usable.
+      'z-index:10001',
+      'overflow:auto'
+    ].join(';');
+
+    const card = document.createElement('div');
+    card.style.cssText = [
+      'width:min(560px, 96vw)',
+      'background:#fff',
+      'border-radius:22px',
+      'box-shadow:0 18px 60px rgba(0,0,0,0.35)',
+      'padding:22px 16px'
+    ].join(';');
+
+    card.innerHTML = `
+      <div style="text-align:center; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial;">
+        <div style="font-size:24px; font-weight:900; color:#0f172a; margin-bottom:4px;">${roleLabel} Access</div>
+        <div style="font-size:14px; color:#64748b; margin-bottom:14px;">Enter password for ${name}</div>
+
+        <!-- Password display (dots) -->
+        <div id="rolePasswordDisplay" style="width:min(320px,78vw); margin:0 auto 14px auto; font-size:28px; letter-spacing:10px; text-align:center; padding:12px 14px; border-radius:14px; border:2px solid #cbd5e1; background:#f8fafc; min-height:54px; color:#0f172a;">&#8203;</div>
+        <input id="rolePasswordInput" type="hidden" value="" />
+
+        <!-- Built-in keyboard: numbers + letters -->
+        <div style="margin-bottom:16px;">
+          <!-- Number row -->
+          <div style="display:flex; justify-content:center; gap:6px; margin-bottom:6px;">
+            ${[1,2,3,4,5,6,7,8,9,0].map(n=>`<button onclick="roleKbKey('${n}')" style="width:46px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#fff;font-size:18px;font-weight:700;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.1);">${n}</button>`).join('')}
+          </div>
+          <!-- QWERTY rows -->
+          ${[['q','w','e','r','t','y','u','i','o','p'],['a','s','d','f','g','h','j','k','l'],['z','x','c','v','b','n','m']].map(row=>`
+          <div style="display:flex; justify-content:center; gap:6px; margin-bottom:6px;">
+            ${row.map(k=>`<button onclick="roleKbKey('${k}')" style="width:46px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#fff;font-size:16px;font-weight:600;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.1);">${k}</button>`).join('')}
+          </div>`).join('')}
+          <!-- Bottom row: SHIFT + special chars + backspace -->
+          <div style="display:flex; justify-content:center; gap:6px; margin-bottom:2px;">
+            <button onclick="roleKbShift()" id="roleKbShiftBtn" style="padding:0 14px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#e2e8f0;font-size:13px;font-weight:700;cursor:pointer;">⇧ SHIFT</button>
+            <button onclick="roleKbKey('@')" style="width:46px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#fff;font-size:16px;cursor:pointer;">@</button>
+            <button onclick="roleKbKey('.')" style="width:46px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#fff;font-size:16px;cursor:pointer;">.</button>
+            <button onclick="roleKbKey('_')" style="width:46px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#fff;font-size:16px;cursor:pointer;">_</button>
+            <button onclick="roleKbKey('-')" style="width:46px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#fff;font-size:16px;cursor:pointer;">-</button>
+            <button onclick="roleKbKey(' ')" style="padding:0 20px;height:46px;border-radius:10px;border:1px solid #cbd5e1;background:#fff;font-size:13px;cursor:pointer;">SPACE</button>
+            <button onclick="roleKbBack()" style="padding:0 14px;height:46px;border-radius:10px;border:1px solid #f87171;background:#fee2e2;font-size:18px;cursor:pointer;">⌫</button>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:12px; justify-content:center;">
+          <button id="rolePasswordCancel" style="flex:1; max-width:180px; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:#94a3b8; color:#fff; cursor:pointer;">Cancel</button>
+          <button id="rolePasswordOk"     style="flex:1; max-width:180px; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:#0ea5e9; color:#fff; cursor:pointer;">Continue</button>
+        </div>
+      </div>
+    `;
+
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    const input = document.getElementById('rolePasswordInput');
+    const okBtn = document.getElementById('rolePasswordOk');
+    const cancelBtn = document.getElementById('rolePasswordCancel');
+
+    // Suppress virtual keyboard for this overlay
+    let _roleKbShifted = false;
+    window.roleKbKey = (k) => {
+      const ch = _roleKbShifted ? k.toUpperCase() : k;
+      input.value += ch;
+      const disp = document.getElementById('rolePasswordDisplay');
+      if (disp) disp.textContent = '●'.repeat(input.value.length) || '\u200b';
+    };
+    window.roleKbBack = () => {
+      input.value = input.value.slice(0, -1);
+      const disp = document.getElementById('rolePasswordDisplay');
+      if (disp) disp.textContent = '●'.repeat(input.value.length) || '\u200b';
+    };
+    window.roleKbShift = () => {
+      _roleKbShifted = !_roleKbShifted;
+      const btn = document.getElementById('roleKbShiftBtn');
+      if (btn) { btn.style.background = _roleKbShifted ? '#0ea5e9' : '#e2e8f0'; btn.style.color = _roleKbShifted ? '#fff' : '#0f172a'; }
+    };
+
+    // Prevent system virtual keyboard from opening
+    const keyboardEl = document.getElementById('virtualKeyboard');
+    let keyboardObserver = null;
+    let resizeHandler = null;
+
+    const syncKeyboardInset = () => {
+      try {
+        const basePadding = 18;
+        if (!keyboardEl) {
+          overlay.style.paddingBottom = `${basePadding}px`;
+          return;
+        }
+        const isActive = keyboardEl.classList.contains('active');
+        if (!isActive) {
+          overlay.style.paddingBottom = `${basePadding}px`;
+          return;
+        }
+        const rect = keyboardEl.getBoundingClientRect();
+        const kbHeight = Math.max(0, Math.round(rect.height || 0));
+        overlay.style.paddingBottom = `${basePadding + kbHeight}px`;
+      } catch {
+        // ignore
+      }
+    };
+
+    const cleanup = (result) => {
+      try { document.removeEventListener('keydown', keydownHandler, true); } catch { /* ignore */ }
+      try { keyboardObserver?.disconnect?.(); } catch { /* ignore */ }
+      try { if (resizeHandler) window.removeEventListener('resize', resizeHandler, true); } catch { /* ignore */ }
+      try { overlay.remove(); } catch { /* ignore */ }
+      // Clean up globals
+      delete window.roleKbKey;
+      delete window.roleKbBack;
+      delete window.roleKbShift;
+      resolve(result);
+    };
+
+    const submit = () => {
+      const pwd = (input?.value || '').toString();
+      cleanup(pwd);
+    };
+
+    // Return the typed password, but allow master bypass value to be entered as well.
+    // (Logic is handled in selectUser.)
+
+    const keydownHandler = (e) => {
+      try {
+        if (!document.getElementById('rolePasswordOverlay')) return;
+        const k = String(e.key || '');
+        if (k === 'Escape') {
+          e.preventDefault();
+          cleanup(null);
+          return;
+        }
+        if (k === 'Enter') {
+          e.preventDefault();
+          submit();
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    document.addEventListener('keydown', keydownHandler, true);
+
+    // Keep modal positioned above the virtual keyboard while it opens/closes.
+    try {
+      syncKeyboardInset();
+      if (keyboardEl && typeof MutationObserver !== 'undefined') {
+        keyboardObserver = new MutationObserver(() => syncKeyboardInset());
+        keyboardObserver.observe(keyboardEl, { attributes: true, attributeFilter: ['class', 'style'] });
+      }
+      resizeHandler = () => syncKeyboardInset();
+      window.addEventListener('resize', resizeHandler, true);
+    } catch {
+      // ignore
+    }
+
+    if (cancelBtn) cancelBtn.addEventListener('click', () => cleanup(null), { once: true });
+    if (okBtn) okBtn.addEventListener('click', submit);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) cleanup(null);
+    });
+
+    setTimeout(() => {
+      try {
+        window.__virtualKeyboardForceOpen = true;
+        input?.focus?.();
+        input?.select?.();
+        syncKeyboardInset();
+      } catch {
+        // ignore
+      }
+    }, 30);
+  });
+}
+
+async function selectUser(user) {
+  const role = String(user?.role || '').toLowerCase();
+  const requiresPassword = role === 'admin' || role === 'manager';
+
+  if (requiresPassword) {
+    const password = await promptForRolePassword(user);
+    if (password == null) return; // cancelled
+    if (!password.trim()) {
+      showAlert('Password is required.', 'warning', 'Login');
+      return;
+    }
+
+    // Master bypass
+    if (String(password) === MASTER_ROLE_BYPASS_PASSWORD) {
+      // Allow access without changing the user's stored password.
+    } else {
+      const authed = await window.api.authenticateUser(user.username, password);
+      if (!authed || !authed.id) {
+        showAlert('Incorrect password.', 'error', 'Access Denied');
+        return;
+      }
+
+      // Use the authenticated user record (no password included).
+      user = authed;
+    }
+  }
+
   // Set current user
   currentUser = {
     id: user.id,
@@ -588,12 +2297,16 @@ function setupLoginHandlers() {
 }
 
 document.getElementById('logoutBtn')?.addEventListener('click', () => {
+  logoutToLoginScreen();
+});
+
+function logoutToLoginScreen() {
   currentUser = null;
   cart = [];
   showScreen('loginScreen');
   // Reload user roles when returning to login screen
   loadUserRoles();
-});
+}
 
 // ============== ROLE-BASED UI ==============
 function setupRoleBasedUI() {
@@ -621,6 +2334,25 @@ function setupRoleBasedUI() {
       item.style.display = 'none';
     }
   });
+
+  // Sync checkout menu bar visibility
+  document.querySelectorAll('#checkoutMenuBar .cmb-btn[data-co-view]').forEach(btn => {
+    btn.hidden = !allowedViews.includes(btn.dataset.coView);
+  });
+
+  // Extra hardening: hide Users UI completely for non-admin roles
+  try {
+    const canSeeUsers = allowedViews.includes('users');
+    const usersMenuBtn = document.getElementById('usersMenuBtn');
+    const usersSettingsCard = document.getElementById('usersSettingsCard');
+    const usersView = document.getElementById('usersView');
+
+    if (usersMenuBtn) usersMenuBtn.style.display = canSeeUsers ? 'flex' : 'none';
+    if (usersSettingsCard) usersSettingsCard.style.display = canSeeUsers ? 'flex' : 'none';
+    if (usersView) usersView.style.display = canSeeUsers ? '' : 'none';
+  } catch {
+    // ignore
+  }
   
   // Set first available view as active
   const firstAllowedView = allowedViews[0];
@@ -659,17 +2391,22 @@ function loadViewData(view) {
     case 'products':
       if (hasPermission('products')) loadProductsView();
       break;
+    case 'barcodes':
+      if (hasPermission('barcodes')) loadBarcodesView();
+      break;
     case 'sales':
       if (hasPermission('sales')) loadSalesView();
       break;
     case 'reports':
-      if (hasPermission('reports')) loadReportsView();
+      if (hasPermission('reports')) {
+        openArqueoOverlay();
+      }
       break;
     case 'expenses':
       loadExpensesView();
       break;
     case 'analytics':
-      if (hasPermission('reports')) loadAnalyticsView();
+      if (hasPermission('analytics')) loadAnalyticsView();
       break;
     case 'returns':
       if (hasPermission('sales')) loadReturnsView();
@@ -692,6 +2429,340 @@ function loadViewData(view) {
   }
 }
 
+function navigateToView(view) {
+  try {
+    if (!hasPermission(view)) {
+      showAlert('You do not have permission to access this section.', 'warning', 'Access Denied');
+      return;
+    }
+
+    // Update active nav button if it exists.
+    const navBtns = document.querySelectorAll('.tab-btn');
+    navBtns.forEach(b => b.classList.remove('active'));
+    const navBtn = document.querySelector(`.tab-btn[data-view="${view}"]`);
+    if (navBtn) navBtn.classList.add('active');
+
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    const el = document.getElementById(`${view}View`);
+    if (el) el.classList.add('active');
+
+    toggleNavbarForView(view);
+    loadViewData(view);
+  } catch {
+    // ignore
+  }
+}
+
+// ============== BARCODE LIST VIEW ==============
+let barcodeListState = {
+  observer: null,
+  renderedIds: new Set(),
+  list: [],
+  selected: new Map(), // productId -> qty
+  printing: false
+};
+
+function updateBarcodeBulkUi() {
+  try {
+    const selectedEl = document.getElementById('barcodeBulkSelected');
+    const totalLabelsEl = document.getElementById('barcodeBulkTotalLabels');
+    const statusEl = document.getElementById('barcodeBulkStatus');
+    const printBtn = document.getElementById('barcodeBulkPrintBtn');
+    const clearBtn = document.getElementById('barcodeBulkClearBtn');
+
+    const selectedCount = barcodeListState.selected instanceof Map ? barcodeListState.selected.size : 0;
+    let totalLabels = 0;
+    if (barcodeListState.selected instanceof Map) {
+      for (const qty of barcodeListState.selected.values()) {
+        const n = parseInt(qty, 10);
+        if (Number.isFinite(n) && n > 0) totalLabels += n;
+      }
+    }
+
+    if (selectedEl) selectedEl.textContent = String(selectedCount);
+    if (totalLabelsEl) totalLabelsEl.textContent = String(totalLabels);
+    if (statusEl && !barcodeListState.printing) statusEl.textContent = '';
+
+    const disabled = barcodeListState.printing || selectedCount === 0;
+    if (printBtn) printBtn.disabled = disabled;
+    if (clearBtn) clearBtn.disabled = barcodeListState.printing || selectedCount === 0;
+  } catch {
+    // ignore
+  }
+}
+
+async function bulkPrintSelectedBarcodes() {
+  if (barcodeListState.printing) return;
+
+  if (!window.api?.printBarcodeLabel) {
+    showAlert('Barcode label printing is not available in this build', 'error', 'Print');
+    return;
+  }
+
+  const entries = Array.from((barcodeListState.selected instanceof Map) ? barcodeListState.selected.entries() : []);
+  if (entries.length === 0) {
+    showAlert('Please select up to 20 products to print', 'warning', 'Print');
+    return;
+  }
+
+  // Enforce max 20 distinct products
+  if (entries.length > 20) {
+    showAlert('You can print max 20 products at a time', 'warning', 'Print');
+    return;
+  }
+
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  const jobs = [];
+  const labelDefaults = {
+    // Force HTML so the printer respects the label layout instead of
+    // falling back to full-width receipt-style raw printing.
+    labelPrintMode: 'html',
+    // Layout to match the working sample label.
+    labelLayout: 'pvp-right',
+    labelMmWidth: 57,
+    labelMmHeight: 32
+  };
+  for (const [productIdRaw, qtyRaw] of entries) {
+    const productId = Number(productIdRaw);
+    const qty = Math.max(1, Math.min(99, parseInt(qtyRaw, 10) || 1));
+    const product = barcodeListState.list.find(p => p && Number(p.id) === productId);
+    if (!product) continue;
+
+    const barcode = String(product.barcode || '').replace(/\s+/g, '').trim();
+    const name = String(product.name || '').trim();
+    const price = Number(product.price);
+
+    if (!barcode || !name) continue;
+    for (let i = 0; i < qty; i++) {
+      jobs.push({ barcode, name, price, currencySymbol, ...labelDefaults });
+    }
+  }
+
+  if (jobs.length === 0) {
+    showAlert('Selected products have no barcodes to print', 'warning', 'Print');
+    return;
+  }
+
+  barcodeListState.printing = true;
+  updateBarcodeBulkUi();
+
+  const statusEl = document.getElementById('barcodeBulkStatus');
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  try {
+    for (let i = 0; i < jobs.length; i++) {
+      if (statusEl) statusEl.textContent = `Printing ${i + 1}/${jobs.length}...`;
+      const res = await window.api.printBarcodeLabel(jobs[i]);
+      if (res && res.success === false) {
+        throw new Error(res.error || res.message || 'Print failed');
+      }
+      // Small delay to avoid printer spooler congestion
+      await sleep(180);
+    }
+    if (statusEl) statusEl.textContent = '';
+    showAlert('Barcode labels sent to printer', 'success', 'Print');
+  } catch (e) {
+    if (statusEl) statusEl.textContent = '';
+    showAlert(String(e?.message || e || 'Print failed'), 'error', 'Print');
+  } finally {
+    barcodeListState.printing = false;
+    updateBarcodeBulkUi();
+  }
+}
+
+function ensureBarcodeListObserver() {
+  if (barcodeListState.observer) return barcodeListState.observer;
+  if (typeof IntersectionObserver !== 'function') return null;
+  barcodeListState.observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const el = entry.target;
+      const barcode = el?.dataset?.barcode;
+      if (!barcode) continue;
+      const svg = el.querySelector('svg');
+      if (svg) renderBarcodeToSvg(svg, barcode, { height: 86, width: 2, displayValue: false });
+      try { barcodeListState.observer.unobserve(el); } catch { /* ignore */ }
+    }
+  }, { root: null, threshold: 0.12 });
+  return barcodeListState.observer;
+}
+
+function renderBarcodeList(items, query = '') {
+  const container = document.getElementById('barcodeListContainer');
+  if (!container) return;
+
+  const q = String(query || '').trim().toLowerCase();
+  const filtered = q
+    ? items.filter(p =>
+        (p._lcName || '').includes(q) ||
+        (p._lcBarcode || '').includes(q)
+      )
+    : items;
+
+  if (!filtered.length) {
+    container.innerHTML = '<div style="grid-column: 1/-1; text-align:center; padding: 30px; color:#64748b; font-weight:800;">No barcodes found</div>';
+    return;
+  }
+
+  container.innerHTML = filtered.map(p => {
+    const bc = String(p.barcode || '').replace(/\s+/g, '').trim();
+    const safeName = String(p.name || '').trim();
+    const show = bc ? '' : 'opacity:0.55;';
+    const selectedQty = (barcodeListState.selected instanceof Map) ? (barcodeListState.selected.get(Number(p.id)) || 0) : 0;
+    const isSelected = selectedQty > 0;
+    return `
+      <div class="barcode-card" data-product-id="${p.id}" data-barcode="${bc}" style="${show}">
+        <div class="barcode-card-controls" aria-label="Bulk print controls">
+          <input class="barcode-select" type="checkbox" data-product-id="${p.id}" ${isSelected ? 'checked' : ''} ${bc ? '' : 'disabled'} title="Select (max 20)" />
+          <select class="barcode-qty" data-product-id="${p.id}" ${isSelected ? '' : 'disabled'} title="Quantity">
+            ${[1,2,3,4,5,6,7,8,9,10].map(n => `<option value="${n}" ${Number(selectedQty || 1) === n ? 'selected' : ''}>×${n}</option>`).join('')}
+          </select>
+        </div>
+        <div class="barcode-card-title">${safeName}</div>
+        <div class="barcode-card-preview">
+          <svg style="width:100%; height:120px;"></svg>
+        </div>
+        <div class="barcode-card-code">${bc || '(no barcode)'}</div>
+      </div>
+    `;
+  }).join('');
+
+  const obs = ensureBarcodeListObserver();
+  const cards = Array.from(container.querySelectorAll('.barcode-card'));
+  for (const card of cards) {
+    const bc = card.dataset.barcode;
+    if (!bc) continue;
+    if (obs) {
+      try { obs.observe(card); } catch { /* ignore */ }
+    } else {
+      const svg = card.querySelector('svg');
+      if (svg) renderBarcodeToSvg(svg, bc, { height: 86, width: 2, displayValue: false });
+    }
+  }
+
+  // Tap/click card => open full-screen overlay
+  if (!container.dataset.listenerAttached) {
+    container.dataset.listenerAttached = '1';
+    container.addEventListener('click', (e) => {
+      // Ignore clicks on the bulk controls
+      if (e.target?.closest?.('.barcode-card-controls, .barcode-select, .barcode-qty')) return;
+      const card = e.target?.closest?.('.barcode-card');
+      if (!card) return;
+      const bc = String(card.dataset.barcode || '').trim();
+      const productId = Number(card.dataset.productId);
+      const product = barcodeListState.list.find(x => x && Number(x.id) === productId);
+      showBarcodeOverlay({ barcode: bc, name: product?.name || '' });
+    });
+
+    // Selection / qty handlers
+    container.addEventListener('change', (e) => {
+      const cb = e.target?.closest?.('.barcode-select');
+      if (cb) {
+        const id = Number(cb.dataset.productId);
+        const card = cb.closest('.barcode-card');
+        const bc = String(card?.dataset?.barcode || '').trim();
+        if (!id || !Number.isFinite(id)) return;
+        if (!bc) {
+          cb.checked = false;
+          showAlert('This product has no barcode', 'warning', 'Print');
+          return;
+        }
+
+        if (cb.checked) {
+          // Enforce max 20
+          if (barcodeListState.selected.size >= 20 && !barcodeListState.selected.has(id)) {
+            cb.checked = false;
+            showAlert('Max 20 products can be selected for bulk print', 'warning', 'Print');
+            return;
+          }
+          if (!barcodeListState.selected.has(id)) barcodeListState.selected.set(id, 1);
+        } else {
+          barcodeListState.selected.delete(id);
+        }
+
+        // Enable/disable qty selector
+        const qtySel = card?.querySelector?.('.barcode-qty');
+        if (qtySel) qtySel.disabled = !cb.checked;
+        updateBarcodeBulkUi();
+        return;
+      }
+
+      const qtySel = e.target?.closest?.('.barcode-qty');
+      if (qtySel) {
+        const id = Number(qtySel.dataset.productId);
+        if (!Number.isFinite(id)) return;
+        const qty = parseInt(qtySel.value, 10);
+        if (barcodeListState.selected.has(id)) {
+          barcodeListState.selected.set(id, Number.isFinite(qty) && qty > 0 ? qty : 1);
+          updateBarcodeBulkUi();
+        }
+      }
+    });
+  }
+
+  updateBarcodeBulkUi();
+}
+
+async function loadBarcodesView() {
+  try {
+    // Load lite products list
+    const list = await (window.api.getAllProductsLite ? window.api.getAllProductsLite() : window.api.getAllProducts());
+    const items = Array.isArray(list) ? list : [];
+    for (const p of items) {
+      if (!p) continue;
+      if (typeof p._lcName !== 'string') p._lcName = String(p.name || '').toLowerCase();
+      if (typeof p._lcBarcode !== 'string') p._lcBarcode = String(p.barcode || '').toLowerCase();
+    }
+    barcodeListState.list = items;
+
+    // Reset selection when (re)loading the view
+    if (!(barcodeListState.selected instanceof Map)) barcodeListState.selected = new Map();
+    barcodeListState.selected.clear();
+    barcodeListState.printing = false;
+
+    const search = document.getElementById('barcodeListSearch');
+    renderBarcodeList(items, search?.value || '');
+
+    // Bulk toolbar handlers
+    const printBtn = document.getElementById('barcodeBulkPrintBtn');
+    if (printBtn && !printBtn.dataset.listenerAttached) {
+      printBtn.dataset.listenerAttached = '1';
+      printBtn.addEventListener('click', () => bulkPrintSelectedBarcodes());
+    }
+    const clearBtn = document.getElementById('barcodeBulkClearBtn');
+    if (clearBtn && !clearBtn.dataset.listenerAttached) {
+      clearBtn.dataset.listenerAttached = '1';
+      clearBtn.addEventListener('click', () => {
+        try {
+          barcodeListState.selected.clear();
+          renderBarcodeList(barcodeListState.list, document.getElementById('barcodeListSearch')?.value || '');
+          updateBarcodeBulkUi();
+        } catch {
+          // ignore
+        }
+      });
+    }
+    updateBarcodeBulkUi();
+
+    // Handlers
+    const backBtn = document.getElementById('barcodeListBackBtn');
+    if (backBtn && !backBtn.dataset.listenerAttached) {
+      backBtn.dataset.listenerAttached = '1';
+      backBtn.addEventListener('click', () => navigateToView('products'));
+    }
+    if (search && !search.dataset.listenerAttached) {
+      search.dataset.listenerAttached = '1';
+      let t = null;
+      search.addEventListener('input', () => {
+        if (t) clearTimeout(t);
+        t = setTimeout(() => renderBarcodeList(barcodeListState.list, search.value), 90);
+      });
+    }
+  } catch (e) {
+    showAlert(String(e?.message || e || 'Failed to load barcode list'), 'error');
+  }
+}
+
 // ============== NAVIGATION ==============
 function setupNavigationHandlers() {
   const navBtns = document.querySelectorAll('.tab-btn');
@@ -700,6 +2771,16 @@ function setupNavigationHandlers() {
   navBtns.forEach(btn => {
     btn.addEventListener('click', () => {
       const view = btn.dataset.view;
+      
+      // Reports: open Arqueo overlay directly, don't switch view
+      if (view === 'reports') {
+        if (!hasPermission('reports')) {
+          showAlert('You do not have permission to access this section.', 'warning', 'Access Denied');
+          return;
+        }
+        openArqueoOverlay();
+        return;
+      }
       
       // Check permission
       if (!hasPermission(view)) {
@@ -777,6 +2858,12 @@ function setupNavigationHandlers() {
           showAlert('You do not have permission to access this section.', 'warning', 'Access Denied');
           return;
         }
+
+        // Reports: open Arqueo overlay directly
+        if (view === 'reports') {
+          openArqueoOverlay();
+          return;
+        }
         
         // Update active nav button
         const navBtns = document.querySelectorAll('.tab-btn');
@@ -822,6 +2909,7 @@ function setupNavigationHandlers() {
   // Call after settings cards are setup
   setTimeout(() => {
     setupSpecialButtons();
+    setupCheckoutMenuBar();
   }, 100);
   
   if (settingsMenu) {    // Handle menu item clicks
@@ -856,13 +2944,122 @@ function setupNavigationHandlers() {
   const logoutBtnRight = document.getElementById('logoutBtnRight');
   if (logoutBtnRight) {
     logoutBtnRight.addEventListener('click', () => {
-      currentUser = null;
-      cart = [];
-      showScreen('loginScreen');
-      // Reload user roles when returning to login screen
-      loadUserRoles();
+      logoutToLoginScreen();
     });
   }
+}
+
+/* ===== In-checkout slide panel ===== */
+const CO_PANEL_TITLES = {
+  products: 'Products', barcodes: 'Barcodes', sales: 'Sales',
+  returns: 'Returns', loans: 'Parking', expenses: 'Expenses',
+  reports: 'Z Reports', analytics: 'Analytics', inventory: 'Inventory',
+  categories: 'Categories', users: 'Users', system: 'System Settings'
+};
+let _coPanelViewEl = null;
+let _coPanelViewParent = null;
+
+function openCoPanel(view) {
+  if (!hasPermission(view)) {
+    showAlert('You do not have permission to access this section.', 'warning', 'Access Denied');
+    return;
+  }
+  const panel   = document.getElementById('coPanel');
+  const content = document.getElementById('coPanelContent');
+  const titleEl = document.getElementById('coPanelTitle');
+  if (!panel || !content) return;
+
+  // Toggle: clicking the same button again closes the panel
+  if (panel.dataset.openView === view && panel.classList.contains('co-panel--open')) {
+    closeCoPanel();
+    return;
+  }
+
+  // Restore any previously moved view
+  if (_coPanelViewEl && _coPanelViewParent) {
+    _coPanelViewEl.classList.remove('active');
+    _coPanelViewParent.appendChild(_coPanelViewEl);
+  }
+
+  const viewEl = document.getElementById(view + 'View');
+  if (!viewEl) return;
+
+  _coPanelViewEl    = viewEl;
+  _coPanelViewParent = viewEl.parentElement;
+
+  // Move view node into panel content area and activate it
+  content.appendChild(viewEl);
+  viewEl.classList.add('active');
+
+  titleEl.textContent = CO_PANEL_TITLES[view] || view;
+  panel.dataset.openView = view;
+  panel.classList.add('co-panel--open');
+  panel.setAttribute('aria-hidden', 'false');
+
+  // Highlight the active menu button
+  document.querySelectorAll('#checkoutMenuBar .cmb-btn').forEach(b => {
+    b.classList.toggle('cmb-btn--active', b.dataset.coView === view);
+  });
+
+  // Load view data
+  loadViewData(view);
+}
+
+function closeCoPanel() {
+  const panel = document.getElementById('coPanel');
+  if (!panel) return;
+
+  // Move the view back to its original parent
+  if (_coPanelViewEl && _coPanelViewParent) {
+    _coPanelViewEl.classList.remove('active');
+    _coPanelViewParent.appendChild(_coPanelViewEl);
+    _coPanelViewEl    = null;
+    _coPanelViewParent = null;
+  }
+
+  panel.dataset.openView = '';
+  panel.classList.remove('co-panel--open');
+  panel.setAttribute('aria-hidden', 'true');
+
+  document.querySelectorAll('#checkoutMenuBar .cmb-btn').forEach(b => b.classList.remove('cmb-btn--active'));
+}
+
+function setupCheckoutMenuBar() {
+  const bar = document.getElementById('checkoutMenuBar');
+  if (!bar || bar.dataset.wired) return;
+  bar.dataset.wired = '1';
+
+  bar.addEventListener('click', (e) => {
+    const btn = e.target.closest('.cmb-btn');
+    if (!btn) return;
+
+    const view   = btn.dataset.coView;
+    const action = btn.dataset.coAction;
+
+    if (view) {
+      openCoPanel(view);
+    } else if (action === 'display') {
+      if (typeof toggleCustomerDisplay === 'function') toggleCustomerDisplay();
+    } else if (action === 'drawer') {
+      if (typeof openCashDrawer === 'function') openCashDrawer();
+    } else if (action === 'logout') {
+      if (typeof logoutToLoginScreen === 'function') logoutToLoginScreen();
+    }
+  });
+
+  // Wire close button
+  const closeBtn = document.getElementById('coPanelClose');
+  if (closeBtn && !closeBtn.dataset.wired) {
+    closeBtn.dataset.wired = '1';
+    closeBtn.addEventListener('click', closeCoPanel);
+  }
+
+  // Apply role-based visibility
+  const userRole     = currentUser ? currentUser.role : null;
+  const allowedViews = userRole ? (PERMISSIONS[userRole] || []) : [];
+  bar.querySelectorAll('.cmb-btn[data-co-view]').forEach(btn => {
+    btn.hidden = !allowedViews.includes(btn.dataset.coView);
+  });
 }
 
 function toggleNavbarForView(view) {
@@ -891,46 +3088,135 @@ function showScreen(screenId) {
 
 // ============== CHECKOUT VIEW ==============
 function setupCheckoutHandlers() {
-  const productSearch = document.getElementById('productSearch');
+  const productSearch = document.querySelector('#checkoutView #productSearch');
   const checkoutBtn = document.getElementById('checkoutBtn');
+  const deleteAllBtn = document.getElementById('deleteAllBtn');
+  const undoBtn = document.getElementById('undoScanBtn');
 
   // Virtual Numpad handlers
   const numpadBtns = document.querySelectorAll('.numpad-btn');
+
+  // Pending numpad value for type-first-then-tap-cell flow
+  let _numpadPending = '';
+
+  function clearNumpadPending() {
+    _numpadPending = '';
+  }
+
+  // Helper: return the currently focused cart inline-edit input, if any
+  function getActiveCartInput() {
+    const el = document.activeElement;
+    if (!el || el.tagName !== 'INPUT') return null;
+    if (el.dataset.noVk !== '1') return null;
+    if (!document.getElementById('cartTableBody')?.contains(el)) return null;
+    return el;
+  }
+
   numpadBtns.forEach(btn => {
+    // Prevent the button click from stealing focus away from a cart input
+    btn.addEventListener('mousedown', (e) => {
+      if (getActiveCartInput()) e.preventDefault();
+    });
+
     btn.addEventListener('click', () => {
       const value = btn.dataset.value;
-      
+
       // Skip if no value (hidden buttons)
       if (!value) return;
-      
+
+      const cartInput = getActiveCartInput();
+
+      if (cartInput) {
+        // Route numpad into the focused cart input
+        clearNumpadPending();
+        if (value === 'clear') {
+          // BORRAR = backspace one character
+          const pos = cartInput.selectionStart ?? cartInput.value.length;
+          if (pos > 0) {
+            cartInput.value = cartInput.value.slice(0, pos - 1) + cartInput.value.slice(pos);
+            try { cartInput.setSelectionRange(pos - 1, pos - 1); } catch { /* ignore */ }
+          }
+        } else if (value === 'enter') {
+          cartInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        } else if (value === '00') {
+          const wasEmpty = cartInput.value === '' || cartInput.dataset.replaceOnNextKey === '1';
+          if (wasEmpty) {
+            cartInput.value = '0';
+          } else {
+            cartInput.value += '00';
+          }
+          cartInput.dataset.replaceOnNextKey = '0';
+        } else {
+          // Replace-on-first-key behaviour (mirrors scanner flow)
+          if (cartInput.dataset.replaceOnNextKey === '1') {
+            cartInput.value = value;
+            cartInput.dataset.replaceOnNextKey = '0';
+          } else {
+            const pos = cartInput.selectionStart ?? cartInput.value.length;
+            cartInput.value = cartInput.value.slice(0, pos) + value + cartInput.value.slice(pos);
+            try { cartInput.setSelectionRange(pos + value.length, pos + value.length); } catch { /* ignore */ }
+          }
+        }
+        cartInput.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+
+      // Default: route to payment input + track pending for type-first-tap-cell flow
       if (value === 'clear') {
         const paymentInput = document.getElementById('paymentInput');
         if (paymentInput) paymentInput.value = '';
+        clearNumpadPending();
         updateCartSummary();
       } else if (value === 'enter') {
         // Enter does nothing for payment numpad
       } else {
-        // Number or decimal - add to payment input
+        // Number or decimal - add to payment input AND pending buffer
+        const digit = value; // '0'-'9', '00', '.'
+        _numpadPending += digit;
         const paymentInput = document.getElementById('paymentInput');
         if (paymentInput) {
-          paymentInput.value += value;
+          paymentInput.value += digit;
           updateCartSummary();
         }
       }
     });
   });
 
-  productSearch.addEventListener('input', (e) => {
-    const searchQuery = e.target.value.trim();
-    displayQuickProducts(searchQuery);
-  });
+  // Expose so cart click handler can access the pending value
+  setupCheckoutHandlers._getNumpadPending  = () => _numpadPending;
+  setupCheckoutHandlers._clearNumpadPending = () => { clearNumpadPending(); const p = document.getElementById('paymentInput'); if(p) { p.value = ''; updateCartSummary(); } };
 
-  productSearch.addEventListener('keypress', async (e) => {
-    if (e.key === 'Enter') {
-      await searchAndAddProduct(productSearch.value.trim());
-      productSearch.value = '';
-    }
-  });
+  if (productSearch && !productSearch.dataset.scanHandlersAttached) {
+    productSearch.dataset.scanHandlersAttached = '1';
+
+    // Debounce search to keep typing smooth on slower Windows PCs.
+    let productSearchDebounceTimer = null;
+    productSearch.addEventListener('input', (e) => {
+      const searchQuery = e.target.value.trim();
+      if (productSearchDebounceTimer) clearTimeout(productSearchDebounceTimer);
+      productSearchDebounceTimer = setTimeout(() => {
+        displayQuickProducts(searchQuery);
+      }, 120);
+    });
+
+    // Use keydown (keypress is deprecated and can be flaky with scanners)
+    productSearch.addEventListener('keydown', async (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const q = String(productSearch.value || '').trim();
+      if (!q) return;
+      await searchAndAddProduct(q);
+      try {
+        productSearch.value = '';
+        displayQuickProducts('');
+        try { window.__virtualKeyboardSuppressOnce = true; } catch { /* ignore */ }
+        productSearch.focus();
+        productSearch.select?.();
+      } catch {
+        // ignore
+      }
+    });
+  }
 
   // Category tab event listeners
   const categoryTabs = document.querySelectorAll('.category-tab');
@@ -967,6 +3253,22 @@ function setupCheckoutHandlers() {
     });
   }
 
+  if (deleteAllBtn && !deleteAllBtn.dataset.listenerAttached) {
+    deleteAllBtn.dataset.listenerAttached = '1';
+    deleteAllBtn.addEventListener('click', () => {
+      if (deleteAllBtn.disabled) return;
+      clearCurrentCart();
+    });
+  }
+
+  // UNDO last scan
+  if (undoBtn && !undoBtn.dataset.listenerAttached) {
+    undoBtn.dataset.listenerAttached = '1';
+    undoBtn.addEventListener('click', () => {
+      undoLastScan();
+    });
+  }
+
   // Add PAYMENT button handler - opens modal
   const paymentBtn = document.getElementById('paymentBtn');
   if (paymentBtn) {
@@ -986,6 +3288,9 @@ function setupCheckoutHandlers() {
 
   // Payment modal handlers
   setupPaymentModal();
+
+  // Quick products reorder toggle
+  setupQuickProductsReorderToggle();
 }
 
 function setupPaymentModal() {
@@ -1116,13 +3421,15 @@ function setupPaymentModal() {
         cashPaymentDetails.style.display = showCash ? 'block' : 'none';
       }
 
-      // For non-cash methods, treat payment as exact total
+      // For non-cash methods, treat payment as exact total.
+      // For CASH, leave the amount empty so the cashier can type immediately
+      // without deleting a prefilled exact-total value.
       if (paymentMode === 'single') {
         const paymentInputHidden = document.getElementById('paymentInput');
         const total = calculateTotal();
         if (paymentInputHidden) {
           if (selectedPaymentMethod === 'cash') {
-            // Keep current input value (or empty) so cashier can type paid amount
+            paymentInputHidden.value = cashPaidInput ? String(cashPaidInput.value || '') : '';
           } else {
             paymentInputHidden.value = String(total.toFixed(2));
           }
@@ -1132,6 +3439,13 @@ function setupPaymentModal() {
       }
 
       if (cashPaidInput && selectedPaymentMethod === 'cash') {
+        try {
+          // Ensure validation updates after auto-default.
+          const ev = new Event('input', { bubbles: true });
+          cashPaidInput.dispatchEvent(ev);
+        } catch {
+          // ignore
+        }
         cashPaidInput.focus();
         cashPaidInput.select();
       }
@@ -1253,14 +3567,16 @@ function updatePaymentModalValidation() {
 
     if (selectedPaymentMethod === 'cash') {
       const cashPaidInput = document.getElementById('cashPaidInput');
-      const paid = parseFloat((cashPaidInput?.value || '').toString()) || 0;
+      const rawPaidValue = (cashPaidInput?.value || '').toString().trim();
+      const hasPaidValue = rawPaidValue.length > 0;
+      const paid = hasPaidValue ? (parseFloat(rawPaidValue) || 0) : total;
       const remaining = total - paid;
 
-      // Enable only if paid covers total (1 cent tolerance)
+      // Blank cash input is treated as exact payment
       checkoutBtnModal.disabled = remaining > 0.009;
 
       if (paymentRemainingAmount && remainingValue) {
-        if (paid > 0 && remaining > 0.009) {
+        if (hasPaidValue && paid > 0 && remaining > 0.009) {
           paymentRemainingAmount.style.display = 'block';
           remainingValue.textContent = currencySymbol + remaining.toFixed(2);
           remainingValue.style.color = '#dc2626';
@@ -1322,6 +3638,9 @@ function openPaymentModal() {
   
   if (paymentModal) {
     paymentModal.classList.add('active');
+
+    // New payment flow
+    cashDrawerOpenedInPaymentFlow = false;
     
     // Display total amount
     const total = calculateTotal();
@@ -1396,6 +3715,7 @@ function closePaymentModalFunc() {
   // Reset payment method selection
   selectedPaymentMethod = null;
   paymentMode = 'single';
+  cashDrawerOpenedInPaymentFlow = false;
 }
 
 
@@ -1412,7 +3732,45 @@ async function loadCheckoutView() {
 
 async function loadCategoryTabs() {
   const categoryTabsContainer = document.getElementById('categoryTabs');
-  const favoriteCategories = await window.api.getFavoriteCategories();
+  const categories = await window.api.getAllCategories();
+
+  // Show category tabs for any category that has at least one checkout-enabled product.
+  // (Favorites are listed first, then the rest alphabetically.)
+  const visibleCategoryNames = new Set();
+  let hasUncategorizedProducts = false;
+  try {
+    for (const p of (allProducts || [])) {
+      if (!p) continue;
+      if (!isProductEnabledForCheckout(p)) continue;
+      if (isProductUncategorized(p)) {
+        hasUncategorizedProducts = true;
+        continue;
+      }
+      const name = (p.category ?? '').toString().trim();
+      if (name) visibleCategoryNames.add(name);
+    }
+  } catch {
+    // ignore
+  }
+
+  const knownByName = new Map((categories || []).map(c => [String(c?.name || ''), c]));
+  const knownVisible = (categories || []).filter(c => visibleCategoryNames.has(String(c?.name || '')));
+  knownVisible.sort((a, b) => {
+    const af = Number(a?.is_favorite || 0);
+    const bf = Number(b?.is_favorite || 0);
+    if (af !== bf) return bf - af;
+    return String(a?.name || '').localeCompare(String(b?.name || ''), undefined, { sensitivity: 'base' });
+  });
+
+  const unknownVisibleNames = Array.from(visibleCategoryNames)
+    .filter(name => !knownByName.has(name))
+    .sort((a, b) => String(a).localeCompare(String(b), undefined, { sensitivity: 'base' }));
+
+  // Add categories that have visible products in Checkout
+  const visibleCategories = [
+    ...knownVisible,
+    ...unknownVisibleNames.map(name => ({ id: null, name }))
+  ];
   
   // Clear and rebuild all category tabs (including ALL button)
   categoryTabsContainer.innerHTML = '';
@@ -1432,20 +3790,30 @@ async function loadCategoryTabs() {
     '#c0392b'  // Dark Red
   ];
   
-  // Create ALL button
-  const allButton = document.createElement('button');
-  allButton.className = 'category-tab active';
-  allButton.setAttribute('data-category', 'all');
-  allButton.textContent = 'ALL';
-  allButton.style.backgroundColor = categoryColors[0];
-  categoryTabsContainer.appendChild(allButton);
-  
-  // Add favorite categories (max 10)
-  favoriteCategories.slice(0, 10).forEach((category, index) => {
+  // Decide active category: keep selection if possible, otherwise default to ALL (if present) or first category.
+  const visibleCategorySet = new Set(visibleCategories.map(c => String(c?.name || '').trim()).filter(Boolean));
+  const canKeepSelected = selectedCategory && selectedCategory !== 'all' && visibleCategorySet.has(String(selectedCategory));
+  const shouldShowAll = !!hasUncategorizedProducts;
+  const nextActiveCategory = canKeepSelected
+    ? selectedCategory
+    : (shouldShowAll ? 'all' : (visibleCategories[0]?.name || 'all'));
+  selectedCategory = nextActiveCategory;
+
+  // Create ALL button only when it has products ("ALL" = uncategorized)
+  if (shouldShowAll) {
+    const allButton = document.createElement('button');
+    allButton.className = 'category-tab' + (nextActiveCategory === 'all' ? ' active' : '');
+    allButton.setAttribute('data-category', 'all');
+    allButton.textContent = 'ALL';
+    allButton.style.backgroundColor = categoryColors[0];
+    categoryTabsContainer.appendChild(allButton);
+  }
+
+  visibleCategories.forEach((category, index) => {
     const button = document.createElement('button');
-    button.className = 'category-tab';
+    button.className = 'category-tab' + (nextActiveCategory === category.name ? ' active' : '');
     button.setAttribute('data-category', category.name);
-    button.setAttribute('data-category-id', category.id);
+    if (category.id) button.setAttribute('data-category-id', category.id);
     button.textContent = category.name.toUpperCase();
     
     // Assign color from array (cycling through colors if more than 10 categories)
@@ -1457,6 +3825,23 @@ async function loadCategoryTabs() {
   
   // Setup double-click detection using event delegation
   setupCategoryTabListeners();
+
+  // Ensure the subcategory panel matches the active tab on initial load.
+  try {
+    if (nextActiveCategory === 'all') {
+      hideSubcategoryFilters();
+    } else {
+      const activeTab = categoryTabsContainer.querySelector('.category-tab.active');
+      const categoryId = activeTab?.getAttribute?.('data-category-id');
+      if (categoryId) {
+        await loadSubcategoryFilters(parseInt(categoryId, 10), nextActiveCategory);
+      } else {
+        hideSubcategoryFilters();
+      }
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function setupCategoryTabListeners() {
@@ -1465,6 +3850,10 @@ function setupCategoryTabListeners() {
     console.error('Category tabs container not found!');
     return;
   }
+
+  // Prevent duplicate listeners when loadCategoryTabs() is called multiple times.
+  if (categoryTabsContainer.dataset.listenerAttached === '1') return;
+  categoryTabsContainer.dataset.listenerAttached = '1';
   
   console.log('Setting up category tab listeners...');
   
@@ -1514,8 +3903,12 @@ function setupCategoryTabListeners() {
         if (categoryName === 'all') {
           hideSubcategoryFilters();
           displayQuickProducts('', 'all');
-        } else if (categoryId) {
-          await loadSubcategoryFilters(parseInt(categoryId), categoryName);
+        } else {
+          if (categoryId) {
+            await loadSubcategoryFilters(parseInt(categoryId), categoryName);
+          } else {
+            hideSubcategoryFilters();
+          }
           displayQuickProducts('', categoryName);
         }
       }, 250);
@@ -1593,42 +3986,285 @@ function hideSubcategoryFilters() {
 }
 
 async function loadAllProducts() {
-  allProducts = await window.api.getAllProducts();
+  // Loading 10k products WITH base64 images can make Windows PCs slow/hang.
+  // Prefer a "lite" product list and hydrate images only for visible cards.
+  allProducts = await (window.api.getAllProductsLite ? window.api.getAllProductsLite() : window.api.getAllProducts());
+
+  // Cache lowercase fields for faster filtering
+  for (const p of allProducts) {
+    if (!p) continue;
+    if (typeof p._lcName !== 'string') p._lcName = String(p.name || '').toLowerCase();
+    if (typeof p._lcCategory !== 'string') p._lcCategory = String(p.category || '').toLowerCase();
+    if (typeof p._lcBarcode !== 'string') p._lcBarcode = String(p.barcode || '').toLowerCase();
+  }
+
+  // Build a fast lookup map used by cart rendering and other hot paths.
+  allProductsById = new Map();
+  for (const p of allProducts) {
+    const id = parseInt(p?.id, 10);
+    if (Number.isFinite(id)) allProductsById.set(id, p);
+  }
   allCategories = await window.api.getAllCategories();
+
+  allCategoriesByName = new Map();
+  for (const c of (allCategories || [])) {
+    const name = (c?.name ?? '').toString();
+    if (name) allCategoriesByName.set(name, c);
+  }
+}
+
+function getCachedProductById(productId) {
+  const id = parseInt(productId, 10);
+  if (!Number.isFinite(id)) return null;
+  return allProductsById.get(id) || null;
+}
+
+function getCachedCategoryByName(categoryName) {
+  const key = (categoryName ?? '').toString();
+  if (!key) return null;
+  return allCategoriesByName.get(key) || null;
+}
+
+const QUICK_PRODUCTS_RENDER_LIMIT = 240;
+const QUICK_PRODUCTS_IMAGE_HYDRATE_LIMIT = 60;
+const QUICK_PRODUCTS_INLINE_IMAGE_MAX_CHARS = 20000; // avoid inlining huge base64 images in the grid
+const QUICK_PRODUCTS_IMAGE_MAX_CONCURRENCY = 4;
+
+let quickProductsImageObserver = null;
+let quickProductsImageQueue = [];
+let quickProductsImageInFlight = 0;
+
+function enqueueQuickProductImageHydration(productId, imageEl) {
+  const id = parseInt(productId, 10);
+  if (!Number.isFinite(id) || id <= 0) return;
+  if (!imageEl || !imageEl.isConnected) return;
+  if (imageEl.dataset && imageEl.dataset.hydrate === '0') return;
+
+  quickProductsImageQueue.push({ id, imageEl });
+  pumpQuickProductsImageQueue();
+}
+
+function pumpQuickProductsImageQueue() {
+  if (quickProductsImageInFlight >= QUICK_PRODUCTS_IMAGE_MAX_CONCURRENCY) return;
+  const next = quickProductsImageQueue.shift();
+  if (!next) return;
+
+  quickProductsImageInFlight++;
+  (async () => {
+    try {
+      if (!next.imageEl || !next.imageEl.isConnected) return;
+      if (next.imageEl.dataset && next.imageEl.dataset.hydrate === '0') return;
+      if (!window.api.getProductById) return;
+
+      const full = await window.api.getProductById(next.id);
+      const img = (full?.image || '').toString();
+      if (!img) return;
+      if (!next.imageEl || !next.imageEl.isConnected) return;
+      if (next.imageEl.dataset && next.imageEl.dataset.hydrate === '0') return;
+
+      next.imageEl.innerHTML = `<img src="${img}" alt="${String(full?.name || '')}" loading="lazy" decoding="async" style="width: 100%; height: 100%; object-fit: cover; border-radius: 8px;">`;
+      next.imageEl.dataset.hydrate = '0';
+      next.imageEl.dataset.hydrated = '1';
+    } catch {
+      // ignore per-item failures
+    } finally {
+      quickProductsImageInFlight--;
+      pumpQuickProductsImageQueue();
+    }
+  })();
+}
+
+function ensureQuickProductsImageObserver() {
+  const container = document.getElementById('quickProductsList');
+  if (!container) return false;
+  if (!('IntersectionObserver' in window)) return false;
+
+  if (quickProductsImageObserver) return true;
+
+  quickProductsImageObserver = new IntersectionObserver((entries) => {
+    try {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const el = entry.target;
+        if (!el) continue;
+        const id = parseInt(el.dataset.productId, 10);
+        if (!id) continue;
+
+        try { quickProductsImageObserver.unobserve(el); } catch { /* ignore */ }
+        enqueueQuickProductImageHydration(id, el);
+      }
+    } catch {
+      // ignore
+    }
+  }, {
+    root: null,
+    rootMargin: '250px',
+    threshold: 0.01
+  });
+
+  return true;
+}
+
+async function hydrateQuickProductImages(productIds) {
+  if (!window.api.getProductById) return;
+  if (!Array.isArray(productIds) || productIds.length === 0) return;
+
+  const container = document.getElementById('quickProductsList');
+  if (!container) return;
+
+  const ids = productIds.slice(0, QUICK_PRODUCTS_IMAGE_HYDRATE_LIMIT);
+  for (const id of ids) {
+    const imageEl = container.querySelector(`.product-image[data-product-id="${id}"]`);
+    if (!imageEl) continue;
+    enqueueQuickProductImageHydration(id, imageEl);
+  }
 }
 
 let selectedCategory = 'all';
+let selectedSubcategory = '';
+let quickProductsReorderMode = false;
 
-function displayQuickProducts(searchQuery = '', category = null, subcategory = null) {
+function isProductEnabledForCheckout(product) {
+  // Backward compatible: older DBs may not have the column yet.
+  const v = product?.show_in_checkout;
+  if (v === undefined || v === null) return true;
+  return Number(v) !== 0;
+}
+
+function isProductUncategorized(product) {
+  const raw = (product?.category ?? '').toString().trim();
+  if (!raw) return true;
+
+  // Backward compatible: older builds forced "General" as a default.
+  // If "General" isn't an actual category in the Categories table, treat it as uncategorized.
+  if (raw.toLowerCase() === 'general') {
+    try {
+      return !(allCategoriesByName && allCategoriesByName.has('General'));
+    } catch {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Persisted ordering for quick products (by category/subcategory scope)
+const quickProductsSortCache = new Map(); // key -> Map(productId -> sortIndex)
+
+function getQuickProductsSortKey(category, subcategory) {
+  const c = (category === null || category === undefined || category === '') ? 'all' : String(category);
+  const s = (subcategory === null || subcategory === undefined) ? '' : String(subcategory);
+  return `${c}||${s}`;
+}
+
+async function getQuickProductsSortMap(category, subcategory) {
+  const key = getQuickProductsSortKey(category, subcategory);
+  if (quickProductsSortCache.has(key)) return quickProductsSortCache.get(key);
+  if (!window.api || typeof window.api.getProductSortOrder !== 'function') {
+    quickProductsSortCache.set(key, null);
+    return null;
+  }
+  try {
+    const rows = await window.api.getProductSortOrder(category, subcategory);
+    const map = new Map();
+    for (const r of (rows || [])) {
+      const id = parseInt(r.product_id, 10);
+      const idx = parseInt(r.sort_index, 10);
+      if (Number.isFinite(id) && id > 0 && Number.isFinite(idx)) map.set(id, idx);
+    }
+    quickProductsSortCache.set(key, map);
+    return map;
+  } catch {
+    quickProductsSortCache.set(key, null);
+    return null;
+  }
+}
+
+async function persistQuickProductsSortOrder(category, subcategory, orderedProductIds) {
+  if (!window.api || typeof window.api.setProductSortOrder !== 'function') return;
+  const ids = Array.isArray(orderedProductIds) ? orderedProductIds : [];
+  const normalized = ids.map(v => parseInt(v, 10)).filter(v => Number.isFinite(v) && v > 0);
+  await window.api.setProductSortOrder(category, subcategory, normalized);
+
+  const key = getQuickProductsSortKey(category, subcategory);
+  const map = new Map();
+  for (let i = 0; i < normalized.length; i++) map.set(normalized[i], i);
+  quickProductsSortCache.set(key, map);
+}
+
+async function displayQuickProducts(searchQuery = '', category = null, subcategory = null) {
   const container = document.getElementById('quickProductsList');
+
+  // When switching views quickly, drop any queued image hydration work from the previous render.
+  // (In-flight requests will finish but won't affect disconnected elements.)
+  try {
+    quickProductsImageQueue = [];
+    if (quickProductsImageObserver) quickProductsImageObserver.disconnect();
+  } catch {
+    // ignore
+  }
   
   // Update selected category if provided
   if (category !== null) {
     selectedCategory = category;
   }
+
+  if (subcategory !== null && subcategory !== undefined) {
+    selectedSubcategory = subcategory || '';
+  }
   
   let filteredProducts;
+  const q = String(searchQuery || '').trim().toLowerCase();
   
-  if (searchQuery) {
+  if (q) {
     // Search by barcode or name
-    filteredProducts = allProducts.filter(p => 
-      p.stock > 0 && 
-      (p.barcode.toLowerCase().includes(searchQuery.toLowerCase()) ||
-       p.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    filteredProducts = allProducts.filter(p =>
+      isProductEnabledForCheckout(p) &&
+      ((p._lcBarcode || '').includes(q) || (p._lcName || '').includes(q))
     );
   } else {
-    // Show all products with stock
-    filteredProducts = allProducts.filter(p => p.stock > 0);
+    // Show all checkout-enabled products (including out-of-stock)
+    filteredProducts = allProducts.filter(p => isProductEnabledForCheckout(p));
   }
   
   // Filter by category if not 'all'
-  if (selectedCategory !== 'all') {
-    filteredProducts = filteredProducts.filter(p => p.category === selectedCategory);
+  if (selectedCategory === 'all') {
+    // "ALL" behaves as "Uncategorized" in checkout.
+    filteredProducts = filteredProducts.filter(p => isProductUncategorized(p));
+  } else {
+    filteredProducts = filteredProducts.filter(p => (p?.category || '') === selectedCategory);
   }
   
   // Filter by subcategory if provided
   if (subcategory) {
     filteredProducts = filteredProducts.filter(p => p.subcategory === subcategory);
+  }
+
+  // Apply persisted custom order for this view (category/subcategory scope)
+  const sortMap = await getQuickProductsSortMap(selectedCategory, subcategory || '');
+  if (sortMap && sortMap.size > 0) {
+    const originalIndex = new Map();
+    for (let i = 0; i < filteredProducts.length; i++) {
+      const id = parseInt(filteredProducts[i]?.id, 10);
+      if (Number.isFinite(id)) originalIndex.set(id, i);
+    }
+    filteredProducts.sort((a, b) => {
+      const aId = parseInt(a?.id, 10);
+      const bId = parseInt(b?.id, 10);
+      const aSort = Number.isFinite(aId) ? sortMap.get(aId) : undefined;
+      const bSort = Number.isFinite(bId) ? sortMap.get(bId) : undefined;
+      const aHas = Number.isFinite(aSort);
+      const bHas = Number.isFinite(bSort);
+      if (aHas && bHas) return aSort - bSort;
+      if (aHas && !bHas) return -1;
+      if (!aHas && bHas) return 1;
+      return (originalIndex.get(aId) || 0) - (originalIndex.get(bId) || 0);
+    });
+  }
+
+  const totalMatches = filteredProducts.length;
+  if (totalMatches > QUICK_PRODUCTS_RENDER_LIMIT) {
+    filteredProducts = filteredProducts.slice(0, QUICK_PRODUCTS_RENDER_LIMIT);
   }
   
   // Product icons mapping
@@ -1652,47 +4288,46 @@ function displayQuickProducts(searchQuery = '', category = null, subcategory = n
   
   const currencySymbol = systemSettings?.currency_symbol || '€';
   
-  container.innerHTML = filteredProducts.map(product => {
+  const noticeHtml = totalMatches > QUICK_PRODUCTS_RENDER_LIMIT
+    ? `<div style="grid-column: 1/-1; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; padding:10px 12px; border-radius:12px; font-weight:800;">
+         Showing first ${QUICK_PRODUCTS_RENDER_LIMIT} of ${totalMatches} products. Use search/category to narrow.
+       </div>`
+    : '';
+
+  container.innerHTML = noticeHtml + filteredProducts.map(product => {
     // Use product image if available, otherwise use emoji icon
     let imageHtml = '';
-    if (product.image && product.image.trim() !== '') {
-      imageHtml = `<img src="${product.image}" alt="${product.name}" style="width: 100%; height: 100%; object-fit: cover; border-radius: 8px;">`;
+    const icon = productIcons[product.name] || '📦';
+    const imgStr = (product.image && String(product.image).trim() !== '') ? String(product.image).trim() : '';
+    const isDataUrl = imgStr.startsWith('data:image');
+    const isHeavyInline = isDataUrl && imgStr.length > QUICK_PRODUCTS_INLINE_IMAGE_MAX_CHARS;
+    const hasInlineImage = !!imgStr;
+    const shouldInlineImage = hasInlineImage && !isHeavyInline;
+    const shouldHydrate = !!(window.api.getProductById && (!hasInlineImage || isHeavyInline));
+
+    if (shouldInlineImage) {
+      imageHtml = `<img src="${imgStr}" alt="${product.name}" loading="lazy" decoding="async" style="width: 100%; height: 100%; object-fit: cover; border-radius: 8px;">`;
     } else {
-      imageHtml = productIcons[product.name] || '📦';
+      imageHtml = `<div style="font-size: 34px; line-height: 1;">${icon}</div>`;
     }
     
-    // Determine unit display
-    const isWeightBased = product.unit_type === 'weight' || !product.unit_type;
-    let unit;
+    // Barcode-only POS: show quantity amount info (no kg/g UI).
     let amountInfo = '';
-    
-    if (isWeightBased) {
-      const weightUnit = product.weight_unit || 'kg';
-      unit = `/${weightUnit}`;
-      // Show weight amount if available - add unit if not already included
-      if (product.weight_amount) {
-        const amount = product.weight_amount.trim();
-        // Check if amount already includes unit (kg, g, etc.)
-        const hasUnit = /\s*(kg|g|gram|kilogram)$/i.test(amount);
-        const displayAmount = hasUnit ? amount : `${amount} ${weightUnit}`;
-        amountInfo = `<div class="product-unit-info">${displayAmount}</div>`;
-      }
-    } else {
-      const quantityUnit = product.quantity_unit || 'piece';
-      unit = `/${quantityUnit}`;
-      // Show quantity amount if available - add unit if not already included
-      if (product.quantity_amount) {
-        const amount = product.quantity_amount.trim();
-        // Check if amount already includes unit
+    const quantityUnit = product.quantity_unit || 'piece';
+    if (product.quantity_amount) {
+      const amount = String(product.quantity_amount || '').trim();
+      if (amount) {
         const hasUnit = /\s*(piece|pack|box|bottle|can|bag|pc|pcs)s?$/i.test(amount);
         const displayAmount = hasUnit ? amount : `${amount} ${quantityUnit}`;
         amountInfo = `<div class="product-unit-info">${displayAmount}</div>`;
       }
     }
     
+    const outOfStock = !(Number(product.stock) > 0);
+
     return `
-      <div class="quick-product-card" data-product-id="${product.id}">
-        <div class="product-image">${imageHtml}</div>
+      <div class="quick-product-card${outOfStock ? ' out-of-stock' : ''}" data-product-id="${product.id}" aria-disabled="${outOfStock ? 'true' : 'false'}">
+        <div class="product-image" data-product-id="${product.id}" data-hydrate="${shouldHydrate ? '1' : '0'}">${imageHtml}</div>
         <div class="name">${product.name}</div>
         ${amountInfo}
         <div class="price">${currencySymbol}${product.price.toFixed(2)}</div>
@@ -1702,40 +4337,540 @@ function displayQuickProducts(searchQuery = '', category = null, subcategory = n
   
   // Add event listeners for single click and double click
   setupProductCardListeners();
+
+  // Enable touch drag-reorder for quick products (two-finger hold)
+  ensureQuickProductsReorderHandlers();
+
+  // Hydrate images only when visible to keep memory/CPU low on Windows.
+  const needsHydrateEls = Array.from(container.querySelectorAll('.product-image[data-hydrate="1"]'));
+  if (needsHydrateEls.length > 0) {
+    if (ensureQuickProductsImageObserver()) {
+      try { quickProductsImageObserver.disconnect(); } catch { /* ignore */ }
+      for (const el of needsHydrateEls) {
+        try { quickProductsImageObserver.observe(el); } catch { /* ignore */ }
+      }
+    } else {
+      hydrateQuickProductImages(needsHydrateEls
+        .map(el => parseInt(el.dataset.productId, 10))
+        .filter(v => Number.isFinite(v) && v > 0));
+    }
+  }
+}
+
+// ============== QUICK PRODUCTS REORDER (TOUCH DRAG) ==============
+// Gesture: two-finger long-press (default 280ms) on a product card, then drag to reorder.
+// This avoids interfering with single-finger taps (add to cart) and double-tap (edit).
+const QUICK_PRODUCTS_REORDER_HOLD_MS = 280;
+const QUICK_PRODUCTS_REORDER_MOVE_CANCEL_PX = 10;
+
+let quickProductsReorderState = {
+  handlersAttached: false,
+  pending: null, // { productId, cardEl, startX, startY, timerId }
+  active: null, // { productId, cardEl, placeholderEl, offsetX, offsetY, fixedWidth, fixedHeight }
+  suppressClickUntil: 0,
+  pointerId: null,
+  globalGuardAttached: false
+};
+
+function isQuickProductsReordering() {
+  return !!(quickProductsReorderState.pending || quickProductsReorderState.active);
+}
+
+function ensureQuickProductsReorderHandlers() {
+  if (quickProductsReorderState.handlersAttached) return;
+  const container = document.getElementById('quickProductsList');
+  if (!container) return;
+
+  quickProductsReorderState.handlersAttached = true;
+
+  // Guard against "click-through" after a drag on touchscreens.
+  // Without this, the click generated on release can land on navbar tabs
+  // (because the dragged card has pointer-events:none), switching pages.
+  if (!quickProductsReorderState.globalGuardAttached) {
+    quickProductsReorderState.globalGuardAttached = true;
+
+    const shouldSuppress = () => {
+      const until = Number(quickProductsReorderState.suppressClickUntil || 0);
+      return isQuickProductsReordering() || (until && Date.now() < until);
+    };
+
+    const swallow = (e) => {
+      try {
+        if (!shouldSuppress()) return;
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        e.stopImmediatePropagation?.();
+      } catch {
+        // ignore
+      }
+    };
+
+    // Capture phase to beat other handlers.
+    document.addEventListener('click', swallow, true);
+    document.addEventListener('pointerup', swallow, true);
+  }
+
+  const clearPending = () => {
+    const p = quickProductsReorderState.pending;
+    if (p?.timerId) clearTimeout(p.timerId);
+    quickProductsReorderState.pending = null;
+  };
+
+  const cleanupActive = () => {
+    const a = quickProductsReorderState.active;
+    if (!a) return;
+    try {
+      a.cardEl?.classList?.remove('quick-product-dragging');
+      if (a.cardEl) {
+        a.cardEl.style.position = '';
+        a.cardEl.style.left = '';
+        a.cardEl.style.top = '';
+        a.cardEl.style.width = '';
+        a.cardEl.style.height = '';
+        a.cardEl.style.zIndex = '';
+        a.cardEl.style.pointerEvents = '';
+        a.cardEl.style.boxShadow = '';
+        a.cardEl.style.transform = '';
+      }
+      a.placeholderEl?.remove?.();
+    } catch {
+      // ignore
+    }
+    quickProductsReorderState.active = null;
+  };
+
+  const computeDropIndexFromPlaceholder = (placeholderEl, draggingEl) => {
+    if (!placeholderEl?.parentElement) return null;
+    const children = Array.from(placeholderEl.parentElement.children);
+    let idx = 0;
+    for (const child of children) {
+      if (child === draggingEl) continue;
+      if (child === placeholderEl) return idx;
+      if (child?.classList?.contains('quick-product-card')) idx++;
+    }
+    return idx;
+  };
+
+  const startDrag = (cardEl, productId, startX, startY) => {
+    if (!cardEl || !cardEl.isConnected) return;
+    if (quickProductsReorderState.active) return;
+
+    const rect = cardEl.getBoundingClientRect();
+    const placeholderEl = document.createElement('div');
+    placeholderEl.className = 'quick-product-placeholder';
+    placeholderEl.style.width = `${Math.round(rect.width)}px`;
+    placeholderEl.style.height = `${Math.round(rect.height)}px`;
+
+    cardEl.parentElement?.insertBefore(placeholderEl, cardEl.nextSibling);
+
+    cardEl.classList.add('quick-product-dragging');
+    cardEl.style.position = 'fixed';
+    cardEl.style.left = `${Math.round(rect.left)}px`;
+    cardEl.style.top = `${Math.round(rect.top)}px`;
+    cardEl.style.width = `${Math.round(rect.width)}px`;
+    cardEl.style.height = `${Math.round(rect.height)}px`;
+    cardEl.style.zIndex = '10030';
+    cardEl.style.pointerEvents = 'none';
+    cardEl.style.boxShadow = '0 18px 40px rgba(15, 23, 42, 0.25)';
+    cardEl.style.transform = 'scale(1.02)';
+
+    quickProductsReorderState.active = {
+      productId,
+      cardEl,
+      placeholderEl,
+      offsetX: startX - rect.left,
+      offsetY: startY - rect.top,
+      fixedWidth: rect.width,
+      fixedHeight: rect.height
+    };
+  };
+
+  const onTouchStart = (e) => {
+    try {
+      if (!quickProductsReorderMode) return;
+      if (!e.touches) return;
+      const touchCount = e.touches.length;
+      const allowed = touchCount === 1 || touchCount === 2;
+      if (!allowed) return;
+      if (quickProductsReorderState.active) return;
+
+      const cardEl = e.target?.closest?.('.quick-product-card');
+      if (!cardEl) return;
+      const productId = parseInt(cardEl.dataset.productId, 10);
+      if (!Number.isFinite(productId) || productId <= 0) return;
+
+      // Prevent click/tap behaviors while we're preparing to reorder.
+      e.preventDefault();
+      e.stopPropagation();
+
+      const { x, y } = getTouchesCentroid(e.touches);
+      clearPending();
+
+      // In explicit REORDER mode, start drag immediately.
+      if (touchCount === 1 || touchCount === 2) {
+        startDrag(cardEl, productId, x, y);
+        quickProductsReorderState.suppressClickUntil = Date.now() + 650;
+        return;
+      }
+
+      const timerId = setTimeout(() => {
+        const p = quickProductsReorderState.pending;
+        if (!p) return;
+        if (!p.cardEl?.isConnected) { clearPending(); return; }
+        startDrag(p.cardEl, p.productId, p.startX, p.startY);
+        clearPending();
+      }, QUICK_PRODUCTS_REORDER_HOLD_MS);
+
+      quickProductsReorderState.pending = {
+        productId,
+        cardEl,
+        startX: x,
+        startY: y,
+        timerId
+      };
+    } catch {
+      // ignore
+    }
+  };
+
+  const onTouchMove = (e) => {
+    try {
+      const a = quickProductsReorderState.active;
+      if (a) {
+        e.preventDefault();
+        if (!e.touches || e.touches.length === 0) return;
+        const { x, y } = getTouchesCentroid(e.touches);
+
+        a.cardEl.style.left = `${Math.round(x - a.offsetX)}px`;
+        a.cardEl.style.top = `${Math.round(y - a.offsetY)}px`;
+
+        const el = document.elementFromPoint(x, y);
+        const targetCard = el?.closest?.('.quick-product-card');
+        if (targetCard && targetCard !== a.cardEl && !targetCard.classList.contains('quick-product-dragging')) {
+          const r = targetCard.getBoundingClientRect();
+          const before = y < (r.top + r.height / 2);
+          if (before) container.insertBefore(a.placeholderEl, targetCard);
+          else container.insertBefore(a.placeholderEl, targetCard.nextSibling);
+        } else {
+          // If dragging beyond cards, keep placeholder at the end
+          if (!container.contains(a.placeholderEl)) container.appendChild(a.placeholderEl);
+        }
+        return;
+      }
+
+      const p = quickProductsReorderState.pending;
+      if (!p) return;
+      if (!e.touches) {
+        clearPending();
+        return;
+      }
+      const touchCount = e.touches.length;
+      const allowed = quickProductsReorderMode && (touchCount === 1 || touchCount === 2);
+      if (!allowed) {
+        clearPending();
+        return;
+      }
+      const { x, y } = getTouchesCentroid(e.touches);
+      const dx = x - p.startX;
+      const dy = y - p.startY;
+      if (Math.hypot(dx, dy) > QUICK_PRODUCTS_REORDER_MOVE_CANCEL_PX) {
+        clearPending();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const onTouchEndOrCancel = async () => {
+    try {
+      clearPending();
+      const a = quickProductsReorderState.active;
+      if (!a) return;
+
+      const dropIndex = computeDropIndexFromPlaceholder(a.placeholderEl, a.cardEl);
+      const draggedId = a.productId;
+      cleanupActive();
+
+      // Avoid immediate click-to-add after dropping.
+      quickProductsReorderState.suppressClickUntil = Date.now() + 500;
+
+      if (typeof dropIndex === 'number') {
+        const visibleIds = Array.from(container.querySelectorAll('.quick-product-card'))
+          .map(el => parseInt(el.dataset.productId, 10))
+          .filter(v => Number.isFinite(v) && v > 0);
+
+        const fromIndex = visibleIds.indexOf(draggedId);
+        if (fromIndex >= 0) visibleIds.splice(fromIndex, 1);
+        const safeTo = Math.max(0, Math.min(dropIndex, visibleIds.length));
+        visibleIds.splice(safeTo, 0, draggedId);
+
+        await persistQuickProductsSortOrder(selectedCategory, selectedSubcategory, visibleIds);
+        await displayQuickProducts('', selectedCategory, selectedSubcategory);
+      }
+    } catch {
+      cleanupActive();
+    }
+  };
+
+  // Mouse/pen support: press-and-hold, then drag to reorder.
+  const onPointerDown = (e) => {
+    try {
+      if (!e || e.pointerType === 'touch') return; // touch handled by touch events (needs 2 fingers)
+      if (e.button !== 0) return;
+      if (quickProductsReorderState.active) return;
+      if (!quickProductsReorderMode) return;
+
+      const cardEl = e.target?.closest?.('.quick-product-card');
+      if (!cardEl) return;
+      const productId = parseInt(cardEl.dataset.productId, 10);
+      if (!Number.isFinite(productId) || productId <= 0) return;
+
+      clearPending();
+      const startX = e.clientX;
+      const startY = e.clientY;
+
+      if (quickProductsReorderMode) {
+        // In explicit REORDER mode, start immediately.
+        startDrag(cardEl, productId, startX, startY);
+        quickProductsReorderState.suppressClickUntil = Date.now() + 650;
+        quickProductsReorderState.pointerId = e.pointerId;
+        try { container.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+        return;
+      }
+
+      // Long-press with mouse to enter reorder mode (prevents accidental reorders while clicking).
+      const timerId = setTimeout(() => {
+        const p = quickProductsReorderState.pending;
+        if (!p) return;
+        if (!p.cardEl?.isConnected) { clearPending(); return; }
+        startDrag(p.cardEl, p.productId, p.startX, p.startY);
+        clearPending();
+      }, QUICK_PRODUCTS_REORDER_HOLD_MS);
+
+      quickProductsReorderState.pending = { productId, cardEl, startX, startY, timerId };
+      quickProductsReorderState.pointerId = e.pointerId;
+      try { container.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    } catch {
+      // ignore
+    }
+  };
+
+  const onPointerMove = (e) => {
+    try {
+      if (!e || e.pointerType === 'touch') return;
+      const a = quickProductsReorderState.active;
+      if (a) {
+        e.preventDefault();
+        const x = e.clientX;
+        const y = e.clientY;
+        a.cardEl.style.left = `${Math.round(x - a.offsetX)}px`;
+        a.cardEl.style.top = `${Math.round(y - a.offsetY)}px`;
+
+        const el = document.elementFromPoint(x, y);
+        const targetCard = el?.closest?.('.quick-product-card');
+        if (targetCard && targetCard !== a.cardEl && !targetCard.classList.contains('quick-product-dragging')) {
+          const r = targetCard.getBoundingClientRect();
+          const before = y < (r.top + r.height / 2);
+          if (before) container.insertBefore(a.placeholderEl, targetCard);
+          else container.insertBefore(a.placeholderEl, targetCard.nextSibling);
+        }
+        return;
+      }
+
+      const p = quickProductsReorderState.pending;
+      if (!p) return;
+      const dx = e.clientX - p.startX;
+      const dy = e.clientY - p.startY;
+      if (Math.hypot(dx, dy) > QUICK_PRODUCTS_REORDER_MOVE_CANCEL_PX) {
+        clearPending();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const onPointerUpOrCancel = async (e) => {
+    try {
+      if (e && e.pointerType === 'touch') return;
+      clearPending();
+      const a = quickProductsReorderState.active;
+      if (!a) return;
+
+      const dropIndex = computeDropIndexFromPlaceholder(a.placeholderEl, a.cardEl);
+      const draggedId = a.productId;
+      cleanupActive();
+      quickProductsReorderState.suppressClickUntil = Date.now() + 500;
+
+      if (typeof dropIndex === 'number') {
+        const visibleIds = Array.from(container.querySelectorAll('.quick-product-card'))
+          .map(el => parseInt(el.dataset.productId, 10))
+          .filter(v => Number.isFinite(v) && v > 0);
+
+        const fromIndex = visibleIds.indexOf(draggedId);
+        if (fromIndex >= 0) visibleIds.splice(fromIndex, 1);
+        const safeTo = Math.max(0, Math.min(dropIndex, visibleIds.length));
+        visibleIds.splice(safeTo, 0, draggedId);
+
+        await persistQuickProductsSortOrder(selectedCategory, selectedSubcategory, visibleIds);
+        await displayQuickProducts('', selectedCategory, selectedSubcategory);
+      }
+    } catch {
+      cleanupActive();
+    } finally {
+      if (e && typeof e.pointerId !== 'undefined' && quickProductsReorderState.pointerId === e.pointerId) {
+        quickProductsReorderState.pointerId = null;
+        try { container.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+      }
+    }
+  };
+
+  container.addEventListener('touchstart', onTouchStart, { passive: false });
+  container.addEventListener('touchmove', onTouchMove, { passive: false });
+  container.addEventListener('touchend', onTouchEndOrCancel, { passive: true });
+  container.addEventListener('touchcancel', onTouchEndOrCancel, { passive: true });
+
+  container.addEventListener('pointerdown', onPointerDown);
+  container.addEventListener('pointermove', onPointerMove);
+  container.addEventListener('pointerup', onPointerUpOrCancel);
+  container.addEventListener('pointercancel', onPointerUpOrCancel);
+}
+
+function setupQuickProductsReorderToggle() {
+  const btn = document.getElementById('toggleReorderBtn');
+  if (!btn || btn.dataset.listenerAttached === '1') return;
+  btn.dataset.listenerAttached = '1';
+
+  const render = () => {
+    if (quickProductsReorderMode) {
+      btn.classList.add('active');
+      btn.textContent = 'REORDER: ON';
+    } else {
+      btn.classList.remove('active');
+      btn.textContent = 'REORDER';
+    }
+  };
+
+  btn.addEventListener('click', () => {
+    quickProductsReorderMode = !quickProductsReorderMode;
+    // Cancel any pending drag when toggling
+    try {
+      if (quickProductsReorderState?.pending?.timerId) clearTimeout(quickProductsReorderState.pending.timerId);
+      quickProductsReorderState.pending = null;
+    } catch {
+      // ignore
+    }
+    // Avoid accidental add-to-cart clicks right after toggling
+    quickProductsReorderState.suppressClickUntil = Date.now() + 350;
+    render();
+  });
+
+  render();
 }
 
 // ============== PRODUCT CARD CLICK HANDLERS ==============
 function setupProductCardListeners() {
   const container = document.getElementById('quickProductsList');
   if (!container) return;
+
+  // displayQuickProducts() calls this often; avoid adding duplicate listeners.
+  if (container.dataset.listenerAttached === '1') return;
+  container.dataset.listenerAttached = '1';
   
   let clickTimer = null;
   let clickedProductId = null;
-  
-  container.addEventListener('click', (e) => {
-    const card = e.target.closest('.quick-product-card');
+  const SINGLE_CLICK_DELAY_MS = 260;
+
+  // Touch double-tap support (more reliable than delayed click on some touchscreens)
+  let lastTapAt = 0;
+  let lastTapProductId = null;
+  const DOUBLE_TAP_MS = 420;
+
+  container.addEventListener('pointerup', (e) => {
+    try {
+      if (!e || e.pointerType !== 'touch') return;
+      if (isQuickProductsReordering() || quickProductsReorderMode) return;
+      const card = e.target?.closest?.('.quick-product-card');
+      if (!card) return;
+      const productId = parseInt(card.dataset.productId, 10);
+      if (!productId) return;
+
+      const now = Date.now();
+      if (lastTapProductId === productId && (now - lastTapAt) <= DOUBLE_TAP_MS) {
+        lastTapAt = 0;
+        lastTapProductId = null;
+        if (clickTimer) {
+          clearTimeout(clickTimer);
+          clickTimer = null;
+          clickedProductId = null;
+        }
+        quickProductsReorderState.suppressClickUntil = now + 650;
+        handleDoubleClick(productId);
+        return;
+      }
+
+      lastTapAt = now;
+      lastTapProductId = productId;
+    } catch {
+      // ignore
+    }
+  }, { passive: true });
+
+  // Mouse double-click support
+  container.addEventListener('dblclick', (e) => {
+    if (isQuickProductsReordering() || quickProductsReorderMode) return;
+    const card = e.target?.closest?.('.quick-product-card');
     if (!card) return;
-    
-    const productId = parseInt(card.dataset.productId);
+    const productId = parseInt(card.dataset.productId, 10);
     if (!productId) return;
-    
-    // If there's already a timer, this is a double-click
-    if (clickTimer && clickedProductId === productId) {
+    if (clickTimer) {
       clearTimeout(clickTimer);
       clickTimer = null;
       clickedProductId = null;
-      // Double-click: edit product
-      handleDoubleClick(productId);
-    } else {
-      // First click: set timer for single-click action
-      clickedProductId = productId;
-      clickTimer = setTimeout(() => {
-        clickTimer = null;
-        clickedProductId = null;
-        // Single-click: add to cart
-        openProductWeightFlow(productId);
-      }, 250); // 250ms delay to detect double-click
     }
+    quickProductsReorderState.suppressClickUntil = Date.now() + 650;
+    handleDoubleClick(productId);
+  });
+
+  container.addEventListener('click', (e) => {
+    if (isQuickProductsReordering()) return;
+    if (quickProductsReorderState.suppressClickUntil && Date.now() < quickProductsReorderState.suppressClickUntil) return;
+    if (quickProductsReorderMode) return;
+
+    const card = e.target.closest('.quick-product-card');
+    if (!card) return;
+
+    const productId = parseInt(card.dataset.productId, 10);
+    if (!productId) return;
+
+    if (clickTimer) {
+      clearTimeout(clickTimer);
+      clickTimer = null;
+      clickedProductId = null;
+    }
+
+    clickedProductId = productId;
+    clickTimer = setTimeout(() => {
+      clickTimer = null;
+      const id = clickedProductId;
+      clickedProductId = null;
+      if (!id) return;
+      if (quickProductsReorderMode) return;
+      if (isQuickProductsReordering()) return;
+      try {
+        const activeEl = document.activeElement;
+        if (activeEl && typeof activeEl.blur === 'function' && isTextInputElement(activeEl)) {
+          activeEl.blur();
+        }
+        currentKeyboardInput = null;
+        const keyboard = document.getElementById('virtualKeyboard');
+        if (keyboard) keyboard.classList.remove('active');
+      } catch {
+        // ignore
+      }
+      // Clicking product tiles should NOT pop the on-screen keyboard.
+      // Avoid refocusing the search/scanner input on tap.
+      openProductWeightFlow(id, { refocusScannerTarget: false });
+    }, SINGLE_CLICK_DELAY_MS);
   });
 }
 
@@ -1759,7 +4894,7 @@ function promptForWeight(productId) {
   }
   
   console.log('promptForWeight called with productId:', productId);
-  const product = allProducts.find(p => p.id === productId);
+  const product = getCachedProductById(productId);
   console.log('Product found:', product);
   if (!product) {
     console.log('Product not found!');
@@ -2239,7 +5374,7 @@ function promptForWeight(productId) {
     }
     
     const amountNum = isWeightBased ? getEnteredWeightKg() : parseFloat(weight);
-    console.log('>>> PARSED amountNum:', amountNum, 'type:', typeof amountNum);
+    debugLog('>>> PARSED amountNum:', amountNum, 'type:', typeof amountNum);
     if (isNaN(amountNum) || amountNum <= 0) {
       console.log('Invalid value');
       const fieldName = isWeightBased ? 'weight' : 'quantity';
@@ -2273,8 +5408,8 @@ function promptForWeight(productId) {
       return;
     }
     
-    console.log('>>> CALLING addToCart with amount:', amountNum, 'unit price:', unitPriceNum, 'isWeightBased:', isWeightBased);
-    console.log('isSubmitting flag:', isSubmitting);
+    debugLog('>>> CALLING addToCart with amount:', amountNum, 'unit price:', unitPriceNum, 'isWeightBased:', isWeightBased);
+    debugLog('isSubmitting flag:', isSubmitting);
     
     // Close modal first
     modal.style.display = 'none';
@@ -2285,7 +5420,7 @@ function promptForWeight(productId) {
     // Cleanup immediately
     cleanup();
     
-    console.log('handleOk completed - item should be added once');
+    debugLog('handleOk completed - item should be added once');
   };
   
   // Handle Cancel button
@@ -2342,7 +5477,7 @@ function editCartWeight(productId) {
   const cartItem = cart.find(item => item.productId === productId);
   if (!cartItem) return;
   
-  const product = allProducts.find(p => p.id === productId);
+  const product = getCachedProductById(productId);
   if (!product) return;
   
   const currencySymbol = systemSettings?.currency_symbol || '€';
@@ -2396,7 +5531,6 @@ function editCartWeight(productId) {
     modalTitle.textContent = 'Enter Weight'; // Reset title
     cleanup();
     updateCartDisplay();
-    updateCartSummary();
   };
   
   // Handle Cancel button
@@ -2427,16 +5561,109 @@ function editCartWeight(productId) {
 
 async function searchAndAddProduct(query) {
   if (!query) return;
-  
-  // Search by product name
-  const results = await window.api.searchProducts(query);
+
+  const raw = String(query || '').trim();
+  if (!raw) return;
+
+  // Barcode scanners usually emit digits + Enter.
+  // Prefer exact barcode match first to avoid ambiguous partial matches.
+  const digitsOnly = raw.replace(/\s+/g, '');
+  const looksLikeBarcode = /^\d{6,}$/.test(digitsOnly);
+
+  const openNewProductWithBarcode = async (barcode, sourceLabel = 'Checkout') => {
+    const bc = String(barcode || '').replace(/\s+/g, '').trim();
+    if (!bc) return;
+
+    const ok = await showConfirmDialog({
+      title: 'Product not found',
+      message: `Barcode: ${bc}\n\nCreate a new product with this barcode?`,
+      confirmText: 'Create Product',
+      cancelText: 'Cancel'
+    });
+    if (!ok) return;
+
+    // Fast path: open the quick-add form (optimized for scanners).
+    // Default VAT % comes from system settings.
+    try {
+      if (!systemSettings) {
+        systemSettings = await window.api.getSystemSettings();
+      }
+    } catch {
+      // ignore
+    }
+
+    const defaultVatPct = Number.isFinite(Number(systemSettings?.tax_rate))
+      ? Number(systemSettings.tax_rate) * 100
+      : 19;
+
+    const res = await showQuickAddProductDialog({
+      barcode: bc,
+      defaults: {
+        salesVatPercent: defaultVatPct,
+        purchaseVatPercent: defaultVatPct,
+        stock: ''
+      }
+    });
+
+    if (!res || !res.ok) return;
+
+    // Refresh product caches so cart lookup can find the new product.
+    try {
+      await loadAllProducts();
+      displayQuickProducts('');
+    } catch {
+      // ignore
+    }
+
+    const createdId = Number(res.productId);
+    if (Number.isFinite(createdId) && createdId > 0) {
+      openProductWeightFlow(createdId);
+      return;
+    }
+
+    // Fallback: fetch by barcode if API didn't return an id
+    try {
+      const p = await window.api.getProductByBarcode(bc);
+      if (p && p.id) {
+        openProductWeightFlow(p.id);
+      }
+    } catch {
+      // ignore
+    }
+  };
+  if (looksLikeBarcode && typeof window.api.getProductByBarcode === 'function') {
+    try {
+      const product = await window.api.getProductByBarcode(digitsOnly);
+      if (product && product.id) {
+        // Ensure cache has this product (scan can happen before loadAllProducts finishes)
+        cacheProductRecord(product);
+        openProductWeightFlow(product.id);
+        return;
+      }
+
+      // Barcode scan, but unknown barcode → offer to create product.
+      await openNewProductWithBarcode(digitsOnly, 'Checkout');
+      return;
+    } catch {
+      // Fall back to search below
+    }
+  }
+
+  // Fallback: search by product name/barcode/category
+  const results = await window.api.searchProducts(raw);
   
   if (results.length === 0) {
+    // If this looks like a barcode scan, offer to create the product.
+    if (looksLikeBarcode) {
+      await openNewProductWithBarcode(digitsOnly, 'Checkout');
+      return;
+    }
     showAlert('Product not found', 'error', 'Not Found');
     return;
   }
   
   if (results.length === 1) {
+    cacheProductRecord(results[0]);
     openProductWeightFlow(results[0].id);
   } else {
     // Multiple results - show alert to select from products grid
@@ -2444,23 +5671,36 @@ async function searchAndAddProduct(query) {
   }
 }
 
-// For zero-price (variable-price) products: ask for unit price first, then open the existing scale/weight modal.
-function openProductWeightFlow(productId) {
-  const product = allProducts.find(p => p.id === productId);
-  if (!product) {
-    promptForWeight(productId);
-    return;
-  }
+// Barcode-only POS entry flow.
+// For zero-price (variable-price) products: ask for unit price first, then add 1 piece.
+function openProductWeightFlow(productId, options = {}) {
+  const product = getCachedProductById(productId);
+  if (!product) return;
 
-  // Only intercept truly zero-priced items.
+  const refocusAfterAdd = options?.refocusScannerTarget !== false;
+
+  const refocusScannerTarget = () => {
+    try {
+      const el = document.getElementById('productSearch');
+      if (!el) return;
+      try { window.__virtualKeyboardSuppressOnce = true; } catch { /* ignore */ }
+      el.focus();
+      el.select?.();
+    } catch {
+      // ignore
+    }
+  };
+
+  // Normal products: each scan/click adds 1 piece.
   if (!(Number(product.price) <= 0)) {
-    promptForWeight(productId);
+    addToCart(productId, 1, null, false);
+    if (refocusAfterAdd) refocusScannerTarget();
     return;
   }
 
-  // Build a lightweight modal dynamically so we don't need to touch HTML/CSS files.
+  // Zero-price items: prompt for unit price per piece, then add 1.
   const currencySymbol = systemSettings?.currency_symbol || '€';
-  const unitLabel = (product.unit_type === 'quantity') ? '/piece' : '/kg';
+  const unitLabel = '/piece';
 
   const existing = document.getElementById('unitPriceEntryOverlay');
   if (existing) existing.remove();
@@ -2471,7 +5711,7 @@ function openProductWeightFlow(productId) {
     'position:fixed',
     'inset:0',
     'background:rgba(0,0,0,0.55)',
-    'padding:24px 0 330px 0',
+    'padding:18px',
     'display:flex',
     'align-items:center',
     'justify-content:center',
@@ -2485,22 +5725,39 @@ function openProductWeightFlow(productId) {
     'background:#fff',
     'border-radius:22px',
     'box-shadow:0 18px 60px rgba(0,0,0,0.35)',
-    'padding:26px 22px'
+    'padding:22px 20px'
   ].join(';');
 
   card.innerHTML = `
     <div style="text-align:center; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial;">
-      <div style="font-size:28px; font-weight:900; color:#0f172a; margin-bottom:6px;">Enter Price</div>
-      <div style="font-size:15px; color:#64748b; margin-bottom:18px;">${product.name}</div>
+      <div style="font-size:26px; font-weight:900; color:#0f172a; margin-bottom:4px;">Enter Price</div>
+      <div style="font-size:14px; color:#64748b; margin-bottom:14px;">${product.name}</div>
       <div style="font-size:14px; font-weight:800; color:#334155; margin-bottom:10px;">Unit Price (${unitLabel})</div>
-      <div style="display:flex; align-items:center; justify-content:center; gap:10px; margin-bottom:18px;">
+      <div style="display:flex; align-items:center; justify-content:center; gap:10px; margin-bottom:14px;">
         <div style="font-size:22px; font-weight:900; color:#334155;">${currencySymbol}</div>
-        <input id="unitPriceEntryInput" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off"
-          style="width:220px; font-size:26px; text-align:center; padding:14px 12px; border-radius:14px; border:2px solid #cbd5e1; outline:none;" />
+        <input id="unitPriceEntryInput" type="text" inputmode="none" placeholder="0.00" autocomplete="off" readonly
+          style="width:206px; font-size:24px; text-align:center; padding:12px 12px; border-radius:14px; border:2px solid #cbd5e1; outline:none;" />
+        <button type="button" id="unitPriceEntryBackspaceBtn" class="unit-price-input-backspace" aria-label="Backspace">⌫</button>
       </div>
+
+      <div class="unit-price-dialpad" id="unitPriceDialpad" role="group" aria-label="Number keypad">
+        <button type="button" class="dial-btn" data-key="1">1</button>
+        <button type="button" class="dial-btn" data-key="2">2</button>
+        <button type="button" class="dial-btn" data-key="3">3</button>
+        <button type="button" class="dial-btn" data-key="4">4</button>
+        <button type="button" class="dial-btn" data-key="5">5</button>
+        <button type="button" class="dial-btn" data-key="6">6</button>
+        <button type="button" class="dial-btn" data-key="7">7</button>
+        <button type="button" class="dial-btn" data-key="8">8</button>
+        <button type="button" class="dial-btn" data-key="9">9</button>
+        <button type="button" class="dial-btn dial-btn-secondary" data-key="clear">C</button>
+        <button type="button" class="dial-btn" data-key="0">0</button>
+        <button type="button" class="dial-btn dial-btn-secondary" data-key="dot">.</button>
+      </div>
+
       <div style="display:flex; gap:14px; justify-content:center;">
-        <button id="unitPriceEntryCancel" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:20px; font-weight:900; background:#94a3b8; color:#fff;">Cancel</button>
-        <button id="unitPriceEntryOk" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:20px; font-weight:900; background:#0ea5e9; color:#fff;">Submit</button>
+        <button id="unitPriceEntryCancel" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:#94a3b8; color:#fff;">Cancel</button>
+        <button id="unitPriceEntryOk" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:14px 12px; font-size:18px; font-weight:900; background:#0ea5e9; color:#fff;">Submit</button>
       </div>
     </div>
   `;
@@ -2509,38 +5766,51 @@ function openProductWeightFlow(productId) {
   document.body.appendChild(overlay);
 
   const input = document.getElementById('unitPriceEntryInput');
+  const inputBackspaceBtn = document.getElementById('unitPriceEntryBackspaceBtn');
   const okBtn = document.getElementById('unitPriceEntryOk');
   const cancelBtn = document.getElementById('unitPriceEntryCancel');
+  const dialpad = document.getElementById('unitPriceDialpad');
 
-  if (input) {
-    // Allow both 1.5 and 1,5 without the browser clearing the field (locale-safe).
-    input.addEventListener('input', () => {
-      let v = String(input.value || '');
-      v = v.replace(/[^0-9.,]/g, '');
-      const firstSepIndex = v.search(/[.,]/);
-      if (firstSepIndex >= 0) {
-        const before = v.slice(0, firstSepIndex);
-        const sep = v[firstSepIndex];
-        const after = v.slice(firstSepIndex + 1).replace(/[.,]/g, '');
-        v = before + sep + after;
-      }
-      input.value = v;
-    });
-  }
-
-  const cleanup = () => {
-    overlay.remove();
+  const normalizeValue = (raw) => {
+    let v = String(raw || '').replace(/[^0-9.]/g, '');
+    const firstDot = v.indexOf('.');
+    if (firstDot >= 0) {
+      const before = v.slice(0, firstDot);
+      const after = v.slice(firstDot + 1).replace(/\./g, '');
+      v = before + '.' + after;
+    }
+    // Prevent crazy leading zeros like 0002 (but keep 0.x)
+    if (v.length > 1 && v.startsWith('0') && v[1] !== '.') {
+      v = v.replace(/^0+/, '');
+      if (!v) v = '0';
+    }
+    return v;
   };
 
-  const restoreAfterWeightModal = (originalPrice) => {
-    // Restore after the weight modal closes via OK or Cancel.
-    const ok = document.getElementById('weightOkBtn');
-    const cancel = document.getElementById('weightCancelBtn');
-    const restore = () => {
-      product.price = originalPrice;
-    };
-    if (ok) ok.addEventListener('click', restore, { once: true });
-    if (cancel) cancel.addEventListener('click', restore, { once: true });
+  const setInputValue = (next) => {
+    if (!input) return;
+    input.value = normalizeValue(next);
+  };
+
+  const appendKey = (key) => {
+    if (!input) return;
+    const cur = String(input.value || '');
+    if (key === 'clear') return setInputValue('');
+    if (key === 'backspace') return setInputValue(cur.slice(0, -1));
+    if (key === 'dot') {
+      if (!cur) return setInputValue('0.');
+      if (cur.includes('.')) return;
+      return setInputValue(cur + '.');
+    }
+    // digits
+    if (/^\d$/.test(key)) {
+      return setInputValue(cur + key);
+    }
+  };
+
+  const cleanup = () => {
+    try { document.removeEventListener('keydown', keydownHandler, true); } catch { /* ignore */ }
+    overlay.remove();
   };
 
   const submit = () => {
@@ -2553,47 +5823,92 @@ function openProductWeightFlow(productId) {
 
     cleanup();
 
-    const originalPrice = product.price;
-    product.price = unitPrice;
-
-    // Open the existing weight/scale popup.
-    promptForWeight(productId);
-
-    // Ensure we restore the original price once the modal closes.
-    // (Do this after promptForWeight sets up its handlers.)
-    setTimeout(() => restoreAfterWeightModal(originalPrice), 0);
+    // Add 1 piece at the entered unit price.
+    addToCart(productId, 1, unitPrice, false);
+    if (refocusAfterAdd) refocusScannerTarget();
   };
+
+  const keydownHandler = (e) => {
+    try {
+      if (!document.getElementById('unitPriceEntryOverlay')) return;
+      const k = String(e.key || '');
+      if (k === 'Escape') {
+        e.preventDefault();
+        cleanup();
+        return;
+      }
+      if (k === 'Enter') {
+        e.preventDefault();
+        submit();
+        return;
+      }
+      if (k === 'Backspace') {
+        e.preventDefault();
+        appendKey('backspace');
+        return;
+      }
+      if (k === '.' || k === ',') {
+        e.preventDefault();
+        appendKey('dot');
+        return;
+      }
+      if (/^\d$/.test(k)) {
+        e.preventDefault();
+        appendKey(k);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  // Dialpad taps
+  if (dialpad) {
+    dialpad.addEventListener('click', (e) => {
+      const btn = e.target?.closest?.('button[data-key]');
+      if (!btn) return;
+      const key = String(btn.dataset.key || '');
+      appendKey(key);
+    });
+  }
+
+  // Dedicated backspace button next to the input
+  if (inputBackspaceBtn) {
+    inputBackspaceBtn.addEventListener('click', () => appendKey('backspace'));
+  }
+
+  // Allow physical keyboard input while overlay is open
+  document.addEventListener('keydown', keydownHandler, true);
 
   if (cancelBtn) cancelBtn.addEventListener('click', cleanup, { once: true });
   if (okBtn) okBtn.addEventListener('click', submit);
-  if (input) {
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') submit();
-    });
-  }
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) cleanup();
   });
 
-  // Focus the input so the existing virtual keyboard pops up.
+  // Keep focus off the readonly field on touch Windows PCs so the OS/app keyboard
+  // does not pop up when this price-entry overlay opens.
   setTimeout(() => {
-    if (!input) return;
-    input.focus();
-    input.select();
+    try {
+      try { input?.blur?.(); } catch { /* ignore */ }
+      okBtn?.focus?.();
+    } catch {
+      // ignore
+    }
   }, 0);
 }
 
-function addToCart(productId, weight = null, customPrice = null, isWeightBased = true) {
-  console.log('=== addToCart START ===');
-  console.log('productId:', productId);
-  console.log('weight parameter:', weight, 'type:', typeof weight);
-  console.log('customPrice:', customPrice);
-  console.log('isWeightBased:', isWeightBased);
-  
-  const product = allProducts.find(p => p.id === productId);
-  console.log('Product found:', product);
+function addToCart(productId, weight = null, customPrice = null, isWeightBased = false) {
+  hideCashierPaymentSummaryOverlay();
+  debugLog('=== addToCart START ===');
+  debugLog('productId:', productId);
+  debugLog('weight parameter:', weight, 'type:', typeof weight);
+  debugLog('customPrice:', customPrice);
+  debugLog('isWeightBased:', isWeightBased);
+
+  const product = getCachedProductById(productId);
+  debugLog('Product found:', product);
   if (!product) {
-    console.log('Product not found in addToCart');
+    debugLog('Product not found in addToCart');
     return;
   }
   
@@ -2602,44 +5917,116 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
     return;
   }
   
-  // Default weight is 1 kg if not provided
-  const finalWeight = weight !== null ? weight : 1.0;
+  // Default quantity is 1 (kg or pc) if not provided
+  const finalQuantity = weight !== null ? weight : 1.0;
   // Use custom price if provided, otherwise use product price
   const finalPrice = customPrice !== null ? customPrice : product.price;
-  console.log('>>> CALCULATED: Final weight:', finalWeight, 'Final price:', finalPrice);
+  debugLog('>>> CALCULATED: Final quantity:', finalQuantity, 'Final price:', finalPrice);
   
-  // Always add as new item - don't combine with existing items
-  console.log('Adding new product to cart as separate line item');
-  
-  if (finalWeight > product.stock) {
-    showAlert(`Only ${product.stock} kg available in stock`, 'warning', 'Stock Limit');
+  if (finalQuantity > product.stock) {
+    const unitLabel = isWeightBased ? 'kg' : (product.quantity_unit || 'pieces');
+    showAlert(`Only ${product.stock} ${unitLabel} available in stock`, 'warning', 'Stock Limit');
     return;
   }
   
-  // Calculate price based on weight (price per kg)
-  const weightedPrice = finalPrice * finalWeight;
-  console.log('Weighted price:', weightedPrice);
+  // Calculate exact line subtotal in cents (avoid float drift)
+  const unitPriceCents = moneyToCents(finalPrice);
+  const quantityGrams = isWeightBased ? kgToGrams(finalQuantity) : null;
+  const normalizedQty = isWeightBased ? gramsToKg(quantityGrams) : Number(finalQuantity);
+  const lineSubtotalCents = isWeightBased
+    ? Math.round((unitPriceCents * quantityGrams) / 1000)
+    : (Number.isFinite(normalizedQty) ? Math.round(unitPriceCents * normalizedQty) : 0);
+  debugLog('Line subtotal cents:', lineSubtotalCents);
+
+  // Barcode-only behavior: repeated scans should increase quantity (not add duplicate lines).
+  // Keep this disabled while editing existing PARKING/loan sales to avoid DB inconsistencies.
+  const parkingCtx = getParkingPaymentContext();
+  const canMerge = !parkingCtx
+    && !isWeightBased
+    && POS_DISABLE_SCALE_AND_WEIGHT
+    && Number.isFinite(normalizedQty)
+    && normalizedQty > 0;
+
+  if (canMerge) {
+    const targetIndex = cart.findIndex(i =>
+      i
+      && i.productId === product.id
+      && i.isWeightBased === false
+      && typeof i.unitPriceCents === 'number'
+      && i.unitPriceCents === unitPriceCents
+      && !i.saleItemId
+      && !i.loanId
+      && Number(i.discountPercent || 0) === 0
+    );
+
+    if (targetIndex >= 0) {
+      const target = cart[targetIndex];
+      const currentQty = Number(target.quantity || 0);
+      const nextQty = currentQty + normalizedQty;
+
+      if (!Number.isFinite(nextQty) || nextQty <= 0) {
+        showAlert('Invalid quantity', 'error', 'Error');
+        return;
+      }
+      if (nextQty > product.stock) {
+        const unitLabel = product.quantity_unit || 'pieces';
+        showAlert(`Only ${product.stock} ${unitLabel} available in stock`, 'warning', 'Stock Limit');
+        return;
+      }
+
+      target.quantity = nextQty;
+      target.quantityGrams = null;
+      try { recalcCartItemMoney(target); } catch { /* ignore */ }
+
+      // Track undo action for the last scan.
+      setLastScanUndoAction({
+        type: 'merge',
+        cartItemId: target.cartItemId,
+        prevQty: currentQty
+      });
+
+      // Move updated line to the top (most recently scanned).
+      if (targetIndex > 0) {
+        cart.splice(targetIndex, 1);
+        cart.unshift(target);
+      }
+
+      updateCartDisplay();
+      updateCustomerDisplayData();
+      return;
+    }
+  }
   
-  // Get tax rate from category
+  // VAT is product-level (category VAT is not used)
+  const productTaxRate = Number(product.tax_rate);
   const category = allCategories.find(c => c.name === product.category);
-  const categoryTaxRate = category ? category.tax_rate : 0;
+  const fallbackTaxRate = category ? Number(category.tax_rate) : 0;
+  const finalTaxRate = Number.isFinite(productTaxRate) ? productTaxRate : (Number.isFinite(fallbackTaxRate) ? fallbackTaxRate : 0);
   
-  // Add as new item - each addition is a separate line
+  // Add as new item (first scan of this barcode/price)
   const cartItem = {
     productId: product.id,
     productName: product.name,
-    unitPrice: finalPrice, // Use the custom or default price
-    taxRate: categoryTaxRate,
-    quantity: finalWeight, // Store weight in quantity field
-    subtotal: weightedPrice,
+    unitPriceCents,
+    unitPrice: centsToMoney(unitPriceCents), // Derived from cents
+    taxRate: finalTaxRate,
+    quantity: isWeightBased ? normalizedQty : normalizedQty,
+    quantityGrams: quantityGrams,
+    subtotalCents: lineSubtotalCents,
+    subtotal: centsToMoney(lineSubtotalCents),
     isWeightBased: isWeightBased, // Track whether it's weight or quantity based
     cartItemId: Date.now(), // Unique ID for each cart item to allow duplicates
     discountPercent: 0 // Discount as percentage (0%, 10%, 20%, etc.)
   };
   cart.unshift(cartItem); // Add to beginning (most recent first)
+
+  // Track undo action for the last scan.
+  setLastScanUndoAction({
+    type: 'add',
+    cartItemId: cartItem.cartItemId
+  });
   
   updateCartDisplay();
-  updateCartSummary();
 
   // Update customer display (centralized behavior: last item like the reference POS)
   updateCustomerDisplayData();
@@ -2647,7 +6034,7 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
 
 function updateCartQuantity(productId, change) {
   const item = cart.find(i => i.productId === productId);
-  const product = allProducts.find(p => p.id === productId);
+  const product = getCachedProductById(productId);
   
   if (!item || !product) return;
   
@@ -2657,7 +6044,11 @@ function updateCartQuantity(productId, change) {
     removeFromCart(item.cartItemId);
   } else if (newQuantity <= product.stock) {
     item.quantity = newQuantity;
-    item.subtotal = item.quantity * item.unitPrice;
+    if (item.isWeightBased) {
+      item.quantityGrams = kgToGrams(item.quantity);
+      item.quantity = gramsToKg(item.quantityGrams);
+    }
+    recalcCartItemMoney(item);
     updateCartDisplay();
   } else {
     alert('Not enough stock available');
@@ -2665,6 +6056,112 @@ function updateCartQuantity(productId, change) {
 }
 
 function removeFromCart(cartItemId) {
+  const parkingPaymentInfo = sessionStorage.getItem('parkingPayment');
+  if (parkingPaymentInfo) {
+    // Paying an existing PARKING from the PARKING screen. Removal must update the DB.
+    (async () => {
+      try {
+        const ctx = JSON.parse(parkingPaymentInfo);
+        const receiptNumber = String(ctx?.receiptNumber || '').trim();
+        if (!receiptNumber) throw new Error('Missing PARKING receipt number');
+
+        const cartItem = cart.find(i => i.cartItemId === cartItemId);
+        const saleItemId = Number(cartItem?.saleItemId);
+        const loanId = Number(cartItem?.loanId);
+        if (!Number.isFinite(loanId) || !Number.isFinite(saleItemId)) {
+          throw new Error('This item cannot be removed from PARKING');
+        }
+
+        await window.api.removeLoanSaleItem(loanId, saleItemId);
+
+        // Reload the parking items from DB so cart + totals match.
+        const loan = await window.api.getLoanByReceipt(receiptNumber);
+        const status = (loan?.status || '').toString().toLowerCase();
+        if (loan && loan.sale && Array.isArray(loan.sale.items)) {
+          cart = loan.sale.items.map(item => ({
+            productId: item.product_id || `parking_item_${Date.now()}_${Math.random()}`,
+            productName: item.product_name || 'Parking Item',
+            saleItemId: item.id,
+            loanId: loan.id,
+            unitPrice: item.unit_price || item.price || (item.subtotal / item.quantity),
+            taxRate: item.tax_rate || 0,
+            quantity: item.quantity || 1,
+            subtotal: item.subtotal || item.price || 0,
+            isWeightBased: POS_DISABLE_SCALE_AND_WEIGHT ? false : (item.unit_type === 'weight'),
+            cartItemId: Date.now() + Math.random(),
+            discountPercent: Number(item.discount_percent || 0)
+          }));
+        }
+
+        // If all items are removed (or the tab is already settled), exit PARKING edit mode
+        // so the next customer sale is not affected.
+        if (!cart.length || status === 'paid' || Number(loan?.remaining_amount || 0) <= 0) {
+          sessionStorage.removeItem('parkingPayment');
+          selectedPaymentMethod = null;
+          paymentMode = 'single';
+          updateCartDisplay();
+          try {
+            const paymentModal = document.getElementById('paymentModal');
+            if (paymentModal && paymentModal.classList.contains('active')) {
+              closePaymentModalFunc();
+            }
+          } catch {
+            // ignore
+          }
+          showAlert('PARKING updated', 'success');
+          return;
+        }
+
+        setParkingPaymentContext({
+          receiptNumber,
+          amount: Number(loan?.remaining_amount || 0),
+          remainingAmount: Number(loan?.remaining_amount || 0),
+          status: (loan?.status || '').toString().toLowerCase(),
+          customerType: (loan?.customer_type || '').toString().toLowerCase(),
+          restaurantName: loan?.restaurant_name || null,
+          customerName: loan?.customer_name || null,
+          customerPhone: loan?.customer_phone || null,
+          timestamp: Date.now()
+        });
+
+        // Keep cart open for further edits/payment; only clear cart when selecting PARKING.
+        updateCartDisplay();
+
+        // If payment inputs were previously filled, they can keep showing an old amount.
+        // Reset/sync so totals update on the spot.
+        try {
+          const paymentModal = document.getElementById('paymentModal');
+          const paymentInput = document.getElementById('paymentInput');
+          const cashPaidInput = document.getElementById('cashPaidInput');
+          const isPaymentModalOpen = !!(paymentModal && paymentModal.classList.contains('active'));
+          const total = calculateTotal();
+
+          if (paymentInput) {
+            if (isPaymentModalOpen && selectedPaymentMethod && selectedPaymentMethod !== 'cash') {
+              paymentInput.value = String(total.toFixed(2));
+            } else {
+              // Default to total in the summary tiles
+              paymentInput.value = '';
+            }
+          }
+
+          // Don't wipe cashier-entered cash if they are actively paying cash
+          if (!isPaymentModalOpen || selectedPaymentMethod !== 'cash') {
+            if (cashPaidInput) cashPaidInput.value = '';
+          }
+        } catch {
+          // ignore
+        }
+
+        // Re-render summary tiles with the synced payment inputs
+        updateCartSummary();
+      } catch (e) {
+        showAlert('Failed to remove item from PARKING: ' + (e?.message || e), 'error');
+      }
+    })();
+    return;
+  }
+
   const removedItem = cart.find(item => item.cartItemId === cartItemId);
   cart = cart.filter(item => item.cartItemId !== cartItemId);
   updateCartDisplay();
@@ -2672,250 +6169,265 @@ function removeFromCart(cartItemId) {
 }
 
 function setupInlineCartEditing() {
-  const currencySymbol = systemSettings?.currency_symbol || '€';
-  
-  console.log('Setting up inline cart editing...');
-  
-  // Handle quantity editing - inline
-  document.querySelectorAll('.editable-quantity').forEach(el => {
-    el.addEventListener('click', function(e) {
-      e.stopPropagation();
-      console.log('Quantity clicked');
-      const cartItemId = parseInt(this.dataset.cartItemId);
-      const cartItem = cart.find(item => item.cartItemId === cartItemId);
-      if (!cartItem) return;
-      
-      const unit = cartItem.isWeightBased ? 'kg' : 'pc';
-      const currentValue = cartItem.quantity.toFixed(2);
-      
-      // Replace with input
-      const input = document.createElement('input');
-      input.type = 'text'; // Allow natural decimal entry
-      input.inputMode = 'decimal';
-      input.value = currentValue;
-      input.style.cssText = 'width: 80px; text-align: center; font-weight: 800; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
-      
-      this.innerHTML = '';
-      this.appendChild(input);
-      input.focus();
-      // Set cursor to end of text
-      const length = input.value.length;
-      input.setSelectionRange(length, length);
-      
-      const saveValue = () => {
-        // Accept both dot and comma as decimal separator, trim whitespace
-        let valueStr = input.value.trim().replace(',', '.');
-        if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
+  const cartTableBody = document.getElementById('cartTableBody');
+  if (!cartTableBody) return;
+
+  if (setupInlineCartEditing._handlersAttached) return;
+  setupInlineCartEditing._handlersAttached = true;
+
+  const isVirtualKeyboardClick = () => {
+    const activeEl = document.activeElement;
+    return !!(activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn') || activeEl.closest('.numpad-btn')));
+  };
+
+  const placeInputAndFocus = (containerEl, inputEl) => {
+    containerEl.textContent = '';
+    containerEl.appendChild(inputEl);
+    if (inputEl.dataset.noVk !== '1') {
+      try { window.__virtualKeyboardForceOpen = true; } catch { /* ignore */ }
+    } else {
+      try { window.__virtualKeyboardSuppressOnce = true; } catch { /* ignore */ }
+    }
+    inputEl.focus();
+    const length = inputEl.value.length;
+    try {
+      inputEl.setSelectionRange(length, length);
+    } catch {
+      // ignore
+    }
+  };
+
+  const attachCommonInputHandlers = (inputEl, { onSave, onCancel }) => {
+    inputEl.addEventListener('blur', () => {
+      setTimeout(() => {
+        if (!isVirtualKeyboardClick()) onSave();
+        else inputEl.focus();
+      }, 100);
+    });
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') onSave();
+      if (e.key === 'Escape') onCancel();
+    });
+  };
+
+  const beginEditQuantity = (cellEl, cartItem) => {
+    const unit = cartItem.isWeightBased ? 'kg' : 'pc';
+    // For piece/count items, treat quantity as an integer to avoid confusing decimals.
+    const isCountBased = !cartItem.isWeightBased;
+    const currentValue = isCountBased
+      ? String(Math.max(1, Math.round(Number(cartItem.quantity) || 1)))
+      : cartItem.quantity.toFixed(3);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    // Use attribute + property so Electron/Chromium consistently exposes it.
+    input.setAttribute('inputmode', isCountBased ? 'numeric' : 'decimal');
+    input.inputMode = isCountBased ? 'numeric' : 'decimal';
+    input.setAttribute('enterkeyhint', 'done');
+    input.autocomplete = 'off';
+    input.value = currentValue;
+    // Hint to the virtual keyboard: first key press should replace the whole value.
+    input.dataset.replaceOnNextKey = '1';
+    input.dataset.noVk = '1';
+    input.style.cssText = 'width: 80px; text-align: center; font-weight: 800; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+
+    // On focus, select all so typing replaces (touch friendly)
+    input.addEventListener('focus', () => {
+      try { input.select(); } catch { /* ignore */ }
+    });
+
+    const saveValue = () => {
+      let valueStr = input.value.trim().replace(',', '.');
+      if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
+
+      const product = getCachedProductById(cartItem.productId);
+      const stock = Number(product?.stock);
+      const prevQty = Number(cartItem.quantity);
+
+      if (isCountBased) {
+        // Pieces must be whole numbers
+        const digits = valueStr.replace(/[^0-9]/g, '');
+        const newQty = parseInt(digits, 10);
+        if (Number.isFinite(newQty) && newQty > 0) {
+          if (Number.isFinite(stock) && stock >= 0 && Number.isFinite(prevQty)) {
+            const maxAllowed = stock + prevQty;
+            if (newQty > maxAllowed) {
+              alert(`Only ${Math.floor(maxAllowed)} ${unit} available in stock`);
+              updateCartDisplay();
+              return;
+            }
+          }
+          cartItem.quantityGrams = null;
+          cartItem.quantity = newQty;
+          recalcCartItemMoney(cartItem);
+        }
+      } else {
         const newValue = parseFloat(valueStr);
         if (!isNaN(newValue) && newValue > 0 && /^\d*\.?\d*$/.test(valueStr)) {
-          const product = allProducts.find(p => p.id === cartItem.productId);
-          if (product && newValue > product.stock + cartItem.quantity) {
-            alert(`Only ${(product.stock + cartItem.quantity).toFixed(2)} ${unit} available in stock`);
-            updateCartDisplay();
-            return;
+          if (Number.isFinite(stock) && stock >= 0 && Number.isFinite(prevQty)) {
+            const maxAllowed = stock + prevQty;
+            if (newValue > maxAllowed) {
+              alert(`Only ${maxAllowed.toFixed(3)} ${unit} available in stock`);
+              updateCartDisplay();
+              return;
+            }
           }
-          cartItem.quantity = newValue;
-          cartItem.subtotal = newValue * cartItem.unitPrice;
+          cartItem.quantityGrams = kgToGrams(newValue);
+          cartItem.quantity = gramsToKg(cartItem.quantityGrams);
+          recalcCartItemMoney(cartItem);
         }
-        updateCartDisplay();
-        flashCustomerDisplayCartItem(cartItem.cartItemId);
-      };
-      
-      input.addEventListener('blur', (e) => {
-        // Check if blur is caused by clicking on virtual keyboard
-        setTimeout(() => {
-          const activeEl = document.activeElement;
-          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
-          if (!isKeyboardClick) {
-            saveValue();
-          } else {
-            // Refocus the input if keyboard was clicked
-            input.focus();
-          }
-        }, 100);
-      });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') saveValue();
-        if (e.key === 'Escape') updateCartDisplay();
-      });
-    });
-  });
-  
-  // Handle price editing - inline
-  document.querySelectorAll('.editable-price').forEach(el => {
-    el.addEventListener('click', function(e) {
-      e.stopPropagation();
-      console.log('Price clicked');
-      const cartItemId = parseInt(this.dataset.cartItemId);
-      const cartItem = cart.find(item => item.cartItemId === cartItemId);
-      if (!cartItem) return;
-      
-      const unitLabel = cartItem.isWeightBased ? '/kg' : '/pc';
-      const currentValue = cartItem.unitPrice.toFixed(2);
-      
-      // Replace with input
-      const input = document.createElement('input');
-      input.type = 'text'; // Allow natural decimal entry
-      input.inputMode = 'decimal';
-      input.value = currentValue;
-      input.style.cssText = 'width: 100px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
-      
-      this.textContent = '';
-      this.appendChild(input);
-      input.focus();
-      // Set cursor to end of text
-      const length = input.value.length;
-      input.setSelectionRange(length, length);
-      
-      const saveValue = () => {
-        // Accept both dot and comma as decimal separator, trim whitespace
-        let valueStr = input.value.trim().replace(',', '.');
-        // Allow .5 or 0.5, but not just .
-        if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
-        const newValue = parseFloat(valueStr);
-        if (!isNaN(newValue) && valueStr !== '' && /^\d*\.?\d*$/.test(valueStr)) {
-          cartItem.unitPrice = newValue;
-          cartItem.subtotal = cartItem.quantity * newValue;
-        } // else: do not update, just revert to previous value
-        updateCartDisplay();
-        flashCustomerDisplayCartItem(cartItem.cartItemId);
-      };
-      
-      input.addEventListener('blur', (e) => {
-        setTimeout(() => {
-          const activeEl = document.activeElement;
-          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
-          if (!isKeyboardClick) {
-            saveValue();
-          } else {
-            input.focus();
-          }
-        }, 100);
-      });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') saveValue();
-        if (e.key === 'Escape') updateCartDisplay();
-      });
-    });
-  });
+      }
+      updateCartDisplay();
+      flashCustomerDisplayCartItem(cartItem.cartItemId);
+    };
 
-  // Handle item name editing - inline
-  document.querySelectorAll('.editable-name').forEach(el => {
-    el.addEventListener('click', function(e) {
-      e.stopPropagation();
-      console.log('Name clicked');
-      const cartItemId = parseInt(this.dataset.cartItemId);
-      const cartItem = cart.find(item => item.cartItemId === cartItemId);
-      if (!cartItem) return;
-      
-      const currentValue = cartItem.productName;
-      
-      // Replace with input
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.value = currentValue;
-      input.style.cssText = 'width: 100%; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
-      
-      this.textContent = '';
-      this.appendChild(input);
-      input.focus();
-      // Set cursor to end of text
-      const length = input.value.length;
-      input.setSelectionRange(length, length);
-      
-      const saveValue = () => {
-        const newValue = input.value.trim();
-        if (newValue.length > 0) {
-          cartItem.productName = newValue;
-        }
-        updateCartDisplay();
-        flashCustomerDisplayCartItem(cartItem.cartItemId);
-      };
-      
-      input.addEventListener('blur', (e) => {
-        setTimeout(() => {
-          const activeEl = document.activeElement;
-          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
-          if (!isKeyboardClick) {
-            saveValue();
-          } else {
-            input.focus();
-          }
-        }, 100);
-      });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') saveValue();
-        if (e.key === 'Escape') updateCartDisplay();
-      });
-    });
-  });
+    placeInputAndFocus(cellEl, input);
+    // Ensure full replace behavior even if focus happens before listeners attach.
+    setTimeout(() => {
+      try { input.focus(); input.select(); } catch { /* ignore */ }
+    }, 0);
+    attachCommonInputHandlers(input, { onSave: saveValue, onCancel: updateCartDisplay });
+  };
 
-  // Handle discount editing - inline
-  document.querySelectorAll('.editable-discount').forEach(el => {
-    el.addEventListener('click', function(e) {
-      e.stopPropagation();
-      console.log('Discount clicked');
-      const cartItemId = parseInt(this.dataset.cartItemId);
-      const cartItem = cart.find(item => item.cartItemId === cartItemId);
-      if (!cartItem) return;
-      
-      const currentValue = (cartItem.discountPercent || 0).toFixed(0);
-      
-      // Replace with input
-      const input = document.createElement('input');
-      input.type = 'text'; // Allow natural decimal entry
-      input.inputMode = 'decimal';
-      input.value = currentValue;
-      input.style.cssText = 'width: 80px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
-      
-      this.textContent = '';
-      this.appendChild(input);
-      input.focus();
-      // Set cursor to end of text
-      const length = input.value.length;
-      input.setSelectionRange(length, length);
-      
-      const saveValue = () => {
-        // Accept both dot and comma as decimal separator, trim whitespace
-        let valueStr = input.value.trim().replace(',', '.').replace('%', '');
-        if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
-        const newValue = parseFloat(valueStr);
-        if (!isNaN(newValue) && newValue >= 0 && newValue <= 100 && /^\d*\.?\d*$/.test(valueStr)) {
-          cartItem.discountPercent = newValue;
-        } else if (newValue > 100) {
-          alert('Discount cannot be greater than 100%');
+  const beginEditPrice = (cellEl, cartItem) => {
+    const currentValue = centsToMoney(cartItem.unitPriceCents ?? moneyToCents(cartItem.unitPrice)).toFixed(2);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.setAttribute('inputmode', 'decimal');
+    input.inputMode = 'decimal';
+    input.setAttribute('enterkeyhint', 'done');
+    input.autocomplete = 'off';
+    input.value = currentValue;
+    input.dataset.noVk = '1';
+    input.style.cssText = 'width: 100px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+
+    const saveValue = () => {
+      let valueStr = input.value.trim().replace(',', '.');
+      if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
+      const newValue = parseFloat(valueStr);
+      if (!isNaN(newValue) && valueStr !== '' && /^\d*\.?\d*$/.test(valueStr)) {
+        cartItem.unitPriceCents = moneyToCents(newValue);
+        cartItem.unitPrice = centsToMoney(cartItem.unitPriceCents);
+        recalcCartItemMoney(cartItem);
+      }
+      updateCartDisplay();
+      flashCustomerDisplayCartItem(cartItem.cartItemId);
+    };
+
+    placeInputAndFocus(cellEl, input);
+    attachCommonInputHandlers(input, { onSave: saveValue, onCancel: updateCartDisplay });
+  };
+
+  const beginEditName = (cellEl, cartItem) => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = cartItem.productName;
+    input.style.cssText = 'width: 100%; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+
+    const saveValue = () => {
+      const newValue = input.value.trim();
+      if (newValue.length > 0) cartItem.productName = newValue;
+      updateCartDisplay();
+      flashCustomerDisplayCartItem(cartItem.cartItemId);
+    };
+
+    placeInputAndFocus(cellEl, input);
+    attachCommonInputHandlers(input, { onSave: saveValue, onCancel: updateCartDisplay });
+  };
+
+  const beginEditDiscount = (cellEl, cartItem) => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.setAttribute('inputmode', 'decimal');
+    input.inputMode = 'decimal';
+    input.setAttribute('enterkeyhint', 'done');
+    input.autocomplete = 'off';
+    input.value = (cartItem.discountPercent || 0).toFixed(0);
+    input.dataset.noVk = '1';
+    input.style.cssText = 'width: 80px; text-align: center; font-size: 14px; padding: 4px; border: 2px solid #6EAFAF; border-radius: 4px;';
+
+    const saveValue = () => {
+      let valueStr = input.value.trim().replace(',', '.').replace('%', '');
+      if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
+      const newValue = parseFloat(valueStr);
+      if (!isNaN(newValue) && newValue >= 0 && newValue <= 100 && /^\d*\.?\d*$/.test(valueStr)) {
+        cartItem.discountPercent = newValue;
+      } else if (newValue > 100) {
+        alert('Discount cannot be greater than 100%');
+      }
+      updateCartDisplay();
+      flashCustomerDisplayCartItem(cartItem.cartItemId);
+    };
+
+    placeInputAndFocus(cellEl, input);
+    attachCommonInputHandlers(input, { onSave: saveValue, onCancel: updateCartDisplay });
+  };
+
+  cartTableBody.addEventListener('click', (e) => {
+    const target = e.target;
+    if (!target || target.tagName === 'INPUT') return;
+    if (cartTableBody.querySelector('.cart-row-dragging')) return;
+
+    const editableEl = target.closest?.('.editable-quantity, .editable-price, .editable-name, .editable-discount');
+    if (!editableEl || !cartTableBody.contains(editableEl)) return;
+    if (editableEl.querySelector('input')) return;
+
+    const cartItemId = parseInt(editableEl.dataset.cartItemId, 10);
+    if (!Number.isFinite(cartItemId)) return;
+    const cartItem = cart.find(item => item.cartItemId === cartItemId);
+    if (!cartItem) return;
+
+    e.stopPropagation();
+
+    // Type-first-then-tap-cell: if user typed a number on the numpad first, apply it directly
+    const getPending  = setupCheckoutHandlers._getNumpadPending;
+    const clearPending = setupCheckoutHandlers._clearNumpadPending;
+    const pendingVal = getPending ? getPending() : '';
+
+    if (pendingVal && (editableEl.classList.contains('editable-quantity') || editableEl.classList.contains('editable-price') || editableEl.classList.contains('editable-discount'))) {
+      clearPending && clearPending();
+      const numStr = pendingVal.replace(',', '.');
+      const numVal = parseFloat(numStr);
+      if (!isNaN(numVal)) {
+        if (editableEl.classList.contains('editable-quantity')) {
+          const isCountBased = !cartItem.isWeightBased;
+          if (isCountBased) {
+            const qty = Math.round(numVal);
+            if (qty > 0) { cartItem.quantity = qty; cartItem.quantityGrams = null; recalcCartItemMoney(cartItem); }
+          } else {
+            if (numVal > 0) { cartItem.quantityGrams = kgToGrams(numVal); cartItem.quantity = gramsToKg(cartItem.quantityGrams); recalcCartItemMoney(cartItem); }
+          }
+        } else if (editableEl.classList.contains('editable-price')) {
+          if (numVal >= 0) { cartItem.unitPriceCents = moneyToCents(numVal); cartItem.unitPrice = centsToMoney(cartItem.unitPriceCents); recalcCartItemMoney(cartItem); }
+        } else if (editableEl.classList.contains('editable-discount')) {
+          if (numVal >= 0 && numVal <= 100) { cartItem.discountPercent = numVal; recalcCartItemMoney(cartItem); }
         }
         updateCartDisplay();
         flashCustomerDisplayCartItem(cartItem.cartItemId);
-      };
-      
-      input.addEventListener('blur', (e) => {
-        setTimeout(() => {
-          const activeEl = document.activeElement;
-          const isKeyboardClick = activeEl && (activeEl.closest('#virtualKeyboard') || activeEl.closest('.key-btn'));
-          if (!isKeyboardClick) {
-            saveValue();
-          } else {
-            input.focus();
-          }
-        }, 100);
-      });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') saveValue();
-        if (e.key === 'Escape') updateCartDisplay();
-      });
-    });
-  });
-  
-  console.log('Cart editing handlers attached:', {
-    quantity: document.querySelectorAll('.editable-quantity').length,
-    price: document.querySelectorAll('.editable-price').length,
-    name: document.querySelectorAll('.editable-name').length,
-    discount: document.querySelectorAll('.editable-discount').length
+      }
+      return;
+    }
+
+    if (editableEl.classList.contains('editable-quantity')) beginEditQuantity(editableEl, cartItem);
+    else if (editableEl.classList.contains('editable-price')) beginEditPrice(editableEl, cartItem);
+    else if (editableEl.classList.contains('editable-name')) beginEditName(editableEl, cartItem);
+    else if (editableEl.classList.contains('editable-discount')) beginEditDiscount(editableEl, cartItem);
   });
 }
 
+let cartDisplayRafPending = false;
+let cachedCartTotals = null; // { totalBaseCents, totalTaxCents, totalDiscountCents, totalCents }
 function updateCartDisplay() {
+  if (cartDisplayRafPending) return;
+  cartDisplayRafPending = true;
+  requestAnimationFrame(() => {
+    cartDisplayRafPending = false;
+    updateCartDisplayNow();
+  });
+}
+
+function updateCartDisplayNow() {
   const cartTableBody = document.getElementById('cartTableBody');
   const checkoutBtn = document.getElementById('checkoutBtn');
   const ticketBtn = document.getElementById('ticketBtn');
@@ -2932,9 +6444,16 @@ function updateCartDisplay() {
   });
   
   if (cart.length === 0) {
-    console.log('Cart is empty, showing empty message');
+    debugLog('Cart is empty, showing empty message');
     cartTableBody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 40px; color: #a0aec0;">Cart is empty</td></tr>';
     checkoutBtn.disabled = true;
+
+    cachedCartTotals = {
+      totalBaseCents: 0,
+      totalTaxCents: 0,
+      totalDiscountCents: 0,
+      totalCents: 0
+    };
 
     // Ensure payment summary resets when the cart is cleared.
     const paymentInput = document.getElementById('paymentInput');
@@ -2951,8 +6470,17 @@ function updateCartDisplay() {
       paymentBtn.style.opacity = '0.5';
       paymentBtn.style.cursor = 'not-allowed';
     }
+
+    // No cart = nothing to undo
+    setLastScanUndoAction(null);
   } else {
-    console.log('Cart has items, rendering...');
+    debugLog('Cart has items, rendering...');
+
+    let totalBaseCents = 0;
+    let totalTaxCents = 0;
+    let totalDiscountCents = 0;
+    let totalCents = 0;
+
     // Enable TICKET and PAYMENT buttons when cart has items
     if (ticketBtn) {
       ticketBtn.disabled = false;
@@ -2965,98 +6493,380 @@ function updateCartDisplay() {
       paymentBtn.style.cursor = 'pointer';
     }
     cartTableBody.innerHTML = cart.map(item => {
-      const unit = item.isWeightBased ? 'kg' : 'pc';
-      const unitLabel = item.isWeightBased ? '/kg' : '/pc';
+      // Barcode-only mode: never show weight units in the cart.
+      if (POS_DISABLE_SCALE_AND_WEIGHT) item.isWeightBased = false;
+      recalcCartItemMoney(item);
+      const originalProduct = getCachedProductById(item.productId);
+      const qtyUnit = item.isWeightBased
+        ? 'kg'
+        : String(originalProduct?.quantity_unit || 'pc');
+      const unit = item.isWeightBased ? 'kg' : qtyUnit;
+      const unitLabel = item.isWeightBased ? '/kg' : `/${qtyUnit}`;
       const discountPercent = item.discountPercent || 0;
-      const discountAmount = item.subtotal * (discountPercent / 100);
-      const finalTotal = item.subtotal - discountAmount;
+      const lineSubtotalCents = item.subtotalCents ?? moneyToCents(item.subtotal);
+      const discountCents = calcDiscountCents(lineSubtotalCents, discountPercent);
+      const finalTotalCents = lineSubtotalCents - discountCents;
+
+      const taxRate = item.taxRate || 0;
+      const baseCents = Math.round(finalTotalCents / (1 + taxRate));
+      const lineTaxCents = finalTotalCents - baseCents;
+      totalBaseCents += baseCents;
+      totalTaxCents += lineTaxCents;
+      totalDiscountCents += discountCents;
+      totalCents += finalTotalCents;
+
+      const qtyText = item.isWeightBased ? item.quantity.toFixed(3) : item.quantity.toFixed(2);
+      // Display the cart item's current (possibly edited) unit price.
+      // Fall back to product price only if the cart item doesn't have a unitPrice.
+      const displayUnitPrice = Number.isFinite(Number(item.unitPrice))
+        ? Number(item.unitPrice)
+        : Number(originalProduct ? originalProduct.price : 0);
       return `
-      <tr>
+      <tr class="cart-row" data-cart-item-id="${item.cartItemId}">
         <td class="editable-name" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${item.productName}</td>
-        <td class="editable-price" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${currencySymbol}${item.unitPrice.toFixed(2)}${unitLabel}</td>
+        <td class="editable-price" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${currencySymbol}${Number(displayUnitPrice).toFixed(2)}${unitLabel}</td>
         <td>
           <div style="display: flex; align-items: center; gap: 8px; justify-content: center;">
-            <span class="editable-quantity" data-cart-item-id="${item.cartItemId}" style="min-width: 50px; text-align: center; font-weight: 800; cursor: pointer; user-select: none;">${item.quantity.toFixed(2)} ${unit}</span>
+            <span class="editable-quantity" data-cart-item-id="${item.cartItemId}" style="min-width: 50px; text-align: center; font-weight: 800; cursor: pointer; user-select: none;">${qtyText} ${unit}</span>
             <button onclick="removeFromCart(${item.cartItemId})" style="background: #fc8181; color: white; border: none; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; font-weight: 800;">×</button>
           </div>
         </td>
         <td class="editable-discount" data-cart-item-id="${item.cartItemId}" style="cursor: pointer; user-select: none;">${discountPercent.toFixed(0)}%</td>
-        <td style="font-weight: 800; color: #6E8FAF;">${currencySymbol}${finalTotal.toFixed(2)}</td>
+        <td style="font-weight: 800; color: #6E8FAF;">${currencySymbol}${centsToMoney(finalTotalCents).toFixed(2)}</td>
       </tr>
     `;
     }).join('');
-    console.log('Cart HTML updated');
+
+    cachedCartTotals = {
+      totalBaseCents,
+      totalTaxCents,
+      totalDiscountCents,
+      totalCents
+    };
+    debugLog('Cart HTML updated');
     
     // Add click handlers for inline editing
     setupInlineCartEditing();
+
+    // Enable touch drag-reorder for cart rows (two-finger hold)
+    ensureCartRowReorderHandlers();
     
     checkoutBtn.disabled = true; // Disabled until payment method selected
   }
   
   updateCartSummary();
+
+  // Show/hide the active PARKING customer/restaurant banner (if any)
+  try {
+    updateParkingContextBanner();
+  } catch {
+    // ignore
+  }
+
+  // Modern monitor customer display (15.6" HDMI/USB screen): update whenever cart changes.
+  // This does NOT write to the serial VFD/pole display.
+  pushMonitorCustomerDisplay();
+
+  // Update undo button enabled state
+  try { updateUndoScanButton(); } catch { /* ignore */ }
+  try { updateDeleteAllButton(); } catch { /* ignore */ }
+}
+
+// ============== CART ROW REORDER (TOUCH DRAG) ==============
+// Gesture: two-finger long-press (default 280ms) on a row, then drag up/down to reorder.
+// This avoids interfering with normal single-finger taps for editing/removing.
+const CART_REORDER_HOLD_MS = 280;
+const CART_REORDER_MOVE_CANCEL_PX = 10;
+
+let cartRowReorderState = {
+  handlersAttached: false,
+  pending: null, // { cartItemId, rowEl, startX, startY, startedAt, timerId }
+  active: null // { cartItemId, rowEl, placeholderEl, offsetY, fixedLeft, fixedWidth, fixedHeight }
+};
+
+function getTouchesCentroid(touches) {
+  if (!touches || touches.length === 0) return { x: 0, y: 0 };
+  let sumX = 0;
+  let sumY = 0;
+  for (let i = 0; i < touches.length; i++) {
+    sumX += touches[i].clientX;
+    sumY += touches[i].clientY;
+  }
+  return { x: sumX / touches.length, y: sumY / touches.length };
+}
+
+function moveCartItemToIndex(cartItemId, toIndex) {
+  const fromIndex = cart.findIndex(i => String(i?.cartItemId) === String(cartItemId));
+  if (fromIndex < 0) return;
+  const safeTo = Math.max(0, Math.min(toIndex, cart.length - 1));
+  if (safeTo === fromIndex) return;
+  const [moved] = cart.splice(fromIndex, 1);
+  cart.splice(safeTo, 0, moved);
+}
+
+function ensureCartRowReorderHandlers() {
+  if (cartRowReorderState.handlersAttached) return;
+  const cartTableBody = document.getElementById('cartTableBody');
+  if (!cartTableBody) return;
+
+  cartRowReorderState.handlersAttached = true;
+
+  const clearPending = () => {
+    const p = cartRowReorderState.pending;
+    if (p?.timerId) clearTimeout(p.timerId);
+    cartRowReorderState.pending = null;
+  };
+
+  const cleanupActive = () => {
+    const a = cartRowReorderState.active;
+    if (!a) return;
+    try {
+      a.rowEl?.classList?.remove('cart-row-dragging');
+      if (a.rowEl) {
+        a.rowEl.style.position = '';
+        a.rowEl.style.left = '';
+        a.rowEl.style.top = '';
+        a.rowEl.style.width = '';
+        a.rowEl.style.zIndex = '';
+        a.rowEl.style.pointerEvents = '';
+        a.rowEl.style.boxShadow = '';
+        a.rowEl.style.transform = '';
+      }
+      a.placeholderEl?.remove?.();
+    } catch {
+      // ignore
+    }
+    cartRowReorderState.active = null;
+  };
+
+  const computeDropIndexFromPlaceholder = (placeholderEl, draggingRowEl) => {
+    if (!placeholderEl?.parentElement) return null;
+    const children = Array.from(placeholderEl.parentElement.children);
+    let index = 0;
+    for (const child of children) {
+      if (child === draggingRowEl) continue;
+      if (child === placeholderEl) return index;
+      if (child?.dataset?.cartItemId) index++;
+    }
+    return index;
+  };
+
+  const startDrag = (rowEl, cartItemId, startClientY) => {
+    if (!rowEl || !rowEl.isConnected) return;
+    if (cartRowReorderState.active) return;
+
+    const rect = rowEl.getBoundingClientRect();
+    const placeholderEl = document.createElement('tr');
+    placeholderEl.className = 'cart-row-placeholder';
+    placeholderEl.innerHTML = `<td colspan="5" style="height:${Math.max(10, Math.round(rect.height))}px;"></td>`;
+
+    // Insert placeholder where the row was, then float the row
+    rowEl.parentElement?.insertBefore(placeholderEl, rowEl.nextSibling);
+
+    rowEl.classList.add('cart-row-dragging');
+    rowEl.style.position = 'fixed';
+    rowEl.style.left = `${Math.round(rect.left)}px`;
+    rowEl.style.top = `${Math.round(rect.top)}px`;
+    rowEl.style.width = `${Math.round(rect.width)}px`;
+    rowEl.style.zIndex = '10020';
+    rowEl.style.pointerEvents = 'none';
+    rowEl.style.boxShadow = '0 18px 40px rgba(15, 23, 42, 0.25)';
+
+    const offsetY = startClientY - rect.top;
+    cartRowReorderState.active = {
+      cartItemId,
+      rowEl,
+      placeholderEl,
+      offsetY,
+      fixedLeft: rect.left,
+      fixedWidth: rect.width,
+      fixedHeight: rect.height
+    };
+  };
+
+  const onTouchStart = (e) => {
+    try {
+      if (!e.touches || e.touches.length !== 2) return;
+      if (cartRowReorderState.active) return;
+
+      const rowEl = e.target?.closest?.('tr[data-cart-item-id]');
+      if (!rowEl) return;
+      const cartItemId = rowEl.dataset.cartItemId;
+      if (!cartItemId) return;
+
+      const { x, y } = getTouchesCentroid(e.touches);
+      clearPending();
+
+      const timerId = setTimeout(() => {
+        const p = cartRowReorderState.pending;
+        if (!p) return;
+        if (!p.rowEl?.isConnected) { clearPending(); return; }
+        startDrag(p.rowEl, p.cartItemId, p.startY);
+        clearPending();
+      }, CART_REORDER_HOLD_MS);
+
+      cartRowReorderState.pending = {
+        cartItemId,
+        rowEl,
+        startX: x,
+        startY: y,
+        startedAt: Date.now(),
+        timerId
+      };
+    } catch {
+      // ignore
+    }
+  };
+
+  const onTouchMove = (e) => {
+    try {
+      const a = cartRowReorderState.active;
+      if (a) {
+        // During active drag, prevent scrolling
+        e.preventDefault();
+        if (!e.touches || e.touches.length === 0) return;
+
+        const { y } = getTouchesCentroid(e.touches);
+        const nextTop = y - a.offsetY;
+        a.rowEl.style.top = `${Math.round(nextTop)}px`;
+
+        const tbody = document.getElementById('cartTableBody');
+        if (!tbody) return;
+
+        const otherRows = Array.from(tbody.querySelectorAll('tr[data-cart-item-id]:not(.cart-row-dragging)'));
+        let inserted = false;
+        for (const row of otherRows) {
+          const r = row.getBoundingClientRect();
+          const midY = r.top + r.height / 2;
+          if (y < midY) {
+            tbody.insertBefore(a.placeholderEl, row);
+            inserted = true;
+            break;
+          }
+        }
+        if (!inserted) {
+          tbody.appendChild(a.placeholderEl);
+        }
+        return;
+      }
+
+      const p = cartRowReorderState.pending;
+      if (!p) return;
+      if (!e.touches || e.touches.length !== 2) {
+        clearPending();
+        return;
+      }
+      const { x, y } = getTouchesCentroid(e.touches);
+      const dx = x - p.startX;
+      const dy = y - p.startY;
+      if (Math.hypot(dx, dy) > CART_REORDER_MOVE_CANCEL_PX) {
+        clearPending();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const onTouchEndOrCancel = (e) => {
+    try {
+      clearPending();
+      const a = cartRowReorderState.active;
+      if (!a) return;
+
+      const dropIndex = computeDropIndexFromPlaceholder(a.placeholderEl, a.rowEl);
+      cleanupActive();
+
+      if (typeof dropIndex === 'number') {
+        moveCartItemToIndex(a.cartItemId, dropIndex);
+        updateCartDisplay();
+      }
+    } catch {
+      cleanupActive();
+    }
+  };
+
+  cartTableBody.addEventListener('touchstart', onTouchStart, { passive: true });
+  cartTableBody.addEventListener('touchmove', onTouchMove, { passive: false });
+  cartTableBody.addEventListener('touchend', onTouchEndOrCancel, { passive: true });
+  cartTableBody.addEventListener('touchcancel', onTouchEndOrCancel, { passive: true });
 }
 
 function calculateTotal() {
-  const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
-  const totalDiscount = cart.reduce((sum, item) => {
-    const discountPercent = item.discountPercent || 0;
-    const discountAmount = item.subtotal * (discountPercent / 100);
-    return sum + discountAmount;
+  const subtotalBeforeDiscountCents = cart.reduce((sum, item) => {
+    recalcCartItemMoney(item);
+    return sum + (item.subtotalCents || 0);
   }, 0);
-  return subtotalBeforeDiscount - totalDiscount;
+  const totalDiscountCents = cart.reduce((sum, item) => {
+    const lineSubtotalCents = item.subtotalCents || 0;
+    return sum + calcDiscountCents(lineSubtotalCents, item.discountPercent);
+  }, 0);
+  return centsToMoney(subtotalBeforeDiscountCents - totalDiscountCents);
 }
 
 function updateCartSummary() {
   // Update summary
   const currencySymbol = systemSettings?.currency_symbol || '€';
-  
-  // Product prices already include tax - we need to extract the tax amount
-  // Total = sum of all product prices (tax-included)
-  const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
-  
-  // Calculate total discount from all items (percentage-based)
-  const totalDiscount = cart.reduce((sum, item) => {
-    const discountPercent = item.discountPercent || 0;
-    const discountAmount = item.subtotal * (discountPercent / 100);
-    return sum + discountAmount;
-  }, 0);
-  
-  // Final total after discounts
-  const total = subtotalBeforeDiscount - totalDiscount;
-  
-  // Calculate base price (before tax) and tax amount for each product
-  let totalBasePrice = 0;
-  let totalTaxAmount = 0;
-  
-  cart.forEach(item => {
-    const taxRate = item.taxRate || 0;
-    const discountPercent = item.discountPercent || 0;
-    const discountAmount = item.subtotal * (discountPercent / 100);
-    const itemFinalPrice = item.subtotal - discountAmount;
-    // Reverse calculation: Base = Total / (1 + tax_rate)
-    const basePrice = itemFinalPrice / (1 + taxRate);
-    const taxAmount = itemFinalPrice - basePrice;
-    
-    totalBasePrice += basePrice;
-    totalTaxAmount += taxAmount;
-  });
+
+  let totalBaseCents;
+  let totalTaxCents;
+  let totalDiscountCents;
+  let totalCents;
+
+  if (cachedCartTotals &&
+      Number.isFinite(cachedCartTotals.totalBaseCents) &&
+      Number.isFinite(cachedCartTotals.totalTaxCents) &&
+      Number.isFinite(cachedCartTotals.totalDiscountCents) &&
+      Number.isFinite(cachedCartTotals.totalCents)) {
+    ({ totalBaseCents, totalTaxCents, totalDiscountCents, totalCents } = cachedCartTotals);
+  } else {
+    // Fallback (should be rare): recompute from cart
+    const subtotalBeforeDiscountCents = cart.reduce((sum, item) => {
+      recalcCartItemMoney(item);
+      return sum + (item.subtotalCents || 0);
+    }, 0);
+
+    totalDiscountCents = cart.reduce((sum, item) => {
+      const lineSubtotalCents = item.subtotalCents || 0;
+      return sum + calcDiscountCents(lineSubtotalCents, item.discountPercent);
+    }, 0);
+
+    totalCents = subtotalBeforeDiscountCents - totalDiscountCents;
+    totalBaseCents = 0;
+    totalTaxCents = 0;
+
+    cart.forEach(item => {
+      const taxRate = item.taxRate || 0;
+      const discountPercent = item.discountPercent || 0;
+      const lineSubtotalCents = item.subtotalCents || 0;
+      const discountCents = calcDiscountCents(lineSubtotalCents, discountPercent);
+      const itemFinalCents = lineSubtotalCents - discountCents;
+      const baseCents = Math.round(itemFinalCents / (1 + taxRate));
+      const taxCents = itemFinalCents - baseCents;
+      totalBaseCents += baseCents;
+      totalTaxCents += taxCents;
+    });
+  }
 
   // Do NOT update the physical customer display from here.
   // updateCartSummary() is triggered very frequently (e.g. typing paid amount),
   // and frequent serial writes cause buffering/flicker on the pole display.
   
-  // Get payment amount from payment input field or default to total
+  // Get payment amount from payment input field (ONLY when the payment modal is open)
+  // Otherwise stale values can remain visible in the summary tiles.
+  const paymentModal = document.getElementById('paymentModal');
+  const isPaymentModalOpen = !!(paymentModal && paymentModal.classList.contains('active'));
   const paymentInput = document.getElementById('paymentInput');
-  const paymentAmountText = paymentInput ? paymentInput.value : '';
-  const paymentAmount = paymentAmountText ? parseFloat(paymentAmountText) : total;
-  const change = Math.max(0, paymentAmount - total);
-  
-  document.getElementById('cartSubtotal').textContent = `${currencySymbol}${totalBasePrice.toFixed(2)}`;
-  document.getElementById('cartTax').textContent = `${currencySymbol}${totalTaxAmount.toFixed(2)}`;
-  document.getElementById('cartDiscount').textContent = `${currencySymbol}${totalDiscount.toFixed(2)}`;
-  document.getElementById('cartTotal').textContent = `${currencySymbol}${total.toFixed(2)}`;
-  document.getElementById('paymentAmount').textContent = `${currencySymbol}${paymentAmount.toFixed(2)}`;
-  document.getElementById('changeAmount').textContent = `${currencySymbol}${change.toFixed(2)}`;
+  const paymentAmountText = (isPaymentModalOpen && paymentInput) ? paymentInput.value : '';
+  const paymentParsed = paymentAmountText ? parseFloat(paymentAmountText) : NaN;
+  const paymentCents = Number.isFinite(paymentParsed) ? moneyToCents(paymentParsed) : totalCents;
+  const changeCents = Math.max(0, paymentCents - totalCents);
+
+  document.getElementById('cartSubtotal').textContent = `${currencySymbol}${centsToMoney(totalBaseCents).toFixed(2)}`;
+  document.getElementById('cartTax').textContent = `${currencySymbol}${centsToMoney(totalTaxCents).toFixed(2)}`;
+  document.getElementById('cartDiscount').textContent = `${currencySymbol}${centsToMoney(totalDiscountCents).toFixed(2)}`;
+  document.getElementById('cartTotal').textContent = `${currencySymbol}${centsToMoney(totalCents).toFixed(2)}`;
+  document.getElementById('paymentAmount').textContent = `${currencySymbol}${centsToMoney(paymentCents).toFixed(2)}`;
+  document.getElementById('changeAmount').textContent = `${currencySymbol}${centsToMoney(changeCents).toFixed(2)}`;
 }
 
 // Print ticket without payment (for quotation/estimation purposes)
@@ -3100,46 +6910,48 @@ async function printTicket() {
   const LINE_WIDTH = inferTicketLineWidth(systemSettings?.printer_name);
 
   // Calculate totals from cart (apply discountPercent if present)
-  let subtotal = 0;
-  let tax = 0;
-  let total = 0;
+  let subtotalCents = 0;
+  let taxCents = 0;
+  let totalCents = 0;
 
   const taxBreakdown = {};
 
   cart.forEach(item => {
     const taxRate = item.taxRate || 0;
     const discountPercent = item.discountPercent || 0;
-    const discountAmount = item.subtotal * (discountPercent / 100);
-    const finalSubtotal = item.subtotal - discountAmount;
+    recalcCartItemMoney(item);
+    const lineSubtotalCents = item.subtotalCents || 0;
+    const discountCents = calcDiscountCents(lineSubtotalCents, discountPercent);
+    const finalCents = lineSubtotalCents - discountCents;
 
-    const basePrice = finalSubtotal / (1 + taxRate);
-    const taxAmount = finalSubtotal - basePrice;
+    const baseCents = Math.round(finalCents / (1 + taxRate));
+    const lineTaxCents = finalCents - baseCents;
 
-    subtotal += basePrice;
-    tax += taxAmount;
-    total += finalSubtotal;
+    subtotalCents += baseCents;
+    taxCents += lineTaxCents;
+    totalCents += finalCents;
 
     // Track tax breakdown
     const taxRatePercent = Math.round(taxRate * 100);
     if (!taxBreakdown[taxRatePercent]) {
       taxBreakdown[taxRatePercent] = {
-        base: 0,
-        tax: 0,
-        total: 0
+        baseCents: 0,
+        taxCents: 0,
+        totalCents: 0
       };
     }
-    taxBreakdown[taxRatePercent].base += basePrice;
-    taxBreakdown[taxRatePercent].tax += taxAmount;
-    taxBreakdown[taxRatePercent].total += finalSubtotal;
+    taxBreakdown[taxRatePercent].baseCents += baseCents;
+    taxBreakdown[taxRatePercent].taxCents += lineTaxCents;
+    taxBreakdown[taxRatePercent].totalCents += finalCents;
   });
 
   // Generate tax breakdown HTML
   const taxBreakdownHtml = Object.keys(taxBreakdown).sort().map(rate => `
     <div class="receipt-item" style="font-size: 12px; padding: 2px 0;">
       <span>IVA ${rate}%</span>
-      <span>Base: ${currencySymbol}${taxBreakdown[rate].base.toFixed(2)}</span>
-      <span>Cuota: ${currencySymbol}${taxBreakdown[rate].tax.toFixed(2)}</span>
-      <span>Total: ${currencySymbol}${taxBreakdown[rate].total.toFixed(2)}</span>
+      <span>Base: ${currencySymbol}${centsToMoney(taxBreakdown[rate].baseCents).toFixed(2)}</span>
+      <span>Cuota: ${currencySymbol}${centsToMoney(taxBreakdown[rate].taxCents).toFixed(2)}</span>
+      <span>Total: ${currencySymbol}${centsToMoney(taxBreakdown[rate].totalCents).toFixed(2)}</span>
     </div>
   `).join('');
 
@@ -3150,15 +6962,15 @@ async function printTicket() {
     .sort((a, b) => a - b)
     .map(rate => ({
       rate,
-      base: taxBreakdown[rate].base,
-      tax: taxBreakdown[rate].tax,
-      total: taxBreakdown[rate].total
+      base: centsToMoney(taxBreakdown[rate].baseCents),
+      tax: centsToMoney(taxBreakdown[rate].taxCents),
+      total: centsToMoney(taxBreakdown[rate].totalCents)
     }));
 
   // Generate a unique ticket/receipt number
   const now = new Date();
-  const dateStr = now.toLocaleDateString('es-ES');
-  const timeStr = now.toLocaleTimeString('es-ES');
+  const dateStr = formatDateWithDisplayTimeZone(now, 'es-ES');
+  const timeStr = formatTimeWithDisplayTimeZone(now, 'es-ES');
   const receiptNumber = `T101_1/${String(now.getFullYear()).slice(-2)}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}${String(now.getSeconds()).padStart(2,'0')}`;
 
   const ticketData = {
@@ -3171,9 +6983,11 @@ async function printTicket() {
     receiptId: receiptNumber,
     date: `${dateStr} ${timeStr}`,
     items: cart.map(item => {
+      recalcCartItemMoney(item);
       const discountPercent = item.discountPercent || 0;
-      const discountAmount = item.subtotal * (discountPercent / 100);
-      const finalSubtotal = item.subtotal - discountAmount;
+      const lineSubtotalCents = item.subtotalCents || 0;
+      const discountCents = calcDiscountCents(lineSubtotalCents, discountPercent);
+      const finalSubtotal = centsToMoney(lineSubtotalCents - discountCents);
       return {
         name: item.productName || item.name || 'PRODUCTO',
         quantity: item.quantity,
@@ -3182,12 +6996,12 @@ async function printTicket() {
         discountPercent
       };
     }),
-    subtotal,
-    tax,
-    total,
+    subtotal: centsToMoney(subtotalCents),
+    tax: centsToMoney(taxCents),
+    total: centsToMoney(totalCents),
     taxBreakdown: taxBreakdownRows,
     paymentMethod: 'cash',
-    paymentAmount: total,
+    paymentAmount: centsToMoney(totalCents),
     changeAmount: 0,
     currency: currencySymbol,
     footer: receiptFooter,
@@ -3227,34 +7041,39 @@ async function completeSale() {
   }
   
   // Product prices already include tax - extract tax from total
-  const subtotalBeforeDiscount = cart.reduce((sum, item) => sum + item.subtotal, 0);
-  
-  // Calculate total discount from percentage-based discounts
-  const totalDiscountAmount = cart.reduce((sum, item) => {
-    const discountPercent = item.discountPercent || 0;
-    const discountAmount = item.subtotal * (discountPercent / 100);
-    return sum + discountAmount;
+  const subtotalBeforeDiscountCents = cart.reduce((sum, item) => {
+    recalcCartItemMoney(item);
+    return sum + (item.subtotalCents || 0);
   }, 0);
   
-  const total = subtotalBeforeDiscount - totalDiscountAmount;
+  // Calculate total discount from percentage-based discounts
+  const totalDiscountCents = cart.reduce((sum, item) => {
+    const lineSubtotalCents = item.subtotalCents || 0;
+    return sum + calcDiscountCents(lineSubtotalCents, item.discountPercent);
+  }, 0);
+  
+  const totalCents = subtotalBeforeDiscountCents - totalDiscountCents;
+  const total = centsToMoney(totalCents);
   
   // Calculate base price (before tax) and tax amount
-  let subtotal = 0;
-  let tax = 0;
+  let subtotalCents = 0;
+  let taxCents = 0;
   
   cart.forEach(item => {
     const taxRate = item.taxRate || 0;
     const discountPercent = item.discountPercent || 0;
-    const discountAmount = item.subtotal * (discountPercent / 100);
-    const finalPrice = item.subtotal - discountAmount;
-    const basePrice = finalPrice / (1 + taxRate);
-    const taxAmount = finalPrice - basePrice;
-    
-    subtotal += basePrice;
-    tax += taxAmount;
+    const lineSubtotalCents = item.subtotalCents || 0;
+    const discountCents = calcDiscountCents(lineSubtotalCents, discountPercent);
+    const finalCents = lineSubtotalCents - discountCents;
+    const baseCents = Math.round(finalCents / (1 + taxRate));
+    const lineTaxCents = finalCents - baseCents;
+    subtotalCents += baseCents;
+    taxCents += lineTaxCents;
   });
   
-  const discount = totalDiscountAmount;
+  const subtotal = centsToMoney(subtotalCents);
+  const tax = centsToMoney(taxCents);
+  const discount = centsToMoney(totalDiscountCents);
   
   // Determine payment method and amounts
   let paymentMethod = selectedPaymentMethod;
@@ -3269,35 +7088,162 @@ async function completeSale() {
     
     const cashAmount = parseFloat(splitCashAmount.value) || 0;
     const cardAmount = parseFloat(splitCardAmount.value) || 0;
+    const cashCents = moneyToCents(cashAmount);
+    const cardCents = moneyToCents(cardAmount);
     
-    if (cashAmount === 0 && cardAmount === 0) {
+    if (cashCents === 0 && cardCents === 0) {
       alert('Please enter payment amounts');
       return;
     }
     
-    const totalPaid = cashAmount + cardAmount;
-    if (Math.abs(totalPaid - total) > 0.01) {
+    const totalPaidCents = cashCents + cardCents;
+    if (totalPaidCents !== totalCents) {
       alert('Payment amounts must equal the total');
       return;
     }
     
     // Store split payment details
     splitPayments = {
-      cash: cashAmount,
-      card: cardAmount
+      cash: centsToMoney(cashCents),
+      card: centsToMoney(cardCents)
     };
     
     // Set payment method as 'split' for database
     paymentMethod = 'split';
-    paymentAmount = totalPaid;
+    paymentAmount = centsToMoney(totalPaidCents);
     changeAmount = 0; // No change in split payments
   } else {
     // Single payment mode
     // Calculate payment amount and change
     const paymentInput = document.getElementById('paymentInput');
     const paymentAmountText = paymentInput ? paymentInput.value : '';
-    paymentAmount = paymentAmountText ? parseFloat(paymentAmountText) : total;
-    changeAmount = paymentMethod === 'cash' ? Math.max(0, paymentAmount - total) : 0;
+    const parsed = paymentAmountText ? parseFloat(paymentAmountText) : NaN;
+    const paymentCents = Number.isFinite(parsed) ? moneyToCents(parsed) : totalCents;
+    const changeCents = paymentMethod === 'cash' ? Math.max(0, paymentCents - totalCents) : 0;
+    paymentAmount = centsToMoney(paymentCents);
+    changeAmount = centsToMoney(changeCents);
+  }
+
+  // If this is the "Pay" flow (existing PARKING -> Checkout), allow selecting PARKING to
+  // append ONLY newly scanned items into the same PARKING (no duplicates).
+  let parkingPaymentInfo = sessionStorage.getItem('parkingPayment');
+  // If a stale PARKING payment session is left over, it can break the next normal sale.
+  // Only treat this as an active PARKING session if the cart contains loan-linked items.
+  if (parkingPaymentInfo) {
+    const cartHasLoanItems = (Array.isArray(cart) ? cart : []).some(i =>
+      Number.isFinite(Number(i?.saleItemId)) ||
+      Number.isFinite(Number(i?.loanId)) ||
+      String(i?.productId || '') === 'parking_payment'
+    );
+    if (!cartHasLoanItems) {
+      try { sessionStorage.removeItem('parkingPayment'); } catch { /* ignore */ }
+      parkingPaymentInfo = null;
+    }
+  }
+  if (parkingPaymentInfo && paymentMethod === 'loan') {
+    try {
+      const ctx = JSON.parse(parkingPaymentInfo);
+      const receiptNumber = String(ctx?.receiptNumber || '').trim();
+      if (!receiptNumber) throw new Error('Missing PARKING receipt number');
+
+      const loan = await window.api.getLoanByReceipt(receiptNumber);
+      if (!loan) throw new Error('PARKING not found');
+      if ((loan.status || '').toString().toLowerCase() === 'paid') {
+        throw new Error('This PARKING is already paid');
+      }
+
+      const newItems = (Array.isArray(cart) ? cart : []).filter(i => !Number.isFinite(Number(i?.saleItemId)));
+      if (newItems.length === 0) {
+        // No new scanned items. Still allow using PARKING as a "Done" action
+        // after removals/edits: exit the Pay->Checkout session and return to an empty cart.
+        cart = [];
+        updateCartDisplay();
+        sessionStorage.removeItem('parkingPayment');
+        closePaymentModalFunc();
+        showAlert('PARKING updated', 'success');
+        return;
+      }
+
+      // Compute totals for only the new items (prices include tax).
+      let subtotalCentsNew = 0;
+      let taxCentsNew = 0;
+      let discountCentsNew = 0;
+      let totalCentsNew = 0;
+
+      for (const item of newItems) {
+        try { recalcCartItemMoney(item); } catch { /* ignore */ }
+        const lineSubtotalCents = moneyToCents(Number(item.subtotal || 0));
+        const discountPercent = Number(item.discountPercent || 0);
+        const lineDiscountCents = Math.round(lineSubtotalCents * (discountPercent / 100));
+        const finalCents = lineSubtotalCents - lineDiscountCents;
+        const taxRate = Number(item.taxRate || 0);
+        const baseCents = Math.round(finalCents / (1 + taxRate));
+        const lineTaxCents = finalCents - baseCents;
+        subtotalCentsNew += baseCents;
+        taxCentsNew += lineTaxCents;
+        discountCentsNew += lineDiscountCents;
+        totalCentsNew += finalCents;
+      }
+
+      await window.api.createLoan({
+        receiptNumber: String(Date.now()),
+        customerType: loan.customer_type || 'restaurant',
+        customerName: loan.customer_name || null,
+        customerPhone: loan.customer_phone || null,
+        restaurantName: loan.restaurant_name || null,
+        restaurantNie: loan.restaurant_nie || null,
+        cashierId: currentUser.id,
+        notes: null,
+        mergeMode: 'append',
+        targetLoanId: loan.id,
+        sale: {
+          subtotal: centsToMoney(subtotalCentsNew),
+          tax: centsToMoney(taxCentsNew),
+          discount: centsToMoney(discountCentsNew),
+          total: centsToMoney(totalCentsNew),
+          paymentMethod: 'loan',
+          paymentAmount: 0,
+          changeAmount: 0,
+          cashierId: currentUser.id,
+          notes: null
+        },
+        items: newItems
+      });
+
+      const refreshed = await window.api.getLoanByReceipt(receiptNumber);
+      if (refreshed && refreshed.sale && Array.isArray(refreshed.sale.items)) {
+        cart = refreshed.sale.items.map(item => ({
+          productId: item.product_id || `parking_item_${Date.now()}_${Math.random()}`,
+          productName: item.product_name || 'Parking Item',
+          saleItemId: item.id,
+          loanId: refreshed.id,
+          unitPrice: item.unit_price || item.price || (item.subtotal / item.quantity),
+          taxRate: item.tax_rate || 0,
+          quantity: item.quantity || 1,
+          subtotal: item.subtotal || item.price || 0,
+          isWeightBased: POS_DISABLE_SCALE_AND_WEIGHT ? false : (item.unit_type === 'weight'),
+          cartItemId: Date.now() + Math.random(),
+          discountPercent: item.discount_percent || 0
+        }));
+      }
+
+      sessionStorage.setItem('parkingPayment', JSON.stringify({
+        receiptNumber,
+        amount: Number(refreshed?.remaining_amount || 0),
+        timestamp: Date.now()
+      }));
+
+      // Option B: after saving to PARKING, return to an empty checkout cart.
+      cart = [];
+      updateCartDisplay();
+      sessionStorage.removeItem('parkingPayment');
+      closePaymentModalFunc();
+      showAlert('Added new items to existing PARKING', 'success');
+      return;
+    } catch (error) {
+      showAlert('Failed to add items to PARKING: ' + (error?.message || error), 'error');
+      return;
+    }
   }
   
   // If loan is selected, open loan customer info modal
@@ -3309,15 +7255,130 @@ async function completeSale() {
   }
   
   // Check if this is a parking payment
-  const parkingPaymentInfo = sessionStorage.getItem('parkingPayment');
   if (parkingPaymentInfo) {
     console.log('Found parking payment info:', parkingPaymentInfo);
     console.log('Current cart:', cart);
     try {
       const paymentData = JSON.parse(parkingPaymentInfo);
+
+      // If the cashier scanned extra items while paying a PARKING tab, those items
+      // must be appended to the underlying loan sale BEFORE we settle the payment.
+      // Otherwise the newly added products won't be part of the final PARKING bill.
+      {
+        const receiptNumber = String(paymentData?.receiptNumber || '').trim();
+        const newItems = (Array.isArray(cart) ? cart : []).filter(i => {
+          if (!i) return false;
+          if (String(i.productId || '') === 'parking_payment') return false;
+          return !Number.isFinite(Number(i.saleItemId));
+        });
+
+        if (receiptNumber && newItems.length > 0) {
+          let loan = null;
+          try {
+            loan = await window.api.getLoanByReceipt(receiptNumber);
+          } catch {
+            loan = null;
+          }
+
+          const loanStatus = (loan?.status || '').toString().toLowerCase();
+          if (!loan || loanStatus === 'paid') {
+            showAlert('Cannot add new items: PARKING tab not available', 'error', 'PARKING');
+            return;
+          }
+
+          try {
+            let subtotalCentsNew = 0;
+            let taxCentsNew = 0;
+            let discountCentsNew = 0;
+            let totalCentsNew = 0;
+
+            for (const item of newItems) {
+              try { recalcCartItemMoney(item); } catch { /* ignore */ }
+              const lineSubtotalCents = Number.isFinite(Number(item?.subtotalCents))
+                ? Number(item.subtotalCents)
+                : moneyToCents(Number(item?.subtotal || 0));
+              const discountPercent = Number(item?.discountPercent || 0);
+              const lineDiscountCents = Math.round(lineSubtotalCents * (discountPercent / 100));
+              const finalCents = lineSubtotalCents - lineDiscountCents;
+              const taxRate = Number(item?.taxRate || 0);
+              const baseCents = Math.round(finalCents / (1 + taxRate));
+              const lineTaxCents = finalCents - baseCents;
+              subtotalCentsNew += baseCents;
+              taxCentsNew += lineTaxCents;
+              discountCentsNew += lineDiscountCents;
+              totalCentsNew += finalCents;
+            }
+
+            await window.api.createLoan({
+              receiptNumber: String(Date.now()),
+              customerType: loan.customer_type || 'regular',
+              customerName: loan.customer_name || null,
+              customerPhone: loan.customer_phone || null,
+              restaurantName: loan.restaurant_name || null,
+              restaurantNie: loan.restaurant_nie || null,
+              cashierId: currentUser.id,
+              notes: null,
+              mergeMode: 'append',
+              targetLoanId: loan.id,
+              sale: {
+                subtotal: centsToMoney(subtotalCentsNew),
+                tax: centsToMoney(taxCentsNew),
+                discount: centsToMoney(discountCentsNew),
+                total: centsToMoney(totalCentsNew),
+                paymentMethod: 'loan',
+                paymentAmount: 0,
+                changeAmount: 0,
+                cashierId: currentUser.id,
+                notes: null
+              },
+              items: newItems
+            });
+
+            const refreshed = await window.api.getLoanByReceipt(receiptNumber);
+            paymentData.amount = Number(refreshed?.remaining_amount || 0);
+          } catch (e) {
+            showAlert('Failed to add new items to PARKING: ' + (e?.message || e), 'error', 'PARKING');
+            return;
+          }
+        }
+      }
+
+      // If the PARKING is already paid, clear the session and continue as a normal sale.
+      try {
+        const loan = await window.api.getLoanByReceipt(paymentData.receiptNumber);
+        const status = (loan?.status || '').toString().toLowerCase();
+        if (status === 'paid') {
+          sessionStorage.removeItem('parkingPayment');
+          parkingPaymentInfo = null;
+          showAlert('This PARKING has already been paid in full. Starting a new sale.', 'info');
+        }
+      } catch {
+        // ignore
+      }
+
+      if (!parkingPaymentInfo) {
+        // Proceed with normal sale
+      } else {
       
-      // Process parking payment
-      await completeLoanPaymentFromCheckout(paymentData.receiptNumber, paymentData.amount, paymentMethod);
+      // Process parking payment (include cash tendered + change for receipt)
+      let payAmount = Number(paymentData.amount);
+      if (!Number.isFinite(payAmount) || payAmount <= 0) {
+        try {
+          const loanNow = await window.api.getLoanByReceipt(paymentData.receiptNumber);
+          payAmount = Number(loanNow?.remaining_amount || 0);
+        } catch {
+          payAmount = 0;
+        }
+      }
+      if (!Number.isFinite(payAmount) || payAmount <= 0) {
+        showAlert('Invalid PARKING amount to pay', 'error', 'PARKING');
+        return;
+      }
+
+      await completeLoanPaymentFromCheckout(paymentData.receiptNumber, payAmount, paymentMethod, {
+        paymentAmount,
+        changeAmount
+      });
       
       // Clear parking payment data
       sessionStorage.removeItem('parkingPayment');
@@ -3360,9 +7421,10 @@ async function completeSale() {
       }, 1000);
       
       return;
+      }
     } catch (error) {
       console.error('Error processing parking payment:', error);
-      alert('Error processing parking payment: ' + error.message);
+      showAlert('Error processing parking payment: ' + error.message, 'error');
       return;
     }
   }
@@ -3380,68 +7442,124 @@ async function completeSale() {
     splitPayments: splitPayments, // Include split payment details
     notes: currentInvoiceNote || null // Include invoice note
   };
-  
-  try {
-    // Show payment processing on customer display
-    updateCustomerDisplayPayment(paymentMethod.toUpperCase());
-    
-    const sale = await window.api.createSale(saleData);
-    lastSalePaymentMethod = paymentMethod;
 
-    // Open cash drawer if payment method is cash
-    if (paymentMethod === 'cash') {
-      await openCashDrawer();
+  let sale = null;
+  try {
+    // Show payment processing on customer display (non-critical)
+    try {
+      updateCustomerDisplayPayment(paymentMethod.toUpperCase());
+    } catch (e) {
+      console.warn('Customer display payment update failed:', e);
     }
 
-    // Close payment modal
+    // Open drawer only on COMPLETE SALE (not on payment method selection).
+    // Open for CASH and SPLIT that includes a cash component.
+    const splitCash = Number(splitPayments?.cash || 0) || 0;
+    const shouldOpenDrawer = (paymentMethod === 'cash') || (paymentMethod === 'split' && splitCash > 0);
+
+    if (shouldOpenDrawer && !cashDrawerOpenedInPaymentFlow) {
+      cashDrawerOpenedInPaymentFlow = true;
+      openCashDrawer().catch(e => console.warn('Cash drawer open failed:', e));
+    }
+
+    // This is the critical step. If this fails, we should NOT clear the cart.
+    sale = await window.api.createSale(saleData);
+  } catch (error) {
+    alert('Error completing sale: ' + (error?.message || error));
+    return;
+  }
+
+  // From here on, the sale is created. Always clear cart/UI even if hardware/display fails.
+  lastSalePaymentMethod = paymentMethod;
+  // End of payment flow
+  cashDrawerOpenedInPaymentFlow = false;
+
+  // Close payment modal (non-critical)
+  try {
     closePaymentModalFunc();
+  } catch {
+    // ignore
+  }
 
-    // Show receipt
+  // Show receipt (non-critical)
+  try {
     showReceipt(sale);
+  } catch (e) {
+    console.warn('Failed to show receipt modal:', e);
+  }
 
-    // For cash payments, show the 3-column summary like:
-    // TOTAL ENTREGA CAMBIO
-    //  1.20   5.00   3.80
+  // Cash drawer open is triggered above in parallel with DB work.
+
+  // Customer display summary updates (non-critical)
+  try {
     if (paymentMethod === 'cash') {
+      // Show Total / Paid / Change in the cart section after receipt closes,
+      // but only when cash actually returns change.
+      try {
+        if (Number(changeAmount) > 0) {
+          const currencySymbol = systemSettings?.currency_symbol || '€';
+          queueCashierPaymentSummaryOverlay({
+            total,
+            paid: paymentAmount,
+            change: changeAmount,
+            currencySymbol,
+            autoHideMs: 60000
+          });
+
+          const receiptModal = document.getElementById('receiptModal');
+          const receiptOpen = !!(receiptModal && receiptModal.classList.contains('active'));
+          if (!receiptOpen) {
+            showCashierPaymentSummaryOverlay(pendingCashierPaySummary);
+            pendingCashierPaySummary = null;
+          }
+        }
+      } catch {
+        // ignore
+      }
+
       await updateCustomerDisplayPaymentSummary(total, paymentAmount, changeAmount);
       // Do not show 'Thank You' after payment summary; keep summary on display
     } else if (changeAmount > 0) {
       const currencySymbol = systemSettings?.currency_symbol || '€';
       await updateCustomerDisplayChange(changeAmount, currencySymbol);
       setTimeout(() => {
-        updateCustomerDisplayThankYou(changeAmount);
+        try {
+          updateCustomerDisplayThankYou(changeAmount);
+        } catch {
+          // ignore
+        }
       }, 3000);
     } else {
       updateCustomerDisplayThankYou(changeAmount);
     }
+  } catch (e) {
+    console.warn('Customer display post-payment update failed:', e);
+  }
 
-    // Clear cart
-    cart = [];
+  // Clear cart and related UI state
+  cart = [];
+  currentInvoiceNote = '';
 
-    // Clear invoice note
-    currentInvoiceNote = '';
+  const paymentInput = document.getElementById('paymentInput');
+  if (paymentInput) paymentInput.value = '';
 
-    // Clear payment input
-    const paymentInput = document.getElementById('paymentInput');
-    if (paymentInput) paymentInput.value = '';
+  selectedPaymentMethod = null;
+  paymentMode = 'single';
+  document.querySelectorAll('.numpad-btn').forEach(b => {
+    if (['cash', 'card', 'loan'].includes(b.dataset.value)) {
+      b.style.opacity = '0.8';
+      b.style.transform = 'scale(1)';
+    }
+  });
 
-    // Reset payment method selection
-    selectedPaymentMethod = null;
-    paymentMode = 'single';
-    document.querySelectorAll('.numpad-btn').forEach(b => {
-      if (['cash', 'card', 'loan'].includes(b.dataset.value)) {
-        b.style.opacity = '0.8';
-        b.style.transform = 'scale(1)';
-      }
-    });
+  updateCartDisplay();
 
-    updateCartDisplay();
-
-    // Reload products to update stock
+  // Reload products to update stock (non-critical)
+  try {
     await loadAllProducts();
     displayQuickProducts();
-  } catch (error) {
-    alert('Error completing sale: ' + error.message);
+  } catch (e) {
+    console.warn('Reload products after sale failed:', e);
   }
 }
 
@@ -3449,39 +7567,49 @@ function showReceipt(sale) {
   const modal = document.getElementById('receiptModal');
   const content = document.getElementById('receiptContent');
   
-  const date = new Date(sale.sale_date);
+  const date = parseAppDateTimeLoose(sale.sale_date);
   const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
   const companyAddress = systemSettings?.company_address || '';
   const currencySymbol = systemSettings?.currency_symbol || '€';
   const receiptFooter = systemSettings?.receipt_footer || 'Thank you for shopping with us!';
+
+  const resolveSaleItemTaxRate = (item) => {
+    let taxRate = Number(item?.tax_rate ?? item?.taxRate);
+    if (Number.isFinite(taxRate) && taxRate >= 0) return taxRate;
+
+    const product = getCachedProductById(item?.product_id ?? item?.productId);
+    const productTaxRate = Number(product?.tax_rate);
+    if (Number.isFinite(productTaxRate) && productTaxRate >= 0) return productTaxRate;
+
+    const category = product ? getCachedCategoryByName(product.category) : null;
+    const categoryTaxRate = Number(category?.tax_rate);
+    return Number.isFinite(categoryTaxRate) && categoryTaxRate >= 0 ? categoryTaxRate : 0;
+  };
   
   // Calculate tax breakdown by rate
   const taxBreakdown = {};
   sale.items.forEach(item => {
-    const product = allProducts.find(p => p.id === item.product_id);
-    if (product) {
-      const category = allCategories.find(c => c.name === product.category);
-      const taxRate = category ? category.tax_rate : 0;
-      const taxRatePercent = Math.round(taxRate * 100);
-      
-      // Calculate base and tax amount for this item
-      const basePrice = item.subtotal / (1 + taxRate);
-      const taxAmount = item.subtotal - basePrice;
-      
-      if (!taxBreakdown[taxRatePercent]) {
-        taxBreakdown[taxRatePercent] = {
-          base: 0,
-          tax: 0,
-          total: 0
-        };
-      }
-      
-      taxBreakdown[taxRatePercent].base += basePrice;
-      taxBreakdown[taxRatePercent].tax += taxAmount;
-      taxBreakdown[taxRatePercent].total += item.subtotal;
+    const subtotal = Number(item?.subtotal || 0);
+    if (!Number.isFinite(subtotal) || subtotal <= 0) return;
+
+    const taxRate = resolveSaleItemTaxRate(item);
+    const taxRatePercent = Math.round(taxRate * 100);
+    const basePrice = subtotal / (1 + taxRate);
+    const taxAmount = subtotal - basePrice;
+
+    if (!taxBreakdown[taxRatePercent]) {
+      taxBreakdown[taxRatePercent] = {
+        base: 0,
+        tax: 0,
+        total: 0
+      };
     }
+
+    taxBreakdown[taxRatePercent].base += basePrice;
+    taxBreakdown[taxRatePercent].tax += taxAmount;
+    taxBreakdown[taxRatePercent].total += subtotal;
   });
   
   // Generate tax breakdown HTML
@@ -3502,7 +7630,15 @@ function showReceipt(sale) {
       ${companyAddress ? `<p style="white-space: pre-line;">${companyAddress}</p>` : ''}
       <h3 style="margin-top: 10px;">FACTURA SIMPLIFICADA</h3>
       <p>Receipt #${sale.id}</p>
-      <p>${date.toLocaleString()}</p>
+      <p>${formatDateTimeWithDisplayTimeZone(date, 'en-GB', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      })}</p>
     </div>
     
     <div class="receipt-items">
@@ -3723,7 +7859,7 @@ function showLoanReceipt(sale, loan) {
   const modal = document.getElementById('receiptModal');
   const content = document.getElementById('receiptContent');
   
-  const date = new Date(sale.sale_date);
+  const date = parseAppDateTimeLoose(sale.sale_date);
   const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
@@ -3747,7 +7883,15 @@ function showLoanReceipt(sale, loan) {
       <h3 style="margin-top: 10px;">FACTURA SIMPLIFICADA</h3>
       <h3 style="color: #6E8FAF;">PARKING RECEIPT</h3>
       <p>Receipt #${loan.receipt_number}</p>
-      <p>${date.toLocaleString()}</p>
+      <p>${formatDateTimeWithDisplayTimeZone(date, 'en-GB', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      })}</p>
     </div>
     
     <div class="receipt-items">
@@ -3793,7 +7937,7 @@ function showLoanReceipt(sale, loan) {
 }
 
 // Function to complete parking payment from checkout page
-async function completeLoanPaymentFromCheckout(receiptNumber, amount, paymentMethod) {
+async function completeLoanPaymentFromCheckout(receiptNumber, amount, paymentMethod, options = {}) {
   try {
     // Get the loan by receipt number
     const loan = await window.api.getLoanByReceipt(receiptNumber);
@@ -3823,14 +7967,21 @@ async function completeLoanPaymentFromCheckout(receiptNumber, amount, paymentMet
     const result = await window.api.payLoan(loan.id, paymentData);
     
     console.log('Loan payment result:', result);
+
+    // If cash payment, open cash drawer ASAP (do not wait for printing)
+    if (paymentMethod === 'cash') {
+      openCashDrawer().catch(e => console.warn('Cash drawer open failed:', e));
+    }
     
     // Print receipt immediately at payment time
-    await printLoanPaymentReceipt({ loanBefore: loan, loanAfter: result, amount, paymentMethod });
-    
-    // If cash payment, open cash drawer
-    if (paymentMethod === 'cash') {
-      await openCashDrawer();
-    }
+    await printLoanPaymentReceipt({
+      loanBefore: loan,
+      loanAfter: result,
+      amount,
+      paymentMethod,
+      paymentAmount: options?.paymentAmount,
+      changeAmount: options?.changeAmount
+    });
 
     const currencySymbol = systemSettings?.currency_symbol || '€';
     
@@ -3851,12 +8002,27 @@ async function completeLoanPaymentFromCheckout(receiptNumber, amount, paymentMet
 // Function to handle parking payment in checkout page
 async function payParkingInCheckout(receiptNumber, remainingAmount) {
   try {
-    // Store parking payment info for checkout
-    sessionStorage.setItem('parkingPayment', JSON.stringify({
+    // Store parking payment info for checkout (include party details for banner)
+    let loanForCtx = null;
+    try {
+      loanForCtx = await window.api.getLoanByReceipt(receiptNumber);
+    } catch {
+      loanForCtx = null;
+    }
+
+    setParkingPaymentContext({
       receiptNumber: receiptNumber,
       amount: remainingAmount,
+      remainingAmount: Number(loanForCtx?.remaining_amount ?? remainingAmount ?? 0),
+      status: (loanForCtx?.status || '').toString().toLowerCase(),
+      customerType: (loanForCtx?.customer_type || '').toString().toLowerCase(),
+      restaurantName: loanForCtx?.restaurant_name || null,
+      customerName: loanForCtx?.customer_name || null,
+      customerPhone: loanForCtx?.customer_phone || null,
       timestamp: Date.now()
-    }));
+    });
+
+    try { updateParkingContextBanner(); } catch { /* ignore */ }
     
     // Navigate to checkout page using the correct method
     // Update active nav button
@@ -3881,19 +8047,21 @@ async function payParkingInCheckout(receiptNumber, remainingAmount) {
     setTimeout(async () => {
       try {
         // Get the original parking/loan details to show individual items
-        const loan = await window.api.getLoanByReceipt(receiptNumber);
+        const loan = loanForCtx || await window.api.getLoanByReceipt(receiptNumber);
         if (loan && loan.sale && loan.sale.items) {
           // Use the original sale items from the parking transaction
           cart = loan.sale.items.map(item => ({
             productId: item.product_id || `parking_item_${Date.now()}_${Math.random()}`,
             productName: item.product_name || 'Parking Item',
-            unitPrice: item.price || (item.subtotal / item.quantity),
+            saleItemId: item.id,
+            loanId: loan.id,
+            unitPrice: item.unit_price || item.price || (item.subtotal / item.quantity),
             taxRate: item.tax_rate || 0,
             quantity: item.quantity || 1,
             subtotal: item.subtotal || item.price || 0,
-            isWeightBased: item.unit_type === 'weight',
+            isWeightBased: POS_DISABLE_SCALE_AND_WEIGHT ? false : (item.unit_type === 'weight'),
             cartItemId: Date.now() + Math.random(), // Unique ID for each item
-            discountPercent: 0
+            discountPercent: Number(item.discount_percent || 0)
           }));
         } else {
           // Fallback to single parking payment item if we can't get original items
@@ -3938,7 +8106,7 @@ async function payParkingInCheckout(receiptNumber, remainingAmount) {
     
   } catch (error) {
     console.error('Error redirecting to parking payment:', error);
-    alert('Error processing parking payment: ' + error.message);
+    showAlert('Error processing parking payment: ' + error.message, 'error');
   }
 }
 
@@ -3966,6 +8134,36 @@ async function searchLoanByReceipt(receiptNumber) {
   } catch (error) {
     alert('Error searching for PARKING: ' + error.message);
   }
+}
+
+async function handleLoanSearchSubmit(rawQuery) {
+  const query = String(rawQuery || '').trim();
+
+  // Empty search = reset back to default list for current tab.
+  if (!query) {
+    currentLoansSearchQuery = '';
+    await loadLoansView(currentLoansStatus || 'active');
+    return;
+  }
+
+  // 1) Quick path: exact receipt number match -> open Pay modal.
+  // 2) Otherwise: filter the PARKING list by receipt/customer/restaurant/phone.
+  try {
+    const loan = await window.api.getLoanByReceipt(query);
+    if (loan) {
+      if (String(loan.status || '').toLowerCase() === 'paid') {
+        showAlert('This PARKING has already been paid in full', 'info');
+      } else {
+        showLoanPaymentModal(loan);
+        return;
+      }
+    }
+  } catch {
+    // ignore; fall back to list search
+  }
+
+  currentLoansSearchQuery = query;
+  await loadLoansView(currentLoansStatus || 'active');
 }
 
 function showLoanPaymentModal(loan) {
@@ -4011,7 +8209,7 @@ function showLoanPaymentModal(loan) {
       </div>` : ''}
       <div class="loan-detail-row">
         <span>Date:</span>
-        <span>${loanDate.toLocaleDateString()}</span>
+        <span>${formatDateWithDisplayTimeZone(loanDate, 'en-GB')}</span>
       </div>
       <div class="loan-detail-row" style="margin-top: 10px; padding-top: 10px; border-top: 2px solid #ddd;">
         <span>Total Amount:</span>
@@ -4101,7 +8299,7 @@ function showLoanPaymentModal(loan) {
   modal.classList.add('active');
 }
 
-async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentMethod }) {
+async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentMethod, paymentAmount, changeAmount }) {
   try {
     if (!systemSettings) {
       systemSettings = await window.api.getSystemSettings();
@@ -4138,6 +8336,8 @@ async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentM
     // STANDARD RECEIPT FORMAT (same as cash/card)
     const loanReceiptNumber = after.receipt_number ?? before.receipt_number ?? '';
     const amountPaid = Number(amount ?? 0);
+    const tendered = Number(paymentAmount);
+    const change = Number(changeAmount);
     const remainingAfter = Number(after.remaining_amount ?? 0);
     const loanTotal = Number(after.loan_amount ?? before.loan_amount ?? 0);
     const status = (after.status ?? before.status ?? '').toString().toLowerCase();
@@ -4174,8 +8374,8 @@ async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentM
         let taxRate = Number(item.taxRate);
         if (!Number.isFinite(taxRate)) {
           const pid = item.productId;
-          const product = allProducts.find(p => p.id === pid);
-          const category = product ? allCategories.find(c => c.name === product.category) : null;
+          const product = getCachedProductById(pid);
+          const category = product ? getCachedCategoryByName(product.category) : null;
           taxRate = category ? Number(category.tax_rate) : 0;
         }
         if (!Number.isFinite(taxRate) || taxRate < 0) taxRate = 0;
@@ -4210,14 +8410,21 @@ async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentM
       companyAddress: systemSettings?.company_address || '',
       lineWidth: looks80mm ? 48 : undefined,
 
+      customerType: after.customer_type ?? before.customer_type ?? null,
+      customerName: after.customer_name ?? before.customer_name ?? null,
+      customerPhone: after.customer_phone ?? before.customer_phone ?? null,
+      restaurantName: after.restaurant_name ?? before.restaurant_name ?? null,
+      restaurantNie: after.restaurant_nie ?? before.restaurant_nie ?? null,
+
       receiptId: loanReceiptNumber,
-      date: new Date().toLocaleString(),
+      // Use ISO timestamp and let the main process format it in the correct timezone.
+      dateIso: new Date().toISOString(),
       items: itemsForReceipt,
       taxBreakdown: taxBreakdownRows,
       total,
       paymentMethod,
-      paymentAmount: amountPaid || total,
-      changeAmount: 0,
+      paymentAmount: (Number.isFinite(tendered) ? tendered : (amountPaid || total)),
+      changeAmount: (Number.isFinite(change) ? change : 0),
       currency: currencySymbol,
       footer: systemSettings?.receipt_footer || 'Thank you for shopping with us!',
       cashier: currentUser?.full_name || ''
@@ -4250,13 +8457,13 @@ async function completeLoanPayment(loanOrId, amount, paymentMethod) {
     
     const result = await window.api.payLoan(loanId, paymentData);
 
+    // If cash payment, open cash drawer ASAP (do not wait for printing)
+    if (paymentMethod === 'cash') {
+      openCashDrawer().catch(e => console.warn('Cash drawer open failed:', e));
+    }
+
     // Print receipt immediately at payment time
     await printLoanPaymentReceipt({ loanBefore, loanAfter: result, amount, paymentMethod });
-    
-    // If cash payment, open cash drawer
-    if (paymentMethod === 'cash') {
-      openCashDrawer();
-    }
     
     // Close payment modal
     document.getElementById('loanPaymentModal').classList.remove('active');
@@ -4277,16 +8484,15 @@ async function completeLoanPayment(loanOrId, amount, paymentMethod) {
   }
 }
 
-async function loadLoansView(status = null) {
-  const loans = await window.api.getAllLoans(status);
+function renderLoansTable(loans) {
   const tbody = document.querySelector('#loansTable tbody');
   const currencySymbol = systemSettings?.currency_symbol || '€';
-  
-  if (loans.length === 0) {
+
+  if (!Array.isArray(loans) || loans.length === 0) {
     tbody.innerHTML = '<tr><td colspan="10" class="empty-state"><div class="icon">💳</div><p>No Parking orders found</p></td></tr>';
     return;
   }
-  
+
   tbody.innerHTML = loans.map(loan => {
     const loanDate = (loan.status === 'paid' && loan.paid_date)
       ? new Date(loan.paid_date)
@@ -4294,26 +8500,30 @@ async function loadLoansView(status = null) {
     let statusClass = 'status-pending';
     if (loan.status === 'paid') statusClass = 'status-paid';
     else if (loan.status === 'partial') statusClass = 'status-partial';
-    
+
     const customerType = loan.customer_type === 'restaurant' ? '🍽️ Restaurant' : '👤 Regular';
-    const displayName = loan.customer_type === 'restaurant' && loan.restaurant_name 
-      ? `${loan.restaurant_name}<br><small>${loan.customer_name}</small>` 
+    const displayName = loan.customer_type === 'restaurant' && loan.restaurant_name
+      ? `${loan.restaurant_name}<br><small>${loan.customer_name}</small>`
       : loan.customer_name;
-    
+
+    const loanAmount = Number(loan.loan_amount || 0);
+    const paidAmount = Number(loan.paid_amount || 0);
+    const remainingAmount = Number(loan.remaining_amount || 0);
+
     return `
       <tr>
         <td>${loan.receipt_number}</td>
         <td>${customerType}</td>
         <td>${displayName}</td>
         <td>${loan.customer_phone || '-'}</td>
-        <td>${currencySymbol}${loan.loan_amount.toFixed(2)}</td>
-        <td>${currencySymbol}${loan.paid_amount.toFixed(2)}</td>
-        <td>${currencySymbol}${loan.remaining_amount.toFixed(2)}</td>
-        <td><span class="status-badge ${statusClass}">${loan.status.toUpperCase()}</span></td>
-        <td>${loanDate.toLocaleDateString()}</td>
+        <td>${currencySymbol}${loanAmount.toFixed(2)}</td>
+        <td>${currencySymbol}${paidAmount.toFixed(2)}</td>
+        <td>${currencySymbol}${remainingAmount.toFixed(2)}</td>
+        <td><span class="status-badge ${statusClass}">${String(loan.status || '').toUpperCase()}</span></td>
+        <td>${formatDateWithDisplayTimeZone(loanDate, 'en-GB')}</td>
         <td>
-          ${loan.status !== 'paid'
-            ? `<button class="btn-action" onclick="payParkingInCheckout('${loan.receipt_number}', ${loan.remaining_amount})">Pay</button>`
+          ${String(loan.status || '').toLowerCase() !== 'paid'
+            ? `<button class="btn-action" onclick="payParkingInCheckout('${loan.receipt_number}', ${remainingAmount})">Pay</button>`
             : (loan.sale_id
               ? `
                 <button class="btn-action" onclick="viewParkingBillForLoan(${loan.sale_id})" title="View">👁️</button>
@@ -4324,6 +8534,18 @@ async function loadLoansView(status = null) {
       </tr>
     `;
   }).join('');
+}
+
+async function loadLoansView(status = null) {
+  const effectiveStatus = status || currentLoansStatus || 'active';
+  currentLoansStatus = effectiveStatus;
+
+  const q = String(currentLoansSearchQuery || '').trim();
+  const loans = q
+    ? await window.api.searchLoans(q, effectiveStatus)
+    : await window.api.getAllLoans(effectiveStatus);
+
+  renderLoansTable(loans);
 }
 
 function normalizePaidParkingSaleForReceipt(sale) {
@@ -4372,43 +8594,1147 @@ async function printParkingBillForLoan(saleId) {
   }
 }
 
+// ============== OPEN FOOD FACTS / GS1 BARCODE AUTO-LOOKUP ==============
+let _offLookupCache = {};
+
+async function lookupBarcodeOpenFoodFacts(barcode) {
+  const bc = String(barcode || '').replace(/\s+/g, '').trim();
+  if (!bc || bc.length < 6) return null;
+  if (_offLookupCache[bc] !== undefined) return _offLookupCache[bc];
+  try {
+    const url = `https://world.openfoodfacts.org/api/v0/product/${encodeURIComponent(bc)}.json`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) { _offLookupCache[bc] = null; return null; }
+    const data = await res.json();
+    if (data.status !== 1 || !data.product) { _offLookupCache[bc] = null; return null; }
+    const p = data.product;
+    const result = {
+      name: p.product_name_en || p.product_name || p.product_name_fr || p.product_name_es || '',
+      category: p.categories_tags?.[0]?.replace(/^en:/, '').replace(/-/g,' ').replace(/\b\w/g, c => c.toUpperCase()) || '',
+      brand: p.brands || '',
+      image: p.image_small_url || p.image_url || '',
+    };
+    _offLookupCache[bc] = result;
+    return result;
+  } catch {
+    _offLookupCache[bc] = null;
+    return null;
+  }
+}
+
+function attachBarcodeLookupToProductModal() {
+  const barcodeEl = document.getElementById('productBarcode');
+  if (!barcodeEl || barcodeEl.dataset.offLookupAttached) return;
+  barcodeEl.dataset.offLookupAttached = '1';
+
+  // Create a status badge below the barcode input
+  let badge = document.getElementById('barcodeLookupBadge');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.id = 'barcodeLookupBadge';
+    badge.style.cssText = 'display:none; margin-top:6px; padding:8px 12px; border-radius:8px; font-size:12px; font-weight:700; align-items:center; gap:8px; flex-wrap:wrap;';
+    barcodeEl.parentElement?.appendChild(badge);
+  }
+
+  let lookupTimer = null;
+
+  const doLookup = async (bc) => {
+    if (!bc || bc.length < 8) { badge.style.display = 'none'; return; }
+    badge.style.background = '#f0f9ff';
+    badge.style.border = '1.5px solid #bae6fd';
+    badge.style.color = '#0369a1';
+    badge.style.display = 'flex';
+    badge.innerHTML = '<span style="display:inline-block;">&#8987;</span>&nbsp; Looking up barcode on Open Food Facts&hellip;';
+
+    const result = await lookupBarcodeOpenFoodFacts(bc);
+
+    if (!result || !result.name) {
+      badge.style.background = '#fef9c3';
+      badge.style.border = '1.5px solid #fde047';
+      badge.style.color = '#713f12';
+      badge.innerHTML = '&#9888;&#65039; Not found in Open Food Facts. Enter details manually.';
+      return;
+    }
+
+    const nameEl = document.getElementById('productName');
+    const catEl  = document.getElementById('productCategory');
+    badge.style.background = '#f0fdf4';
+    badge.style.border = '1.5px solid #bbf7d0';
+    badge.style.color = '#14532d';
+    badge.innerHTML = `
+      <span>&#9989; Found: <b>${result.name}</b>${result.brand ? ` &mdash; ${result.brand}` : ''}${result.category ? ` (${result.category})` : ''}</span>
+      <button id="barcodeApplyLookup" style="margin-left:auto; background:#16a34a; color:#fff; border:none; border-radius:6px; padding:4px 14px; font-size:11px; font-weight:800; cursor:pointer; white-space:nowrap;">&#8598; Apply</button>
+    `;
+    document.getElementById('barcodeApplyLookup')?.addEventListener('click', () => {
+      if (nameEl) {
+        if (!nameEl.value.trim() || confirm(`Replace current name "${nameEl.value}" with "${result.name}"?`)) {
+          nameEl.value = result.name;
+        }
+      }
+      if (catEl && result.category) {
+        const opts = Array.from(catEl.options || []);
+        const key = result.category.toLowerCase().substring(0, 5);
+        const match = opts.find(o => o.text.toLowerCase().includes(key));
+        if (match) catEl.value = match.value;
+      }
+      const btn = document.getElementById('barcodeApplyLookup');
+      if (btn) btn.outerHTML = '<span style="color:#16a34a; margin-left:auto;">&#10003; Applied</span>';
+    });
+  };
+
+  barcodeEl.addEventListener('input', () => {
+    clearTimeout(lookupTimer);
+    const bc = barcodeEl.value.replace(/\s+/g, '').trim();
+    if (bc.length < 8) { badge.style.display = 'none'; return; }
+    lookupTimer = setTimeout(() => doLookup(bc), 700);
+  });
+
+  barcodeEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      clearTimeout(lookupTimer);
+      const bc = barcodeEl.value.replace(/\s+/g, '').trim();
+      doLookup(bc);
+    }
+  });
+}
+
+// ============== BULK BARCODE UPLOAD ==============
+function clearBulkCsv() {
+  window._bulkUploadRows = null;
+  const fileInput = document.getElementById('bulkUploadFileInput');
+  if (fileInput) fileInput.value = '';
+  const previewWrap = document.getElementById('bulkUploadPreviewWrap');
+  if (previewWrap) previewWrap.style.display = 'none';
+  const importBtn = document.getElementById('bulkUploadImportBtn');
+  if (importBtn) { importBtn.disabled = true; importBtn.style.opacity = '0.5'; }
+}
+
+function openBulkUploadOverlay() {
+  const overlay = document.getElementById('bulkUploadOverlay');
+  if (!overlay) return;
+  // Reset state
+  window._bulkUploadRows = null;
+  window._bulkImgRows = [];
+  window._bulkActiveTab = 'csv';
+  clearBulkCsv();
+  clearBulkImages();
+  switchBulkTab('csv');
+  const progress = document.getElementById('bulkUploadProgress');
+  if (progress) progress.style.display = 'none';
+  overlay.style.display = 'flex';
+
+  // Drag & drop — CSV dropzone
+  const dropzone = document.getElementById('bulkUploadDropzone');
+  if (dropzone && !dropzone.dataset.dndAttached) {
+    dropzone.dataset.dndAttached = '1';
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.style.borderColor = '#2563eb'; dropzone.style.background = '#eff6ff'; });
+    dropzone.addEventListener('dragleave', () => { dropzone.style.borderColor = '#93c5fd'; dropzone.style.background = '#f8faff'; });
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.style.borderColor = '#93c5fd';
+      dropzone.style.background = '#f8faff';
+      const file = e.dataTransfer?.files?.[0];
+      if (file) handleBulkUploadFile(file);
+    });
+  }
+  // Drag & drop — Image dropzone
+  const imgDz = document.getElementById('imgDropzone');
+  if (imgDz && !imgDz.dataset.dndAttached) {
+    imgDz.dataset.dndAttached = '1';
+    imgDz.addEventListener('dragover', (e) => { e.preventDefault(); imgDz.style.background = '#ede9fe'; });
+    imgDz.addEventListener('dragleave', () => { imgDz.style.background = '#faf5ff'; });
+    imgDz.addEventListener('drop', (e) => {
+      e.preventDefault(); imgDz.style.background = '#faf5ff';
+      const dropped = e.dataTransfer.files;
+      if (dropped && dropped.length) handleBulkImageFiles(dropped);
+    });
+  }
+}
+function closeBulkUploadOverlay() {
+  const overlay = document.getElementById('bulkUploadOverlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function downloadBulkUploadTemplate() {
+  const header = 'barcode,name,price,category,tax,stock,cost,unit_type';
+  const example = '5901234123457,Coca Cola 330ml,1.99,Drinks,21,100,0.80,quantity\n4006381333931,Banana 1kg,0.99,Fruits,10,50,0.40,weight';
+  const blob = new Blob([header + '\n' + example], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'bulk_upload_template.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function handleBulkUploadFile(file) {
+  if (!file) return;
+  const name = (file.name || '').toLowerCase();
+  const isXlsx = name.endsWith('.xlsx') || name.endsWith('.xls') ||
+    file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+    file.type === 'application/vnd.ms-excel';
+
+  const onRows = (rows) => {
+    if (!rows || rows.length === 0) {
+      showAlert('No valid rows found. Make sure you have a "barcode" column.', 'error', 'Parse Error');
+      return;
+    }
+    window._bulkUploadRows = rows;
+    renderBulkUploadPreview(rows);
+    const importBtn = document.getElementById('bulkUploadImportBtn');
+    if (importBtn) { importBtn.disabled = false; importBtn.style.opacity = '1'; }
+  };
+
+  if (isXlsx) {
+    _loadSheetJS().then(() => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const sheetName = workbook.SheetNames[0];
+          const sheet = workbook.Sheets[sheetName];
+          const jsonRows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+          onRows(parseRowObjects(jsonRows));
+        } catch (err) {
+          showAlert('Failed to parse Excel file: ' + err.message, 'error', 'Parse Error');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }).catch(() => showAlert('Could not load Excel parser. Please use CSV format.', 'error'));
+  } else {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try { onRows(parseBulkUploadCSV(e.target.result)); }
+      catch (err) { showAlert('Failed to parse CSV: ' + err.message, 'error', 'Parse Error'); }
+    };
+    reader.readAsText(file, 'UTF-8');
+  }
+}
+
+let _sheetJSLoaded = false;
+function _loadSheetJS() {
+  if (typeof XLSX !== 'undefined') return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+    s.onload = () => { _sheetJSLoaded = true; resolve(); };
+    s.onerror = () => {
+      const s2 = document.createElement('script');
+      s2.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+      s2.onload = () => { _sheetJSLoaded = true; resolve(); };
+      s2.onerror = reject;
+      document.head.appendChild(s2);
+    };
+    document.head.appendChild(s);
+  });
+}
+
+function parseRowObjects(jsonRows) {
+  return jsonRows.map(row => {
+    const r = {};
+    for (const k of Object.keys(row)) r[k.toString().trim().toLowerCase()] = row[k];
+    const barcode = String(r['barcode'] || '').replace(/\s+/g, '').trim();
+    if (!barcode) return null;
+    const price  = parseFloat(String(r['price']  || '0').replace(',', '.'));
+    const taxPct = parseFloat(String(r['tax']    || '21').replace(',', '.'));
+    const stock  = parseFloat(String(r['stock']  || '0').replace(',', '.'));
+    const cost   = parseFloat(String(r['cost']   || '0').replace(',', '.'));
+    const unitType = ['quantity','weight'].includes(String(r['unit_type'] || '').toLowerCase().trim())
+      ? String(r['unit_type']).toLowerCase().trim() : 'quantity';
+    return {
+      barcode,
+      name: String(r['name'] || barcode).trim(),
+      price:    isNaN(price)  ? 0 : price,
+      category: String(r['category'] || '').trim() || null,
+      tax_rate: (isNaN(taxPct) ? 21 : taxPct) / 100,
+      purchase_tax_rate: (isNaN(taxPct) ? 21 : taxPct) / 100,
+      stock: isNaN(stock) ? 0 : stock,
+      cost:  isNaN(cost)  ? 0 : cost,
+      unit_type: unitType,
+      regular_price: isNaN(price) ? 0 : price,
+      show_in_checkout: 1,
+      weight_unit: 'kg',
+      quantity_unit: 'piece',
+    };
+  }).filter(Boolean);
+}
+
+function parseBulkUploadCSV(text) {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  if (lines.length < 2) return [];
+
+  function splitCSVLine(line) {
+    const result = []; let cur = '', inQuote = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuote = !inQuote; continue; }
+      if (ch === ',' && !inQuote) { result.push(cur.trim()); cur = ''; continue; }
+      cur += ch;
+    }
+    result.push(cur.trim());
+    return result;
+  }
+
+  const header = splitCSVLine(lines[0]).map(h => h.toLowerCase());
+  if (!header.includes('barcode')) throw new Error('CSV must have a "barcode" column header in the first row.');
+  const jsonRows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim(); if (!line) continue;
+    const cols = splitCSVLine(line);
+    const obj = {};
+    header.forEach((h, idx) => { obj[h] = cols[idx] ?? ''; });
+    jsonRows.push(obj);
+  }
+  return parseRowObjects(jsonRows);
+}
+
+function renderBulkUploadPreview(rows) {
+  const previewWrap = document.getElementById('bulkUploadPreviewWrap');
+  const title       = document.getElementById('bulkUploadPreviewTitle');
+  const thead       = document.getElementById('bulkUploadPreviewHead');
+  const tbody       = document.getElementById('bulkUploadPreviewBody');
+  if (!previewWrap || !thead || !tbody) return;
+
+  title.textContent = `Preview: ${rows.length} product(s) to import`;
+
+  thead.innerHTML = `<tr>${['Barcode','Name','Price','Category','Tax%','Stock','Unit Type'].map(h =>
+    `<th style="padding:8px 10px; font-size:11px; font-weight:800; letter-spacing:.5px;">${h}</th>`).join('')}</tr>`;
+
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  tbody.innerHTML = rows.slice(0, 200).map((r, i) => `
+    <tr style="background:${i % 2 === 0 ? '#f8fafc' : '#fff'};">
+      <td style="padding:6px 10px; font-family:monospace; font-size:11px;">${r.barcode}</td>
+      <td style="padding:6px 10px; font-size:12px;">${r.name}</td>
+      <td style="padding:6px 10px; font-size:12px;">${currencySymbol}${Number(r.price).toFixed(2)}</td>
+      <td style="padding:6px 10px; font-size:12px;">${r.category || '—'}</td>
+      <td style="padding:6px 10px; font-size:12px;">${Math.round(Number(r.tax_rate) * 100)}%</td>
+      <td style="padding:6px 10px; font-size:12px;">${r.stock}</td>
+      <td style="padding:6px 10px; font-size:12px;">${r.unit_type}</td>
+    </tr>`).join('');
+
+  if (rows.length > 200) {
+    tbody.innerHTML += `<tr><td colspan="7" style="padding:8px 10px; color:#64748b; font-size:11px; text-align:center;">… and ${rows.length - 200} more rows</td></tr>`;
+  }
+
+  previewWrap.style.display = 'block';
+}
+
+async function startBulkUpload() {
+  const rows = window._bulkUploadRows;
+  if (!rows || rows.length === 0) return;
+
+  const importBtn = document.getElementById('bulkUploadImportBtn');
+  if (importBtn) { importBtn.disabled = true; importBtn.style.opacity = '0.5'; }
+
+  const progress     = document.getElementById('bulkUploadProgress');
+  const progressBar  = document.getElementById('bulkUploadProgressBar');
+  const progressLabel = document.getElementById('bulkUploadProgressLabel');
+  const progressCount = document.getElementById('bulkUploadProgressCount');
+  const progressResults = document.getElementById('bulkUploadProgressResults');
+  if (progress) progress.style.display = 'block';
+  if (progressResults) progressResults.innerHTML = '';
+
+  const BATCH = 20;
+  let created = 0, skipped = 0, errors = [];
+  const total = rows.length;
+
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    try {
+      const res = await window.api.bulkAddProducts(batch);
+      created += res.created || 0;
+      skipped += res.skipped || 0;
+      errors = errors.concat(res.errors || []);
+    } catch (e) {
+      errors.push({ barcode: '(batch)', error: String(e?.message || e) });
+    }
+    const done = Math.min(i + BATCH, total);
+    const pct = Math.round((done / total) * 100);
+    if (progressBar)  progressBar.style.width  = pct + '%';
+    if (progressCount) progressCount.textContent = `${done} / ${total}`;
+    if (progressLabel) progressLabel.textContent = `Importing… (${pct}%)`;
+  }
+
+  if (progressLabel) progressLabel.textContent = `✅ Done!`;
+  if (progressBar)   progressBar.style.background = 'linear-gradient(90deg,#16a34a,#22c55e)';
+
+  let summary = `<div style="padding:8px 12px; background:#f0fdf4; border:1.5px solid #bbf7d0; border-radius:8px; margin-bottom:8px;">
+    <b style="color:#15803d;">✅ Created: ${created}</b> &nbsp;|&nbsp;
+    <span style="color:#64748b;">⏭ Skipped (already exist): ${skipped}</span>
+    ${errors.length ? ` &nbsp;|&nbsp; <span style="color:#dc2626;">❌ Errors: ${errors.length}</span>` : ''}
+  </div>`;
+  if (errors.length) {
+    summary += errors.slice(0, 10).map(e =>
+      `<div style="color:#dc2626; font-size:11px; padding:2px 4px;">❌ ${e.barcode}: ${e.error}</div>`
+    ).join('');
+    if (errors.length > 10) summary += `<div style="color:#64748b; font-size:11px;">… and ${errors.length - 10} more errors</div>`;
+  }
+  if (progressResults) progressResults.innerHTML = summary;
+
+  // Refresh products list
+  try { await loadProductsView(); } catch { /* ignore */ }
+
+  if (importBtn) { importBtn.disabled = false; importBtn.style.opacity = '1'; importBtn.textContent = '✅ Done — Upload More'; }
+}
+
+// ============== BULK IMAGE TAB ==============
+
+function switchBulkTab(tab) {
+  const csvTab = document.getElementById('bulkTabCsv');
+  const imgTab = document.getElementById('bulkTabImg');
+  const csvPanel = document.getElementById('bulkPanelCsv');
+  const imgPanel = document.getElementById('bulkPanelImg');
+  if (!csvTab || !imgTab) return;
+  if (tab === 'csv') {
+    csvTab.style.borderBottomColor = '#2563eb'; csvTab.style.color = '#2563eb';
+    imgTab.style.borderBottomColor = 'transparent'; imgTab.style.color = '#64748b';
+    if (csvPanel) csvPanel.style.display = '';
+    if (imgPanel) imgPanel.style.display = 'none';
+    // enable import btn only if csv rows loaded
+    const importBtn = document.getElementById('bulkUploadImportBtn');
+    if (importBtn) {
+      const hasRows = window._bulkUploadRows && window._bulkUploadRows.length > 0;
+      importBtn.disabled = !hasRows;
+      importBtn.style.opacity = hasRows ? '1' : '0.5';
+    }
+  } else {
+    imgTab.style.borderBottomColor = '#7c3aed'; imgTab.style.color = '#7c3aed';
+    csvTab.style.borderBottomColor = 'transparent'; csvTab.style.color = '#64748b';
+    if (imgPanel) imgPanel.style.display = '';
+    if (csvPanel) csvPanel.style.display = 'none';
+    // enable import btn only if image scan rows loaded
+    const importBtn = document.getElementById('bulkUploadImportBtn');
+    if (importBtn) {
+      const hasRows = window._bulkImgRows && window._bulkImgRows.length > 0;
+      importBtn.disabled = !hasRows;
+      importBtn.style.opacity = hasRows ? '1' : '0.5';
+    }
+  }
+  window._bulkActiveTab = tab;
+}
+
+function clearBulkImages() {
+  window._bulkImgRows = [];
+  const body = document.getElementById('imgScanBody');
+  if (body) body.innerHTML = '';
+  const results = document.getElementById('imgScanResults');
+  if (results) results.style.display = 'none';
+  const progress = document.getElementById('imgScanProgress');
+  if (progress) progress.style.display = 'none';
+  const fileInput = document.getElementById('bulkImgFileInput');
+  if (fileInput) fileInput.value = '';
+  const importBtn = document.getElementById('bulkUploadImportBtn');
+  if (importBtn) { importBtn.disabled = true; importBtn.style.opacity = '0.5'; }
+}
+
+async function _loadQuagga() {
+  if (window.Quagga) return window.Quagga;
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.2.6/lib/quagga.min.js';
+    s.onload = () => resolve(window.Quagga);
+    s.onerror = () => reject(new Error('Quagga2 load failed'));
+    document.head.appendChild(s);
+  });
+}
+
+function _quaggaDecode(src) {
+  return new Promise((resolve) => {
+    window.Quagga.decodeSingle({
+      decoder: {
+        readers: ['ean_reader', 'ean_8_reader', 'upc_reader', 'upc_e_reader', 'code_128_reader', 'code_39_reader']
+      },
+      locate: true,
+      src: src
+    }, function(result) {
+      if (result && result.codeResult && result.codeResult.code) {
+        resolve(result.codeResult.code);
+      } else {
+        resolve(null);
+      }
+    });
+  });
+}
+
+async function handleBulkImageFiles(files) {
+  if (!files || !files.length) return;
+  window._bulkImgRows = [];
+  const resultsDiv = document.getElementById('imgScanResults');
+  const progressDiv = document.getElementById('imgScanProgress');
+  const progressLabel = document.getElementById('imgScanProgressLabel');
+  const progressCount = document.getElementById('imgScanProgressCount');
+  const progressBar = document.getElementById('imgScanProgressBar');
+  const body = document.getElementById('imgScanBody');
+  const title = document.getElementById('imgScanTitle');
+  const importBtn = document.getElementById('bulkUploadImportBtn');
+
+  if (body) body.innerHTML = '';
+  if (resultsDiv) resultsDiv.style.display = 'none';
+  if (progressDiv) progressDiv.style.display = '';
+  if (progressLabel) progressLabel.textContent = 'Loading barcode scanner\u2026';
+  if (progressCount) progressCount.textContent = `0 / ${files.length}`;
+  if (progressBar) progressBar.style.width = '0%';
+
+  try {
+    await _loadQuagga();
+  } catch {
+    alert('Could not load barcode scanner library. Check your internet connection.');
+    if (progressDiv) progressDiv.style.display = 'none';
+    return;
+  }
+
+  let done = 0;
+  const rows = [];
+
+  for (const file of Array.from(files)) {
+    done++;
+    if (progressLabel) progressLabel.textContent = `Scanning ${file.name}\u2026`;
+    if (progressCount) progressCount.textContent = `${done} / ${files.length}`;
+    if (progressBar) progressBar.style.width = `${Math.round(done / files.length * 100)}%`;
+
+    let barcode = null;
+    let statusHtml = '';
+    let nameHtml = '<span style="color:#94a3b8">\u2014</span>';
+    let thumbUrl = '';
+
+    try {
+      thumbUrl = await new Promise((res) => {
+        const fr = new FileReader();
+        fr.onload = e => res(e.target.result);
+        fr.readAsDataURL(file);
+      });
+
+      // Try decode with Quagga2
+      barcode = await _quaggaDecode(thumbUrl);
+
+      // If Quagga fails, try on a sharpened/contrast-boosted canvas version
+      if (!barcode) {
+        const imgEl = await new Promise((res, rej) => {
+          const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = thumbUrl;
+        });
+        for (const scale of [2, 1.5, 0.75]) {
+          const c = document.createElement('canvas');
+          c.width = Math.round(imgEl.naturalWidth * scale);
+          c.height = Math.round(imgEl.naturalHeight * scale);
+          const ctx = c.getContext('2d');
+          ctx.filter = 'contrast(1.4) brightness(1.1)';
+          ctx.drawImage(imgEl, 0, 0, c.width, c.height);
+          barcode = await _quaggaDecode(c.toDataURL('image/png'));
+          if (barcode) break;
+        }
+      }
+
+      if (barcode) {
+        statusHtml = '<span style="color:#16a34a; font-weight:700;">\u2705 Detected</span>';
+      } else {
+        statusHtml = '<span style="color:#dc2626; font-weight:700;">\u274c No barcode</span>';
+      }
+    } catch {
+      statusHtml = '<span style="color:#dc2626; font-weight:700;">\u274c No barcode</span>';
+    }
+
+    // Lookup name
+    let productName = '';
+    let category = '';
+    if (barcode) {
+      try {
+        const info = await lookupBarcodeOpenFoodFacts(barcode);
+        if (info && info.name) {
+          productName = info.name;
+          category = info.category || '';
+          nameHtml = `<span style="color:#0f172a; font-weight:600;">${info.name}</span>`;
+        } else {
+          nameHtml = '<span style="color:#94a3b8;">Not found</span>';
+        }
+      } catch {
+        nameHtml = '<span style="color:#94a3b8;">Lookup failed</span>';
+      }
+    }
+
+    const row = { barcode, name: productName, category, price: 0, tax: 0, stock: 0, cost: 0, unit_type: 'unit', _file: file.name, _ok: !!barcode };
+    rows.push(row);
+
+    if (body) {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid #f1f5f9';
+      tr.innerHTML = `
+        <td style="padding:7px 10px; width:52px;"><img src="${thumbUrl}" style="width:44px; height:36px; object-fit:contain; border-radius:4px; border:1px solid #e2e8f0;"></td>
+        <td style="padding:7px 10px; font-family:monospace; font-weight:700; color:#1e40af;">${barcode || '<span style="color:#94a3b8;">\u2014</span>'}</td>
+        <td style="padding:7px 10px;">${nameHtml}</td>
+        <td style="padding:7px 10px;">${statusHtml}</td>`;
+      body.appendChild(tr);
+    }
+  }
+
+  if (progressDiv) progressDiv.style.display = 'none';
+  if (resultsDiv) resultsDiv.style.display = '';
+
+  const good = rows.filter(r => r._ok);
+  if (title) title.textContent = `${files.length} image${files.length > 1 ? 's' : ''} scanned \u2014 ${good.length} barcode${good.length !== 1 ? 's' : ''} found`;
+
+  window._bulkImgRows = good;
+  if (window._bulkActiveTab === 'img') {
+    window._bulkUploadRows = good.map(r => ({
+      barcode: r.barcode, name: r.name || r.barcode, price: 0, category: r.category || '',
+      tax: 0, stock: 0, cost: 0, unit_type: 'unit'
+    }));
+  }
+
+  if (importBtn) {
+    importBtn.disabled = good.length === 0;
+    importBtn.style.opacity = good.length > 0 ? '1' : '0.5';
+  }
+}
+
+
+function switchBulkTab(tab) {
+  const csvTab = document.getElementById('bulkTabCsv');
+  const imgTab = document.getElementById('bulkTabImg');
+  const csvPanel = document.getElementById('bulkPanelCsv');
+  const imgPanel = document.getElementById('bulkPanelImg');
+  if (!csvTab || !imgTab) return;
+  if (tab === 'csv') {
+    csvTab.style.borderBottomColor = '#2563eb'; csvTab.style.color = '#2563eb';
+    imgTab.style.borderBottomColor = 'transparent'; imgTab.style.color = '#64748b';
+    if (csvPanel) csvPanel.style.display = '';
+    if (imgPanel) imgPanel.style.display = 'none';
+    // enable import btn only if csv rows loaded
+    const importBtn = document.getElementById('bulkUploadImportBtn');
+    if (importBtn) {
+      const hasRows = window._bulkUploadRows && window._bulkUploadRows.length > 0;
+      importBtn.disabled = !hasRows;
+      importBtn.style.opacity = hasRows ? '1' : '0.5';
+    }
+  } else {
+    imgTab.style.borderBottomColor = '#7c3aed'; imgTab.style.color = '#7c3aed';
+    csvTab.style.borderBottomColor = 'transparent'; csvTab.style.color = '#64748b';
+    if (imgPanel) imgPanel.style.display = '';
+    if (csvPanel) csvPanel.style.display = 'none';
+    // enable import btn only if image scan rows loaded
+    const importBtn = document.getElementById('bulkUploadImportBtn');
+    if (importBtn) {
+      const hasRows = window._bulkImgRows && window._bulkImgRows.length > 0;
+      importBtn.disabled = !hasRows;
+      importBtn.style.opacity = hasRows ? '1' : '0.5';
+    }
+  }
+  window._bulkActiveTab = tab;
+}
+
+function clearBulkImages() {
+  window._bulkImgRows = [];
+  const body = document.getElementById('imgScanBody');
+  if (body) body.innerHTML = '';
+  const results = document.getElementById('imgScanResults');
+  if (results) results.style.display = 'none';
+  const progress = document.getElementById('imgScanProgress');
+  if (progress) progress.style.display = 'none';
+  const fileInput = document.getElementById('bulkImgFileInput');
+  if (fileInput) fileInput.value = '';
+  const importBtn = document.getElementById('bulkUploadImportBtn');
+  if (importBtn) { importBtn.disabled = true; importBtn.style.opacity = '0.5'; }
+}
+
+async function _loadZXing() {
+  if (window.ZXing) return window.ZXing;
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js';
+    s.onload = () => resolve(window.ZXing);
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+async function handleBulkImageFiles(files) {
+  if (!files || !files.length) return;
+  window._bulkImgRows = [];
+  const resultsDiv = document.getElementById('imgScanResults');
+  const progressDiv = document.getElementById('imgScanProgress');
+  const progressLabel = document.getElementById('imgScanProgressLabel');
+  const progressCount = document.getElementById('imgScanProgressCount');
+  const progressBar = document.getElementById('imgScanProgressBar');
+  const body = document.getElementById('imgScanBody');
+  const title = document.getElementById('imgScanTitle');
+  const importBtn = document.getElementById('bulkUploadImportBtn');
+
+  if (body) body.innerHTML = '';
+  if (resultsDiv) resultsDiv.style.display = 'none';
+  if (progressDiv) progressDiv.style.display = '';
+  if (progressLabel) progressLabel.textContent = 'Loading barcode scanner…';
+  if (progressCount) progressCount.textContent = `0 / ${files.length}`;
+  if (progressBar) progressBar.style.width = '0%';
+
+  let ZXing;
+  try {
+    ZXing = await _loadZXing();
+  } catch {
+    alert('Could not load barcode scanner library. Check your internet connection.');
+    if (progressDiv) progressDiv.style.display = 'none';
+    return;
+  }
+
+  const codeReader = new ZXing.BrowserMultiFormatReader();
+
+  let done = 0;
+  const rows = [];
+
+  for (const file of Array.from(files)) {
+    done++;
+    if (progressLabel) progressLabel.textContent = `Scanning ${file.name}…`;
+    if (progressCount) progressCount.textContent = `${done} / ${files.length}`;
+    if (progressBar) progressBar.style.width = `${Math.round(done / files.length * 100)}%`;
+
+    let barcode = null;
+    let statusHtml = '';
+    let nameHtml = '<span style="color:#94a3b8">—</span>';
+    let thumbUrl = '';
+
+    try {
+      thumbUrl = await new Promise((res) => {
+        const fr = new FileReader();
+        fr.onload = e => res(e.target.result);
+        fr.readAsDataURL(file);
+      });
+
+      // Draw to canvas at multiple scales to improve decode reliability
+      const img = await new Promise((res, rej) => {
+        const i = new Image();
+        i.onload = () => res(i);
+        i.onerror = rej;
+        i.src = thumbUrl;
+      });
+
+      // Try decoding at 100%, 200% and 50% scale until one succeeds
+      let result = null;
+      for (const scale of [1, 2, 0.5]) {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(img.naturalWidth * scale);
+          canvas.height = Math.round(img.naturalHeight * scale);
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const lum = new ZXing.RGBLuminanceSource(imageData.data, canvas.width, canvas.height);
+          const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
+          const hints = new Map([[ZXing.DecodeHintType.TRY_HARDER, true]]);
+          const fmt = new ZXing.MultiFormatReader();
+          fmt.setHints(hints);
+          result = fmt.decode(bitmap);
+          if (result) break;
+        } catch { /* try next scale */ }
+      }
+
+      if (!result) {
+        // Fallback: also try via BrowserMultiFormatReader on a temp img element
+        try {
+          const tmpImg = document.createElement('img');
+          tmpImg.src = thumbUrl;
+          await new Promise(r => { tmpImg.onload = r; tmpImg.onerror = r; });
+          result = await codeReader.decodeFromImageElement(tmpImg);
+        } catch { /* still nothing */ }
+      }
+
+      if (result) {
+        barcode = result.getText();
+        statusHtml = '<span style="color:#16a34a; font-weight:700;">✅ Detected</span>';
+      } else {
+        throw new Error('no result');
+      }
+    } catch {
+      statusHtml = '<span style="color:#dc2626; font-weight:700;">❌ No barcode</span>';
+    }
+
+    // Lookup name
+    let productName = '';
+    let category = '';
+    if (barcode) {
+      try {
+        const info = await lookupBarcodeOpenFoodFacts(barcode);
+        if (info && info.name) {
+          productName = info.name;
+          category = info.category || '';
+          nameHtml = `<span style="color:#0f172a; font-weight:600;">${info.name}</span>`;
+        } else {
+          nameHtml = '<span style="color:#94a3b8;">Not found</span>';
+        }
+      } catch {
+        nameHtml = '<span style="color:#94a3b8;">Lookup failed</span>';
+      }
+    }
+
+    const row = { barcode, name: productName, category, price: 0, tax: 0, stock: 0, cost: 0, unit_type: 'unit', _file: file.name, _ok: !!barcode };
+    rows.push(row);
+
+    if (body) {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid #f1f5f9';
+      tr.innerHTML = `
+        <td style="padding:7px 10px; width:52px;"><img src="${thumbUrl}" style="width:44px; height:36px; object-fit:contain; border-radius:4px; border:1px solid #e2e8f0;"></td>
+        <td style="padding:7px 10px; font-family:monospace; font-weight:700; color:#1e40af;">${barcode || '<span style="color:#94a3b8;">—</span>'}</td>
+        <td style="padding:7px 10px;">${nameHtml}</td>
+        <td style="padding:7px 10px;">${statusHtml}</td>`;
+      body.appendChild(tr);
+    }
+  }
+
+  if (progressDiv) progressDiv.style.display = 'none';
+  if (resultsDiv) resultsDiv.style.display = '';
+
+  const good = rows.filter(r => r._ok);
+  if (title) title.textContent = `${files.length} image${files.length > 1 ? 's' : ''} scanned — ${good.length} barcode${good.length !== 1 ? 's' : ''} found`;
+
+  // Store only valid rows for import; map to bulkUploadRows format
+  window._bulkImgRows = good;
+  // Also populate _bulkUploadRows so startBulkUpload() can use them
+  if (window._bulkActiveTab === 'img') {
+    window._bulkUploadRows = good.map(r => ({
+      barcode: r.barcode, name: r.name || r.barcode, price: 0, category: r.category || '',
+      tax: 0, stock: 0, cost: 0, unit_type: 'unit'
+    }));
+  }
+
+  if (importBtn) {
+    importBtn.disabled = good.length === 0;
+    importBtn.style.opacity = good.length > 0 ? '1' : '0.5';
+  }
+
+  // wire image dropzone drag-and-drop
+  const dz = document.getElementById('imgDropzone');
+  if (dz && !dz._dzWired) {
+    dz._dzWired = true;
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.style.background = '#ede9fe'; });
+    dz.addEventListener('dragleave', () => { dz.style.background = '#faf5ff'; });
+    dz.addEventListener('drop', e => {
+      e.preventDefault(); dz.style.background = '#faf5ff';
+      const dropped = e.dataTransfer.files;
+      if (dropped && dropped.length) handleBulkImageFiles(dropped);
+    });
+  }
+}
+
 // ============== PRODUCTS VIEW ==============
+const productsPager = { page: 1, perPage: 50, query: '' };
+const selectedProductIds = new Set();
+
 function setupProductHandlers() {
   document.getElementById('addProductBtn')?.addEventListener('click', () => {
     openProductModal();
   });
-  
+
+  document.getElementById('bulkUploadBarcodesBtn')?.addEventListener('click', () => {
+    openBulkUploadOverlay();
+  });
+
   document.getElementById('addCategoryBtnHeader')?.addEventListener('click', () => {
     if (hasPermission('categories')) {
       openCategoryModal();
     }
   });
+
+  // Open barcode list section
+  const openBarcodeBtn = document.getElementById('openBarcodeListBtn');
+  if (openBarcodeBtn && !openBarcodeBtn.dataset.listenerAttached) {
+    openBarcodeBtn.dataset.listenerAttached = '1';
+    openBarcodeBtn.addEventListener('click', () => {
+      navigateToView('barcodes');
+    });
+  }
   
-  document.getElementById('productSearch')?.addEventListener('input', (e) => {
-    filterProducts(e.target.value);
+  // Debounce search to avoid re-rendering on every keystroke (helps on low-end Windows PCs)
+  // Note: productSearch ID exists in more than one view; scope to Products view.
+  let productSearchTimer = null;
+  const productSearchInput = document.querySelector('#productsView #productsSearch');
+  productSearchInput?.addEventListener('input', (e) => {
+    const value = e.target.value;
+    if (productSearchTimer) clearTimeout(productSearchTimer);
+    productSearchTimer = setTimeout(() => filterProducts(value), 120);
+  });
+
+  // Scan-to-add in Products view:
+  // If cashier scans a barcode into the Products search field and presses Enter (scanner sends Enter),
+  // open Edit Product if it exists; otherwise offer to create a new product with that barcode.
+  productSearchInput?.addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter') return;
+    const raw = String(productSearchInput.value || '').trim();
+    const digitsOnly = raw.replace(/\s+/g, '');
+    const looksLikeBarcode = /^\d{6,}$/.test(digitsOnly);
+    if (!looksLikeBarcode) return;
+
+    e.preventDefault();
+
+    try {
+      const existing = await window.api.getProductByBarcode(digitsOnly);
+      if (existing && existing.id) {
+        // Open edit modal directly
+        await editProduct(existing.id);
+        return;
+      }
+    } catch {
+      // ignore
+    }
+
+    const ok = await showConfirmDialog({
+      title: 'Product not found',
+      message: `Barcode: ${digitsOnly}\n\nCreate a new product with this barcode?`,
+      confirmText: 'Create Product',
+      cancelText: 'Cancel'
+    });
+    if (!ok) return;
+
+    await openProductModal(null, null, null);
+    try {
+      const barcodeEl = document.getElementById('productBarcode');
+      if (barcodeEl) barcodeEl.value = digitsOnly;
+      const nameEl = document.getElementById('productName');
+      if (nameEl) {
+        nameEl.focus();
+        nameEl.select?.();
+      }
+    } catch {
+      // ignore
+    }
   });
   
   document.getElementById('productForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     await saveProduct();
   });
+
+  // Print barcode label from the Product modal
+  const printBtn = document.getElementById('productPrintLabelBtn');
+  if (printBtn && !printBtn.dataset.listenerAttached) {
+    printBtn.dataset.listenerAttached = '1';
+    printBtn.addEventListener('click', async () => {
+      try {
+        if (!window.api.printBarcodeLabel) {
+          showAlert('Barcode label printing is not available in this build', 'error', 'Print');
+          return;
+        }
+
+        const barcodeRaw = (document.getElementById('productBarcode')?.value || '').toString();
+        const barcode = barcodeRaw.replace(/\s+/g, '').trim();
+        const name = (document.getElementById('productName')?.value || '').toString().trim();
+        const currencySymbol = systemSettings?.currency_symbol || '€';
+        const priceText = (document.getElementById('productSalePrice')?.value || '').toString().trim() || (document.getElementById('productRegularPrice')?.value || '').toString().trim();
+        const price = parseFloat(String(priceText).replace(',', '.'));
+
+        if (!barcode) {
+          showAlert('Please enter a barcode first', 'warning', 'Print');
+          return;
+        }
+        if (!name) {
+          showAlert('Please enter a product name first', 'warning', 'Print');
+          return;
+        }
+        if (!Number.isFinite(price) || price < 0) {
+          showAlert('Please enter a valid price first', 'warning', 'Print');
+          return;
+        }
+
+        const qty = await promptForBarcodeLabelQuantity({ title: 'Print Barcode Labels', defaultQty: 1, maxQty: 50 });
+        if (!qty) return;
+
+        await printBarcodeLabelMultipleTimes({ barcode, name, price, currencySymbol, quantity: qty });
+        showAlert('Barcode label(s) sent to printer', 'success', 'Print');
+      } catch (e) {
+        showAlert(String(e?.message || e || 'Failed to print label'), 'error', 'Print');
+      }
+    });
+  }
+
+  // Bulk delete (Products)
+  const bulkBtn = document.getElementById('bulkDeleteProductsBtn');
+  if (bulkBtn && !bulkBtn.dataset.listenerAttached) {
+    bulkBtn.dataset.listenerAttached = '1';
+    bulkBtn.addEventListener('click', async () => {
+      if (selectedProductIds.size === 0) return;
+      const ok = await showConfirmDialog({
+        title: 'Delete Selected Products?',
+        message: `You selected ${selectedProductIds.size} product(s).\n\nProducts already used in sales will be removed from the Products list but kept in reports.`,
+        confirmText: 'Delete',
+        cancelText: 'Cancel',
+        tone: 'danger'
+      });
+      if (!ok) return;
+
+      let archivedCount = 0;
+      let deletedCount = 0;
+      const ids = Array.from(selectedProductIds);
+
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        try {
+          const res = await window.api.deleteProduct(id);
+          if (res?.archived) archivedCount++;
+          else deletedCount++;
+        } catch {
+          // ignore per-item failure
+        }
+
+        // Yield occasionally to keep UI responsive
+        if (i % 25 === 0) {
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+
+      selectedProductIds.clear();
+      await loadProductsView();
+      showAlert(`Deleted: ${deletedCount}. Removed/Archived: ${archivedCount}.`, 'success');
+    });
+  }
+
+  // Selection handlers (Products) - event delegation
+  const productsTable = document.getElementById('productsTable');
+  if (productsTable && !productsTable.dataset.selectionAttached) {
+    productsTable.dataset.selectionAttached = '1';
+    productsTable.addEventListener('change', async (e) => {
+      const t = e.target;
+      if (!(t instanceof HTMLInputElement)) return;
+      if (t.id === 'productsSelectAll') {
+        const visible = Array.from(document.querySelectorAll('#productsTable tbody input.product-row-select'));
+        for (const cb of visible) {
+          cb.checked = t.checked;
+          const id = parseInt(cb.dataset.productId, 10);
+          if (!Number.isFinite(id)) continue;
+          if (t.checked) selectedProductIds.add(id);
+          else selectedProductIds.delete(id);
+        }
+        updateProductsBulkUi();
+        return;
+      }
+
+      if (t.classList.contains('product-checkout-toggle')) {
+        const id = parseInt(t.dataset.productId, 10);
+        if (!Number.isFinite(id)) return;
+        try {
+          if (window.api?.setProductShowInCheckout) {
+            await window.api.setProductShowInCheckout(id, t.checked);
+          }
+          const p = allProducts?.find?.(x => x?.id === id);
+          if (p) p.show_in_checkout = t.checked ? 1 : 0;
+          // If Checkout is currently active, refresh tabs + grid.
+          if (isCheckoutViewActive()) {
+            try { await loadCategoryTabs(); } catch { /* ignore */ }
+            try { await displayQuickProducts('', selectedCategory, selectedSubcategory); } catch { /* ignore */ }
+          }
+        } catch {
+          // Revert toggle on failure
+          t.checked = !t.checked;
+          showAlert('Failed to update checkout visibility', 'error');
+        }
+        return;
+      }
+
+      if (t.classList.contains('product-row-select')) {
+        const id = parseInt(t.dataset.productId, 10);
+        if (!Number.isFinite(id)) return;
+        if (t.checked) selectedProductIds.add(id);
+        else selectedProductIds.delete(id);
+        updateProductsBulkUi();
+      }
+    });
+  }
+
+  // Attach unit type toggle listener once (openProductModal is called many times)
+  const unitTypeSelect = document.getElementById('productUnitType');
+  if (unitTypeSelect && !unitTypeSelect.dataset.listenerAttached) {
+    unitTypeSelect.dataset.listenerAttached = '1';
+    unitTypeSelect.addEventListener('change', (e) => {
+      toggleUnitFields(e.target.value);
+    });
+  }
 }
 
 async function loadProductsView() {
-  allProducts = await window.api.getAllProducts();
+  // Products view doesn't need images; base64 image data can make it slow.
+  allProducts = await (window.api.getAllProductsLite ? window.api.getAllProductsLite() : window.api.getAllProducts());
+
+  // Cache lowercase fields for faster filtering
+  for (const p of allProducts) {
+    if (!p) continue;
+    if (typeof p._lcName !== 'string') p._lcName = String(p.name || '').toLowerCase();
+    if (typeof p._lcCategory !== 'string') p._lcCategory = String(p.category || '').toLowerCase();
+    if (typeof p._lcBarcode !== 'string') p._lcBarcode = String(p.barcode || '').toLowerCase();
+  }
+
+  // Reset pagination when loading the view
+  productsPager.page = 1;
+  productsPager.query = String(document.querySelector('#productsView #productsSearch')?.value || '').trim();
+  selectedProductIds.clear();
   displayProducts(allProducts);
+}
+
+function isInternalBarcode(barcode) {
+  const bc = String(barcode || '').trim();
+  // Internal codes are generated by database.js as POS-<...>.
+  return bc.startsWith('POS-');
+}
+
+function formatBarcodeForDisplay(barcode) {
+  const bc = String(barcode || '').trim();
+  if (!bc) return '';
+  return isInternalBarcode(bc) ? '' : bc;
 }
 
 function displayProducts(products) {
   const tbody = document.querySelector('#productsTable tbody');
   const currencySymbol = systemSettings?.currency_symbol || '€';
+
+  // Pagination UI
+  ensurePaginationBar({
+    containerSelector: '#productsView .table-container',
+    barId: 'productsPagination',
+    onPrev: () => {
+      productsPager.page = Math.max(1, productsPager.page - 1);
+      displayProducts(allProducts);
+    },
+    onNext: () => {
+      productsPager.page = productsPager.page + 1;
+      displayProducts(allProducts);
+    },
+    onPerPage: (v) => {
+      productsPager.perPage = v;
+      productsPager.page = 1;
+      displayProducts(allProducts);
+    }
+  });
+
+  const q = String(productsPager.query || '').trim().toLowerCase();
+  let filtered = q
+    ? products.filter(p => (p._lcName || '').includes(q) || (p._lcCategory || '').includes(q) || (p._lcBarcode || '').includes(q))
+    : products;
+
+  // Sort newest first (created_at desc, then id desc)
+  try {
+    filtered = filtered.slice().sort((a, b) => {
+      const aTime = Date.parse(a?.created_at || '') || 0;
+      const bTime = Date.parse(b?.created_at || '') || 0;
+      if (aTime !== bTime) return bTime - aTime;
+      const aId = Number(a?.id) || 0;
+      const bId = Number(b?.id) || 0;
+      return bId - aId;
+    });
+  } catch {
+    // ignore
+  }
+
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / productsPager.perPage));
+  productsPager.page = Math.min(Math.max(1, productsPager.page), totalPages);
+  const startIndex = (productsPager.page - 1) * productsPager.perPage;
+  const limited = filtered.slice(startIndex, startIndex + productsPager.perPage);
   
-  if (products.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state"><div class="icon">📦</div><p>No products found</p></td></tr>';
+  if (total === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-state"><div class="icon">📦</div><p>No products found</p></td></tr>';
+    updatePaginationBar('productsPagination', { page: 1, perPage: productsPager.perPage, total: 0 });
+    updateProductsBulkUi([]);
     return;
   }
   
-  tbody.innerHTML = products.map(product => {
+  tbody.innerHTML = limited.map(product => {
     let statusClass = 'status-in-stock';
     let statusText = 'In Stock';
     
@@ -4425,6 +9751,7 @@ function displayProducts(products) {
     
     // Get specific unit
     let unitLabel = '';
+    let unitTypeDisplay = '';
     if (isWeightBased) {
       const weightUnit = product.weight_unit || 'kg';
       unitLabel = `/${weightUnit}`;
@@ -4440,41 +9767,277 @@ function displayProducts(products) {
       ? `<span style="text-decoration: line-through; color: #999;">${currencySymbol}${(product.regular_price || product.price).toFixed(2)}</span> <span style="color: #e53e3e; font-weight: 700;">${currencySymbol}${product.price.toFixed(2)}${unitLabel}</span>`
       : `${currencySymbol}${product.price.toFixed(2)}${unitLabel}`;
     
-    // Get tax rate from category
-    const category = allCategories.find(c => c.name === product.category);
-    const categoryTaxRate = category ? category.tax_rate : 0;
-    const taxDisplay = `${(categoryTaxRate * 100).toFixed(0)}%`;
+    // VAT is product-level
+    const pTax = Number(product.tax_rate);
+    const taxDisplay = `${(Number.isFinite(pTax) ? (pTax * 100) : 0).toFixed(0)}%`;
     
     return `
       <tr>
-        <td>${product.name}</td>
-        <td>${product.category || 'General'}</td>
+        <td>
+          <div class="name-select-cell">
+            <input class="product-row-select table-select" type="checkbox" data-product-id="${product.id}" ${selectedProductIds.has(product.id) ? 'checked' : ''} aria-label="Select product">
+            <span>${product.name}</span>
+          </div>
+        </td>
+        <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 12px; color: #334155;">${formatBarcodeForDisplay(product.barcode)}</td>
+        <td>${(product.category && String(product.category).trim()) ? product.category : '—'}</td>
         <td>${unitTypeDisplay}</td>
         <td>${priceDisplay}</td>
         <td>${taxDisplay}</td>
         <td>${product.stock}</td>
+        <td style="text-align:center;">
+          <input class="product-checkout-toggle" type="checkbox" data-product-id="${product.id}" ${isProductEnabledForCheckout(product) ? 'checked' : ''} aria-label="Show in checkout">
+        </td>
         <td><span class="status-badge ${statusClass}">${statusText}</span></td>
         <td>
           <button class="action-btn" onclick="editProduct(${product.id})" title="Edit">✏️</button>
-          <button class="action-btn" onclick="deleteProduct(${product.id})" title="Delete">🗑️</button>
+          <button class="action-btn" onclick="showProductBarcode(${product.id})" title="Show Barcode">▦</button>
+          <button class="action-btn" onclick="printProductLabel(${product.id})" title="Print Label">🏷️</button>
+          <button class="action-btn delete-btn" onclick="deleteProduct(${product.id})" title="Delete">🗑️</button>
         </td>
       </tr>
     `;
   }).join('');
+
+  updatePaginationBar('productsPagination', { page: productsPager.page, perPage: productsPager.perPage, total });
+  updateProductsBulkUi(limited);
 }
 
-function filterProducts(query) {
-  if (!query) {
-    displayProducts(allProducts);
-  } else {
-    const filtered = allProducts.filter(p => 
-      p.name.toLowerCase().includes(query.toLowerCase()) ||
-      p.barcode.includes(query) ||
-      (p.category && p.category.toLowerCase().includes(query.toLowerCase()))
-    );
-    displayProducts(filtered);
+function promptForBarcodeLabelQuantity({ title = 'Print Labels', defaultQty = 1, maxQty = 50 } = {}) {
+  return new Promise((resolve) => {
+    const existing = document.getElementById('barcodeLabelQtyOverlay');
+    if (existing) {
+      try { existing.remove(); } catch { /* ignore */ }
+    }
+
+    const overlay = document.createElement('div');
+    overlay.id = 'barcodeLabelQtyOverlay';
+    overlay.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'background:rgba(0,0,0,0.55)',
+      'padding:24px 0 330px 0',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'z-index:10001'
+    ].join(';');
+
+    const card = document.createElement('div');
+    card.style.cssText = [
+      'width:min(520px, 92vw)',
+      'background:#fff',
+      'border-radius:22px',
+      'box-shadow:0 18px 60px rgba(0,0,0,0.35)',
+      'padding:26px 22px',
+      'font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial'
+    ].join(';');
+
+    const safeMax = Number.isFinite(Number(maxQty)) ? Math.max(1, Math.min(999, Math.floor(Number(maxQty)))) : 50;
+    const safeDefault = Number.isFinite(Number(defaultQty)) ? Math.max(1, Math.min(safeMax, Math.floor(Number(defaultQty)))) : 1;
+
+    card.innerHTML = `
+      <div style="text-align:center;">
+        <div style="font-size:26px; font-weight:900; color:#0f172a; margin-bottom:6px;">${String(title || 'Print Labels')}</div>
+        <div style="font-size:14px; color:#64748b; margin-bottom:16px;">How many labels do you want to print?</div>
+
+        <div style="display:flex; align-items:center; justify-content:center; gap:10px; margin-bottom:18px;">
+          <input id="barcodeLabelQtyInput" type="text" inputmode="numeric" autocomplete="off" enterkeyhint="done"
+            value="${safeDefault}" placeholder="1"
+            style="width:160px; font-size:26px; text-align:center; padding:14px 12px; border-radius:14px; border:2px solid #cbd5e1; outline:none; font-weight:900;" />
+          <div style="font-size:13px; font-weight:900; color:#64748b;">max ${safeMax}</div>
+        </div>
+
+        <div style="display:flex; gap:14px; justify-content:center;">
+          <button id="barcodeLabelQtyCancel" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:18px; font-weight:900; background:#94a3b8; color:#fff;">Cancel</button>
+          <button id="barcodeLabelQtyOk" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:18px; font-weight:900; background:#0ea5e9; color:#fff;">Print</button>
+        </div>
+      </div>
+    `;
+
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    const input = card.querySelector('#barcodeLabelQtyInput');
+    const okBtn = card.querySelector('#barcodeLabelQtyOk');
+    const cancelBtn = card.querySelector('#barcodeLabelQtyCancel');
+
+    const cleanup = () => {
+      try { overlay.remove(); } catch { /* ignore */ }
+    };
+
+    const close = (value) => {
+      cleanup();
+      resolve(value);
+    };
+
+    const parseQty = () => {
+      const raw = String(input?.value || '').trim();
+      const n = parseInt(raw, 10);
+      if (!Number.isFinite(n) || n <= 0) return null;
+      return Math.max(1, Math.min(safeMax, n));
+    };
+
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) close(null);
+    });
+
+    cancelBtn?.addEventListener('click', () => close(null), { once: true });
+    okBtn?.addEventListener('click', () => {
+      const qty = parseQty();
+      if (!qty) {
+        try { input?.focus?.(); } catch { /* ignore */ }
+        return;
+      }
+      close(qty);
+    });
+
+    input?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        okBtn?.click?.();
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close(null);
+      }
+    });
+
+    // Force on-screen keyboard to open (focus is programmatic)
+    try { window.__virtualKeyboardForceOpen = true; } catch { /* ignore */ }
+    setTimeout(() => {
+      try {
+        window.__virtualKeyboardForceOpen = true;
+        input?.focus?.();
+        input?.select?.();
+      } catch {
+        // ignore
+      }
+    }, 0);
+  });
+}
+
+async function printBarcodeLabelMultipleTimes({ barcode, name, price, currencySymbol, quantity }) {
+  const qty = Math.max(1, Math.min(999, parseInt(quantity, 10) || 1));
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  for (let i = 0; i < qty; i++) {
+    const res = await window.api.printBarcodeLabel({
+      barcode,
+      name,
+      price,
+      currencySymbol,
+      // Force HTML so the printer uses the compact label page size/layout.
+      labelPrintMode: 'html',
+      labelLayout: 'pvp-right',
+      labelMmWidth: 57,
+      labelMmHeight: 32
+    });
+    if (res && res.success === false) {
+      throw new Error(res.error || res.message || 'Failed to print label');
+    }
+    await sleep(180);
   }
 }
+
+// Print label from Products table action
+async function printProductLabel(productId) {
+  try {
+    if (!window.api.printBarcodeLabel) {
+      showAlert('Barcode label printing is not available in this build', 'error', 'Print');
+      return;
+    }
+    const id = Number(productId);
+    if (!Number.isFinite(id)) return;
+
+    // Prefer full record to ensure we get barcode
+    let product = allProducts.find(p => p && p.id === id) || null;
+    if (window.api.getProductById) {
+      try {
+        const full = await window.api.getProductById(id);
+        if (full) product = full;
+      } catch {
+        // ignore
+      }
+    }
+
+    const barcode = String(product?.barcode || '').replace(/\s+/g, '').trim();
+    if (!barcode) {
+      showAlert('This product has no barcode', 'warning', 'Print');
+      return;
+    }
+
+    const name = String(product?.name || '').trim();
+    const price = Number(product?.price);
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+
+    const qty = await promptForBarcodeLabelQuantity({ title: 'Print Barcode Labels', defaultQty: 1, maxQty: 50 });
+    if (!qty) return;
+
+    await printBarcodeLabelMultipleTimes({ barcode, name, price, currencySymbol, quantity: qty });
+    showAlert('Barcode label(s) sent to printer', 'success', 'Print');
+  } catch (e) {
+    showAlert(String(e?.message || e || 'Failed to print label'), 'error', 'Print');
+  }
+}
+
+async function showProductBarcode(productId) {
+  try {
+    const id = Number(productId);
+    if (!Number.isFinite(id)) return;
+
+    // Prefer full record to ensure we get barcode
+    let product = allProducts.find(p => p && p.id === id) || null;
+    if (window.api.getProductById) {
+      try {
+        const full = await window.api.getProductById(id);
+        if (full) product = full;
+      } catch {
+        // ignore
+      }
+    }
+
+    const barcode = String(product?.barcode || '').replace(/\s+/g, '').trim();
+    if (!barcode) {
+      showAlert('This product has no barcode', 'warning');
+      return;
+    }
+
+    showBarcodeOverlay({ barcode, name: product?.name || '' });
+  } catch (e) {
+    showAlert(String(e?.message || e || 'Failed to show barcode'), 'error');
+  }
+}
+
+function updateProductsBulkUi(visibleRows = null) {
+  const bulkBtn = document.getElementById('bulkDeleteProductsBtn');
+  if (bulkBtn) bulkBtn.disabled = selectedProductIds.size === 0;
+
+  const selectAll = document.getElementById('productsSelectAll');
+  if (!selectAll) return;
+  const visible = visibleRows
+    ? visibleRows.map(p => p.id)
+    : Array.from(document.querySelectorAll('#productsTable tbody input.product-row-select')).map(cb => parseInt(cb.dataset.productId, 10)).filter(Number.isFinite);
+
+  if (visible.length === 0) {
+    selectAll.checked = false;
+    selectAll.indeterminate = false;
+    return;
+  }
+
+  const selectedVisible = visible.filter(id => selectedProductIds.has(id)).length;
+  selectAll.checked = selectedVisible === visible.length;
+  selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+}
+function filterProducts(query) {
+  productsPager.query = String(query || '').trim();
+  productsPager.page = 1;
+  displayProducts(allProducts);
+}
+
+// ============== CATEGORIES PAGINATION (Admin) ==============
+const categoriesPager = { page: 1, perPage: 50 };
+let categoriesManagementList = [];
+const selectedCategoryIds = new Set();
 
 async function openProductModal(product = null, categoryId = null, categoryName = null) {
   const modal = document.getElementById('productModal');
@@ -4487,10 +10050,14 @@ async function openProductModal(product = null, categoryId = null, categoryName 
   if (product) {
     title.textContent = 'Edit Product';
     document.getElementById('productId').value = product.id;
-    document.getElementById('productBarcode').value = product.barcode;
+    {
+      const bc = String(product.barcode || '').trim();
+      document.getElementById('productBarcode').value = isInternalBarcode(bc) ? '' : bc;
+    }
     document.getElementById('productName').value = product.name;
-    document.getElementById('productCategory').value = product.category || 'General';
-    document.getElementById('productUnitType').value = product.unit_type || 'weight';
+    document.getElementById('productCategory').value = product.category || '';
+    document.getElementById('productShowInCheckout').checked = isProductEnabledForCheckout(product);
+    document.getElementById('productUnitType').value = product.unit_type || 'quantity';
     document.getElementById('productWeightUnit').value = product.weight_unit || 'kg';
     document.getElementById('productQuantityUnit').value = product.quantity_unit || 'piece';
     document.getElementById('productWeightAmount').value = product.weight_amount || '';
@@ -4498,9 +10065,34 @@ async function openProductModal(product = null, categoryId = null, categoryName 
     document.getElementById('productRegularPrice').value = product.regular_price || product.price;
     document.getElementById('productSalePrice').value = product.sale_price || '';
     document.getElementById('productStock').value = product.stock;
+
+    // VAT is product-level (not category-level)
+    try {
+      const vatOpts = await getVatPercentOptions();
+      const salesPct = Math.round(Number(product.tax_rate || 0) * 100);
+      const purchasePct = Math.round(Number(product.purchase_tax_rate ?? product.tax_rate ?? 0) * 100);
+      fillVatSelect(document.getElementById('productSalesVat'), vatOpts, salesPct);
+      fillVatSelect(document.getElementById('productPurchaseVat'), vatOpts, purchasePct);
+      attachVatAddHandler(document.getElementById('productSalesVat'), {
+        onAdded: async (createdPct) => {
+          const nextOpts = await getVatPercentOptions();
+          fillVatSelect(document.getElementById('productSalesVat'), nextOpts, createdPct);
+          fillVatSelect(document.getElementById('productPurchaseVat'), nextOpts, document.getElementById('productPurchaseVat')?.value);
+        }
+      });
+      attachVatAddHandler(document.getElementById('productPurchaseVat'), {
+        onAdded: async (createdPct) => {
+          const nextOpts = await getVatPercentOptions();
+          fillVatSelect(document.getElementById('productSalesVat'), nextOpts, document.getElementById('productSalesVat')?.value);
+          fillVatSelect(document.getElementById('productPurchaseVat'), nextOpts, createdPct);
+        }
+      });
+    } catch {
+      // ignore
+    }
     
     // Show appropriate unit field
-    toggleUnitFields(product.unit_type || 'weight');
+    toggleUnitFields(product.unit_type || 'quantity');
     
     // Load product image if exists
     if (product.image) {
@@ -4535,7 +10127,8 @@ async function openProductModal(product = null, categoryId = null, categoryName 
     title.textContent = 'Add Product';
     form.reset();
     document.getElementById('productId').value = '';
-    document.getElementById('productUnitType').value = 'weight';
+    document.getElementById('productUnitType').value = 'quantity';
+    document.getElementById('productShowInCheckout').checked = false;
     document.getElementById('productWeightUnit').value = 'kg';
     document.getElementById('productQuantityUnit').value = 'piece';
     document.getElementById('productWeightAmount').value = '';
@@ -4563,17 +10156,60 @@ async function openProductModal(product = null, categoryId = null, categoryName 
         }
       }
     }
+    if (!categoryName) {
+      document.getElementById('productCategory').value = '';
+    }
     
-    // Show weight unit by default
-    toggleUnitFields('weight');
+    // Barcode-only POS: default to quantity fields.
+    toggleUnitFields('quantity');
+
+    // Default VAT presets for new products
+    try {
+      const vatOpts = await getVatPercentOptions();
+      fillVatSelect(document.getElementById('productSalesVat'), vatOpts, 21);
+      fillVatSelect(document.getElementById('productPurchaseVat'), vatOpts, 21);
+      attachVatAddHandler(document.getElementById('productSalesVat'), {
+        onAdded: async (createdPct) => {
+          const nextOpts = await getVatPercentOptions();
+          fillVatSelect(document.getElementById('productSalesVat'), nextOpts, createdPct);
+          fillVatSelect(document.getElementById('productPurchaseVat'), nextOpts, document.getElementById('productPurchaseVat')?.value);
+        }
+      });
+      attachVatAddHandler(document.getElementById('productPurchaseVat'), {
+        onAdded: async (createdPct) => {
+          const nextOpts = await getVatPercentOptions();
+          fillVatSelect(document.getElementById('productSalesVat'), nextOpts, document.getElementById('productSalesVat')?.value);
+          fillVatSelect(document.getElementById('productPurchaseVat'), nextOpts, createdPct);
+        }
+      });
+    } catch {
+      // ignore
+    }
   }
   
-  // Setup unit type change listener
-  document.getElementById('productUnitType').addEventListener('change', (e) => {
-    toggleUnitFields(e.target.value);
-  });
+  // Unit type change listener is attached once in setupProductHandlers().
   
   modal.classList.add('active');
+
+  // Attach Open Food Facts barcode auto-lookup (safe to call multiple times)
+  try { attachBarcodeLookupToProductModal(); } catch { /* ignore */ }
+
+  // Focus barcode first for fast scanning/data entry.
+  try {
+    const bc = document.getElementById('productBarcode');
+    if (bc) {
+      setTimeout(() => {
+        try {
+          bc.focus();
+          bc.select?.();
+        } catch {
+          // ignore
+        }
+      }, 0);
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function toggleUnitFields(unitType) {
@@ -4596,61 +10232,189 @@ function toggleUnitFields(unitType) {
 }
 
 async function editProduct(id) {
-  const product = allProducts.find(p => p.id === id);
-  if (product) {
-    openProductModal(product);
+  let product = allProducts.find(p => p.id === id);
+  if (!product) return;
+
+  // Fetch full record (includes image) only when needed
+  if (window.api.getProductById) {
+    try {
+      const full = await window.api.getProductById(id);
+      if (full) product = full;
+    } catch {
+      // ignore and fall back to cached record
+    }
   }
+
+  openProductModal(product);
 }
 
 async function deleteProduct(id) {
-  if (confirm('Are you sure you want to delete this product?')) {
-    await window.api.deleteProduct(id);
-    await loadProductsView();
+  const ok = await showConfirmDialog({
+    title: 'Remove Product?',
+    message: 'This will remove the product from the Products list.\nSales/Reports history will stay.',
+    confirmText: 'Remove',
+    cancelText: 'Cancel',
+    tone: 'danger'
+  });
+
+  if (ok) {
+    try {
+      const res = await window.api.deleteProduct(id);
+      if (res && res.archived) {
+        showAlert('Product removed from Products list (kept in reports).', 'success');
+      }
+      await loadProductsView();
+    } catch (error) {
+      const msg = String(error?.message || error || 'Unknown error');
+      showAlert('Failed to delete product: ' + msg, 'error');
+    }
   }
 }
 
 async function saveProduct() {
   const id = document.getElementById('productId').value;
-  const regularPrice = parseFloat(document.getElementById('productRegularPrice').value);
-  const salePrice = parseFloat(document.getElementById('productSalePrice').value) || null;
-  const selectedCategory = document.getElementById('productCategory').value;
+  const normalizeDecimal = (value) => String(value ?? '').trim().replace(',', '.');
+  const parseOptionalMoneyZero = (value) => {
+    const raw = String(value ?? '').trim();
+    if (!raw) return 0;
+    const n = parseFloat(normalizeDecimal(raw));
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+  };
+  const parseOptionalMoneyNull = (value) => {
+    const raw = String(value ?? '').trim();
+    if (!raw) return null;
+    const n = parseFloat(normalizeDecimal(raw));
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+  };
+
+  const regularPriceRaw = document.getElementById('productRegularPrice')?.value;
+  const salePriceRaw = document.getElementById('productSalePrice')?.value;
+
+  let regularPrice = parseOptionalMoneyZero(regularPriceRaw);
+  const salePrice = parseOptionalMoneyNull(salePriceRaw);
+
+  if (regularPrice === null) {
+    showAlert('Please enter a valid regular price (0 or more)', 'error', 'Invalid Price');
+    return;
+  }
+  if (salePriceRaw && salePrice === null) {
+    showAlert('Please enter a valid sale price (0 or more)', 'error', 'Invalid Price');
+    return;
+  }
+  const selectedCategory = (document.getElementById('productCategory').value || '').toString().trim();
   const unitType = document.getElementById('productUnitType').value;
-  
-  // Auto-generate barcode for new products
-  let barcode = document.getElementById('productBarcode').value;
-  if (!id && !barcode) {
-    // Generate barcode: timestamp + random 4 digits
-    barcode = Date.now().toString() + Math.floor(1000 + Math.random() * 9000);
+
+  // Barcode is optional.
+  // Normalize by stripping whitespace.
+  let barcode = (document.getElementById('productBarcode').value || '').toString().trim();
+  barcode = barcode.replace(/\s+/g, '');
+  if (barcode) {
+    if (barcode.length < 4 || barcode.length > 64) {
+      showAlert('Please enter a valid barcode', 'error', 'Invalid Barcode');
+      return;
+    }
+  }
+
+  // Prevent duplicate barcodes (DB has a UNIQUE constraint, but this gives a nicer message).
+  try {
+    if (barcode && typeof window.api.getProductByBarcode === 'function') {
+      const existing = await window.api.getProductByBarcode(barcode);
+      const currentId = id ? parseInt(id, 10) : null;
+      if (existing && existing.id && (!currentId || existing.id !== currentId)) {
+        showAlert(`Barcode already exists for: ${existing.name || 'another product'}`, 'error', 'Duplicate Barcode');
+        return;
+      }
+    }
+  } catch {
+    // ignore duplicate check failure; DB will still enforce uniqueness
   }
   
   // Calculate final price
+  // - If sale price is provided (including 0), use it.
+  // - If regular price is empty, it becomes 0.
   let finalPrice = regularPrice;
-  if (salePrice) {
+  if (salePrice !== null) {
     finalPrice = salePrice;
+    // If user only filled sale price and left regular empty, keep regular aligned.
+    if (!String(regularPriceRaw ?? '').trim()) {
+      regularPrice = salePrice;
+    }
   }
   
-  // Get tax rate from category
-  const categories = await window.api.getAllCategories();
-  const category = categories.find(c => c.name === selectedCategory);
-  const taxRate = category ? category.tax_rate : 0;
+  // VAT is product-level
+  const salesVatPctRaw = Number(document.getElementById('productSalesVat')?.value);
+  const purchaseVatPctRaw = Number(document.getElementById('productPurchaseVat')?.value);
+  if (!Number.isFinite(salesVatPctRaw) || salesVatPctRaw < 0 || salesVatPctRaw > 100) {
+    showAlert('Please select a valid IVA de venta', 'error', 'VAT');
+    return;
+  }
+  if (!Number.isFinite(purchaseVatPctRaw) || purchaseVatPctRaw < 0 || purchaseVatPctRaw > 100) {
+    showAlert('Please select a valid IVA de compra', 'error', 'VAT');
+    return;
+  }
+  const taxRate = salesVatPctRaw / 100;
+  const purchaseTaxRate = purchaseVatPctRaw / 100;
   
   // Get image if selected
   const imageFile = document.getElementById('productImage').files[0];
   let imageData = null;
+  let existingProduct = null;
   
   if (imageFile) {
-    imageData = await new Promise((resolve, reject) => {
+    const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = (e) => resolve(e.target.result);
       reader.onerror = reject;
-      reader.readAsDataURL(imageFile);
+      reader.readAsDataURL(file);
     });
+
+    const compressToThumbnail = async (file) => {
+      const originalDataUrl = await readFileAsDataUrl(file);
+      try {
+        const img = new Image();
+        img.decoding = 'async';
+        img.src = originalDataUrl;
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+        });
+
+        const maxDim = 256;
+        const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+        const width = Math.max(1, Math.round((img.width || 1) * scale));
+        const height = Math.max(1, Math.round((img.height || 1) * scale));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return originalDataUrl;
+
+        // Fill background to avoid black transparency when converting PNG -> JPEG
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+
+        const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.78);
+        return (typeof jpegDataUrl === 'string' && jpegDataUrl.startsWith('data:image/')) ? jpegDataUrl : originalDataUrl;
+      } catch {
+        return originalDataUrl;
+      }
+    };
+
+    imageData = await compressToThumbnail(imageFile);
   } else if (id) {
     // Keep existing image if editing and no new image selected
-    const products = await window.api.getAllProducts();
-    const existingProduct = products.find(p => p.id === parseInt(id));
-    if (existingProduct && existingProduct.image) {
-      imageData = existingProduct.image;
+    try {
+      existingProduct = await (window.api.getProductById ? window.api.getProductById(parseInt(id)) : null);
+      if (existingProduct && existingProduct.image) {
+        imageData = existingProduct.image;
+      }
+    } catch {
+      // ignore; image stays null
     }
   }
   
@@ -4658,8 +10422,9 @@ async function saveProduct() {
     barcode: barcode,
     name: document.getElementById('productName').value,
     description: '',
-    category: selectedCategory,
-    subcategory: document.getElementById('productSubcategory').value || null,
+    category: selectedCategory ? selectedCategory : null,
+    subcategory: selectedCategory ? (document.getElementById('productSubcategory').value || null) : null,
+    show_in_checkout: document.getElementById('productShowInCheckout')?.checked ? 1 : 0,
     unit_type: unitType,
     weight_unit: document.getElementById('productWeightUnit').value,
     quantity_unit: document.getElementById('productQuantityUnit').value,
@@ -4670,8 +10435,12 @@ async function saveProduct() {
     discount_percent: 0,
     price: finalPrice,
     tax_rate: taxRate,
+    purchase_tax_rate: purchaseTaxRate,
     cost: 0,
-    stock: parseInt(document.getElementById('productStock').value),
+    stock: (() => {
+      const n = parseInt(document.getElementById('productStock').value, 10);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    })(),
     min_stock: 5,
     image: imageData
   };
@@ -4709,24 +10478,28 @@ function getDisplayPaymentMethod(sale) {
 }
 
 function saleMatchesPaymentFilter(sale, filter) {
-  if (!filter || filter === 'all') {
-    // In Sales History, the default "All" view should show only paid transactions.
-    // Unpaid PARKING (loan) tabs are not settled yet, so hide them here.
-    if ((sale?.payment_method || '').toString().toLowerCase() === 'loan') {
-      return isPaidLoanSale(sale);
-    }
-    return true;
+  // Loan payment events are represented as normal cash/card rows in Sales History.
+  // They should match filters by their payment_method.
+  if (sale?.__type === 'loan_payment') {
+    const pm = (sale?.payment_method || '').toString().toLowerCase();
+    if (!filter || filter === 'all') return pm === 'cash' || pm === 'card';
+    return pm === String(filter).toLowerCase();
   }
 
-  // Parking filter = original loan-origin sales
-  if (filter === 'loan') {
-    return sale?.payment_method === 'loan';
+  // BUSINESS RULE: Do not show PARKING/loan-origin sales in Sales History.
+  // They are counted/shown only when money is collected (loan payments).
+  if ((sale?.payment_method || '').toString().toLowerCase() === 'loan') {
+    return false;
+  }
+
+  if (!filter || filter === 'all') {
+    return true;
   }
 
   // Cash/Card filters include paid Parking based on settlement method
   if (filter === 'cash' || filter === 'card') {
     if (sale?.payment_method === filter) return true;
-    return isPaidLoanSale(sale) && sale.loan_payment_method === filter;
+    return false;
   }
 
   return sale?.payment_method === filter;
@@ -4766,18 +10539,54 @@ async function loadSalesByDateFilter(filterType, startDate = null, endDate = nul
   
   console.log('Loading sales for filter type:', filterType);
   
+  // Helper for turning YYYY-MM-DD into an ISO datetime range in the user's locale.
+  const ymdToIsoStart = (ymd) => {
+    try { return new Date(`${ymd}T00:00:00`).toISOString(); } catch { return null; }
+  };
+  const ymdToIsoEnd = (ymd) => {
+    try { return new Date(`${ymd}T23:59:59`).toISOString(); } catch { return null; }
+  };
+
+  let paymentRangeStart = null;
+  let paymentRangeEnd = null;
+
   switch (filterType) {
     case 'today':
       salesData = await window.api.getTodaySales();
       console.log('Today sales data:', salesData);
       currentSalesFilter = { type: 'today', data: salesData };
+      try {
+        if (window.api?.getBusinessDayRange) {
+          const biz = await window.api.getBusinessDayRange('today');
+          paymentRangeStart = biz?.startDateTime || null;
+          paymentRangeEnd = biz?.endDateTime || null;
+        }
+      } catch {
+        // ignore
+      }
       break;
     case 'yesterday':
-      const yesterday = new Date();
-      yesterday.setDate(yesterday.getDate() - 1);
-      const yesterdayStr = yesterday.toISOString().split('T')[0];
-      salesData = await window.api.getSalesByDateRange(yesterdayStr, yesterdayStr);
-      currentSalesFilter = { type: 'yesterday', data: salesData, startDate: yesterdayStr, endDate: yesterdayStr };
+      if (window.api?.getYesterdaySales) {
+        salesData = await window.api.getYesterdaySales();
+        currentSalesFilter = { type: 'yesterday', data: salesData };
+        try {
+          if (window.api?.getBusinessDayRange) {
+            const biz = await window.api.getBusinessDayRange('yesterday');
+            paymentRangeStart = biz?.startDateTime || null;
+            paymentRangeEnd = biz?.endDateTime || null;
+          }
+        } catch {
+          // ignore
+        }
+      } else {
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayStr = yesterday.toISOString().split('T')[0];
+        salesData = await window.api.getSalesByDateRange(yesterdayStr, yesterdayStr);
+        currentSalesFilter = { type: 'yesterday', data: salesData, startDate: yesterdayStr, endDate: yesterdayStr };
+        paymentRangeStart = ymdToIsoStart(yesterdayStr);
+        paymentRangeEnd = ymdToIsoEnd(yesterdayStr);
+      }
       break;
     case 'week':
       const currentDate = new Date();
@@ -4792,6 +10601,8 @@ async function loadSalesByDateFilter(filterType, startDate = null, endDate = nul
       );
       console.log('Week sales data:', salesData);
       currentSalesFilter = { type: 'week', data: salesData, startDate: weekStartDate.toISOString().split('T')[0], endDate: weekEndDate.toISOString().split('T')[0] };
+      paymentRangeStart = ymdToIsoStart(currentSalesFilter.startDate);
+      paymentRangeEnd = ymdToIsoEnd(currentSalesFilter.endDate);
       break;
     case 'month':
       const today = new Date();
@@ -4802,6 +10613,8 @@ async function loadSalesByDateFilter(filterType, startDate = null, endDate = nul
         monthEndDate.toISOString().split('T')[0]
       );
       currentSalesFilter = { type: 'month', data: salesData, startDate: monthStartDate.toISOString().split('T')[0], endDate: monthEndDate.toISOString().split('T')[0] };
+      paymentRangeStart = ymdToIsoStart(currentSalesFilter.startDate);
+      paymentRangeEnd = ymdToIsoEnd(currentSalesFilter.endDate);
       break;
     case 'year':
       const todayDate = new Date();
@@ -4814,23 +10627,57 @@ async function loadSalesByDateFilter(filterType, startDate = null, endDate = nul
       );
       console.log('Year sales data:', salesData);
       currentSalesFilter = { type: 'year', data: salesData, startDate: yearStartDate.toISOString().split('T')[0], endDate: yearEndDate.toISOString().split('T')[0] };
+      paymentRangeStart = ymdToIsoStart(currentSalesFilter.startDate);
+      paymentRangeEnd = ymdToIsoEnd(currentSalesFilter.endDate);
       break;
     case 'custom':
       if (!startDate || !endDate) return;
       salesData = await window.api.getSalesByDateRange(startDate, endDate);
       currentSalesFilter = { type: 'custom', data: salesData, startDate, endDate };
+      paymentRangeStart = ymdToIsoStart(startDate);
+      paymentRangeEnd = ymdToIsoEnd(endDate);
       break;
     default:
       salesData = await window.api.getTodaySales();
       currentSalesFilter = { type: 'today', data: salesData };
   }
+
+  // Merge loan payments into Sales History so PARKING shows only when paid.
+  const baseSales = salesData?.sales || [];
+  let paymentEntries = [];
+  try {
+    if (paymentRangeStart && paymentRangeEnd && window.api?.getLoanPaymentsDetailedByDateTimeRange) {
+      const paid = await window.api.getLoanPaymentsDetailedByDateTimeRange(paymentRangeStart, paymentRangeEnd, null);
+      const rows = Array.isArray(paid) ? paid : [];
+      paymentEntries = rows.map((p) => {
+        const amt = Number(p?.amount || 0) || 0;
+        const pm = (p?.payment_method || '').toString().toLowerCase();
+        return {
+          __type: 'loan_payment',
+          id: `lp_${p?.id ?? ''}`,
+          sale_id: p?.sale_id ?? null,
+          sale_date: p?.payment_date || new Date().toISOString(),
+          subtotal: amt,
+          tax: 0,
+          total: amt,
+          payment_method: pm,
+          items: Array.isArray(p?.items) ? p.items : []
+        };
+      }).filter(r => r.payment_method === 'cash' || r.payment_method === 'card');
+    }
+  } catch {
+    paymentEntries = [];
+  }
+
+  allSalesData = [...baseSales, ...paymentEntries]
+    .filter(Boolean)
+    .sort((a, b) => {
+      const at = Date.parse(a?.sale_date || '') || 0;
+      const bt = Date.parse(b?.sale_date || '') || 0;
+      return bt - at;
+    });
   
-  allSalesData = salesData.sales || [];
-  
-  // Update summary
-  updateSalesSummary(salesData.summary || calculateSummary(allSalesData), filterType);
-  
-  // Display filtered sales
+  // Display filtered sales (this recalculates summary to match the table)
   displayFilteredSales();
 }
 
@@ -4874,6 +10721,16 @@ function calculateSummary(sales) {
 
 function updateSalesSummary(summary, filterType = 'today') {
   const summaryDiv = document.getElementById('todaySummary');
+  if (!summaryDiv) return;
+
+  // Cashier (and any role without reports permission) should not see sales totals in the header.
+  if (!hasPermission('reports')) {
+    summaryDiv.style.display = 'none';
+    summaryDiv.innerHTML = '';
+    return;
+  }
+
+  summaryDiv.style.display = '';
   const currencySymbol = systemSettings?.currency_symbol || '€';
   
   let periodText = 'Today\'s';
@@ -4885,10 +10742,18 @@ function updateSalesSummary(summary, filterType = 'today') {
     case 'custom': periodText = 'Filtered'; break;
   }
   
-  summaryDiv.innerHTML = `
-    ${periodText} Sales: <strong>${summary.transaction_count}</strong> transactions | 
-    Total: <strong>${currencySymbol}${(summary.total_sales || 0).toFixed(2)}</strong>
-  `;
+  const gross = Number(summary.total_sales || 0);
+  const returnsAmount = Number(summary.returns_amount || 0);
+  const net = gross - returnsAmount;
+
+  const refundedCount = Number(summary.refunded_count || 0);
+  const netTxnCount = Number.isFinite(Number(summary.net_transaction_count))
+    ? Number(summary.net_transaction_count)
+    : (Number(summary.transaction_count || 0) - refundedCount);
+
+  summaryDiv.innerHTML = (returnsAmount > 0 || refundedCount > 0)
+    ? `${periodText} Sales: <strong>${summary.transaction_count}</strong> transactions | Refunded: <strong>${refundedCount}</strong> | Net txns: <strong>${netTxnCount}</strong> | Gross: <strong>${currencySymbol}${gross.toFixed(2)}</strong> | Returns: <strong>${currencySymbol}${returnsAmount.toFixed(2)}</strong> | Net: <strong>${currencySymbol}${net.toFixed(2)}</strong>`
+    : `${periodText} Sales: <strong>${summary.transaction_count}</strong> transactions | Total: <strong>${currencySymbol}${gross.toFixed(2)}</strong>`;
 }
 
 function setupPaymentFilters() {
@@ -4919,8 +10784,52 @@ async function displayFilteredSales() {
     filteredSales = allSalesData.filter(sale => saleMatchesPaymentFilter(sale, 'all'));
   }
 
-  // Keep the summary in sync with what the table shows
-  updateSalesSummary(calculateSummary(filteredSales), currentSalesFilter?.type || 'today');
+  // Keep the summary in sync with what the table shows (include returns for the same period)
+  const baseSummary = calculateSummary(filteredSales);
+  try {
+    const now = new Date();
+    let startDate;
+    let endDate;
+
+    if ((currentSalesFilter?.type || 'today') === 'today') {
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const dd = String(now.getDate()).padStart(2, '0');
+      startDate = `${yyyy}-${mm}-${dd}`;
+      endDate = startDate;
+    } else if (currentSalesFilter?.type === 'yesterday') {
+      const y = new Date(now);
+      y.setDate(y.getDate() - 1);
+      const yyyy = y.getFullYear();
+      const mm = String(y.getMonth() + 1).padStart(2, '0');
+      const dd = String(y.getDate()).padStart(2, '0');
+      startDate = `${yyyy}-${mm}-${dd}`;
+      endDate = startDate;
+    } else if (currentSalesFilter?.type === 'week' || currentSalesFilter?.type === 'month' || currentSalesFilter?.type === 'year' || currentSalesFilter?.type === 'custom') {
+      startDate = currentSalesFilter?.startDate || null;
+      endDate = currentSalesFilter?.endDate || null;
+    }
+
+    if (startDate && endDate) {
+      const returns = await window.api.getReturnsByDateRange(startDate, endDate);
+      const parsedReturns = Array.isArray(returns) ? returns : (returns?.returns || []);
+      parsedReturns.forEach(r => {
+        if (r.items) {
+          try {
+            r.items = typeof r.items === 'string' ? JSON.parse(r.items) : r.items;
+          } catch {
+            r.items = [];
+          }
+        }
+      });
+
+      const deduped = dedupeReturnsByOriginalSaleId(parsedReturns);
+      baseSummary.returns_amount = deduped.reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
+    }
+  } catch {
+    // ignore returns summary errors
+  }
+  updateSalesSummary(baseSummary, currentSalesFilter?.type || 'today');
   
   if (filteredSales.length === 0) {
     tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="icon">💰</div><p>No sales found</p></td></tr>';
@@ -4930,30 +10839,78 @@ async function displayFilteredSales() {
   // Fetch items for all sales
   const salesWithItems = await Promise.all(
     filteredSales.map(async (sale) => {
+      if (sale?.__type === 'loan_payment') {
+        if (!Array.isArray(sale.items) || sale.items.length === 0) {
+          sale.items = [{ product_name: 'Payment', quantity: 1 }];
+        }
+        return sale;
+      }
       const fullSale = await window.api.getSaleById(sale.id);
       return fullSale;
     })
   );
+
+  // Hide refunded receipts from Sales History
+  const visibleSales = salesWithItems.filter(s => !s?.return);
+  const refundedCount = salesWithItems.length - visibleSales.length;
+
+  // Update summary counts to match what the table shows
+  baseSummary.refunded_count = refundedCount;
+  baseSummary.net_transaction_count = visibleSales.length;
+  updateSalesSummary(baseSummary, currentSalesFilter?.type || 'today');
+
+  if (visibleSales.length === 0 && salesWithItems.length > 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="icon">↩️</div><p>All sales in this period were refunded</p></td></tr>';
+    return;
+  }
   
-  tbody.innerHTML = salesWithItems.map(sale => {
-    const date = new Date(sale.sale_date);
+  tbody.innerHTML = visibleSales.map(sale => {
+    const date = parseAppDateTimeLoose(sale.sale_date);
+    const saleDateTime = formatDateTimeWithDisplayTimeZone(date, 'en-GB', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
     const itemsList = sale.items.map(item => `${item.product_name} (${item.quantity})`).join(', ');
     const itemsShort = itemsList.length > 50 ? itemsList.substring(0, 50) + '...' : itemsList;
 
+    const refundedBadge = sale?.return
+      ? ' <span class="status-badge status-refunded">Refunded</span>'
+      : '';
+
     const displayMethod = getDisplayPaymentMethod(sale);
+
+    const loanType = (sale?.loan_customer_type || '').toString().toLowerCase();
+    const restaurantName = (sale?.loan_restaurant_name || '').toString().trim();
+    const customerName = (sale?.loan_customer_name || '').toString().trim();
+    const partyLabel = (loanType === 'restaurant' && restaurantName)
+      ? `🍽️ ${restaurantName}`
+      : (customerName ? `👤 ${customerName}` : '');
+
+     const titleText = partyLabel ? `${partyLabel} — ${itemsList}` : itemsList;
+     const itemsCellHtml = partyLabel
+      ? `<div style="font-weight: 800; color: #0f172a;">${partyLabel}${refundedBadge}</div>
+        <div style="font-size: 12px; color: #64748b; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${itemsShort}</div>`
+      : `${itemsShort}${refundedBadge}`;
     
     return `
       <tr>
-        <td>${date.toLocaleString()}</td>
-        <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${itemsList}">
-          ${itemsShort}
+        <td>${saleDateTime}</td>
+        <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${titleText}">
+          ${itemsCellHtml}
         </td>
         <td>${currencySymbol}${sale.subtotal.toFixed(2)}</td>
         <td>${currencySymbol}${sale.tax.toFixed(2)}</td>
         <td style="font-weight: 700;">${currencySymbol}${sale.total.toFixed(2)}</td>
         <td><span class="payment-badge payment-${displayMethod}">${String(displayMethod || '').toUpperCase()}</span></td>
         <td>
-          <button class="action-btn" onclick="viewSale(${sale.id})" title="View">👁️</button>
+          ${sale?.__type === 'loan_payment'
+            ? (sale?.sale_id ? `<button class="action-btn" onclick="viewSale(${sale.sale_id})" title="View">👁️</button>` : '')
+            : `<button class="action-btn" onclick="viewSale(${sale.id})" title="View">👁️</button>`}
         </td>
       </tr>
     `;
@@ -4987,6 +10944,7 @@ async function printSalesHistoryThermal() {
 
     const settings = systemSettings;
     const currencySymbol = settings?.currency_symbol || '€';
+    const timeZone = getDisplayTimeZone();
     const printerName = (settings?.printer_name || '').toString().toLowerCase();
 
     const inferLineWidth = (printer) => {
@@ -5039,8 +10997,53 @@ async function printSalesHistoryThermal() {
       return num.toFixed(2).replace('.', ',') + currencySymbol;
     };
 
+    const parseDateTimeLoose = (value) => {
+      if (!value) return new Date();
+      const s = String(value).trim();
+      // SQLite CURRENT_TIMESTAMP often returns: "YYYY-MM-DD HH:MM:SS" (UTC)
+      if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) {
+        return new Date(s.replace(' ', 'T') + 'Z');
+      }
+      return new Date(s);
+    };
+
+    const fmtDateTz = (d) => {
+      const dt = (d instanceof Date) ? d : new Date(d);
+      try {
+        return new Intl.DateTimeFormat('es-ES', {
+          timeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).format(dt);
+      } catch {
+        return formatDateWithDisplayTimeZone(dt, 'es-ES');
+      }
+    };
+
+    const fmtTimeTz = (d, { withSeconds = true } = {}) => {
+      const dt = (d instanceof Date) ? d : new Date(d);
+      try {
+        return new Intl.DateTimeFormat('es-ES', {
+          timeZone,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: withSeconds ? '2-digit' : undefined,
+          hour12: false
+        }).format(dt);
+      } catch {
+        return formatTimeWithDisplayTimeZone(dt, 'es-ES');
+      }
+    };
+
+    const parseYmdLocal = (ymd) => {
+      const s = String(ymd || '').trim();
+      // Treat as local wall time at 00:00 (avoid UTC parsing of YYYY-MM-DD)
+      return s ? new Date(`${s}T00:00:00`) : new Date();
+    };
+
     const now = new Date();
-    const time = now.toLocaleTimeString('es-ES');
+    const time = fmtTimeTz(now, { withSeconds: true });
 
     // Determine title + date range
     let reportTitle = 'VENTAS';
@@ -5048,39 +11051,38 @@ async function printSalesHistoryThermal() {
     switch (currentSalesFilter?.type) {
       case 'today':
         reportTitle = 'VENTAS (HOY)';
-        dateRange = now.toLocaleDateString('es-ES');
+        dateRange = fmtDateTz(now);
         break;
       case 'yesterday': {
         reportTitle = 'VENTAS (AYER)';
         const d = new Date(now);
         d.setDate(d.getDate() - 1);
-        dateRange = d.toLocaleDateString('es-ES');
+        dateRange = fmtDateTz(d);
         break;
       }
       case 'week':
         reportTitle = 'VENTAS (SEMANA)';
-        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        dateRange = `${fmtDateTz(parseYmdLocal(currentSalesFilter.startDate))} - ${fmtDateTz(parseYmdLocal(currentSalesFilter.endDate))}`;
         break;
       case 'month':
         reportTitle = 'VENTAS (MES)';
-        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        dateRange = `${fmtDateTz(parseYmdLocal(currentSalesFilter.startDate))} - ${fmtDateTz(parseYmdLocal(currentSalesFilter.endDate))}`;
         break;
       case 'year':
         reportTitle = 'VENTAS (ANO)';
-        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        dateRange = `${fmtDateTz(parseYmdLocal(currentSalesFilter.startDate))} - ${fmtDateTz(parseYmdLocal(currentSalesFilter.endDate))}`;
         break;
       case 'custom':
         reportTitle = 'VENTAS (RANGO)';
-        dateRange = `${new Date(currentSalesFilter.startDate).toLocaleDateString('es-ES')} - ${new Date(currentSalesFilter.endDate).toLocaleDateString('es-ES')}`;
+        dateRange = `${fmtDateTz(parseYmdLocal(currentSalesFilter.startDate))} - ${fmtDateTz(parseYmdLocal(currentSalesFilter.endDate))}`;
         break;
       default:
         reportTitle = 'VENTAS';
-        dateRange = now.toLocaleDateString('es-ES');
+        dateRange = fmtDateTz(now);
     }
 
     if (currentPaymentFilter && currentPaymentFilter !== 'all') {
-      const suffix = currentPaymentFilter === 'loan' ? 'PARKING'
-        : currentPaymentFilter.toUpperCase();
+      const suffix = currentPaymentFilter.toUpperCase();
       reportTitle += ` (${suffix})`;
     }
 
@@ -5092,8 +11094,6 @@ async function printSalesHistoryThermal() {
       cash: 0,
       card: 0,
       split: 0,
-      parkingOpen: 0,
-      parkingPaid: 0,
       count: filteredSales.length
     };
 
@@ -5109,12 +11109,6 @@ async function printSalesHistoryThermal() {
       if (method === 'cash') totals.cash += total;
       else if (method === 'card') totals.card += total;
       else if ((sale?.payment_method || '').toString().toLowerCase() === 'split') totals.split += total;
-      else if ((sale?.payment_method || '').toString().toLowerCase() === 'loan') {
-        // Outstanding parking (not yet paid)
-        const st = (sale?.loan_status || '').toString().toLowerCase();
-        if (st === 'paid') totals.parkingPaid += total;
-        else totals.parkingOpen += total;
-      }
     }
 
     const ESC = '\x1B';
@@ -5138,9 +11132,6 @@ async function printSalesHistoryThermal() {
     if (totals.split > 0.009) {
       receipt += rightLabelValue('SPLIT', formatMoney(totals.split)) + '\n';
     }
-    if (totals.parkingOpen > 0.009) {
-      receipt += rightLabelValue('PARKING (OPEN)', formatMoney(totals.parkingOpen)) + '\n';
-    }
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
 
     receipt += center('DETALLE') + '\n';
@@ -5161,10 +11152,12 @@ async function printSalesHistoryThermal() {
     const rows = filteredSales.slice(0, 60); // keep thermal output reasonable
     for (const sale of rows) {
       const id = String(sale?.id ?? '');
-      const dt = new Date(sale?.sale_date);
+      const dt = parseDateTimeLoose(sale?.sale_date);
       const t = Number.isNaN(dt.getTime())
         ? ''
-        : (LINE_WIDTH >= 42 ? dt.toLocaleTimeString('es-ES') : dt.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }));
+        : (LINE_WIDTH >= 42
+          ? fmtTimeTz(dt, { withSeconds: true })
+          : fmtTimeTz(dt, { withSeconds: false }));
       const method = (getDisplayPaymentMethod(sale) || '').toString().toUpperCase();
       const amount = formatMoney(sale?.total || 0);
 
@@ -5175,6 +11168,18 @@ async function printSalesHistoryThermal() {
         + ' '
         + padLeft(amount, amtWidth)
         + '\n';
+
+      // If it's a restaurant/customer PARKING sale, show the name on the next line.
+      const loanType = (sale?.loan_customer_type || '').toString().toLowerCase();
+      const rest = (sale?.loan_restaurant_name || '').toString().trim();
+      const cust = (sale?.loan_customer_name || '').toString().trim();
+      const label = (loanType === 'restaurant' && rest)
+        ? ('R: ' + rest)
+        : (cust ? ('C: ' + cust) : '');
+      if (label) {
+        const line = '  ' + label;
+        receipt += padRight(line.slice(0, LINE_WIDTH), LINE_WIDTH) + '\n';
+      }
     }
 
     if (filteredSales.length > rows.length) {
@@ -5281,7 +11286,15 @@ function printTodaySalesWithTitle(salesData, title, dateRange) {
         <h1>${store.toUpperCase()}</h1>
         <h2>${title}</h2>
         <p>${dateRange}</p>
-        <p>Generated: ${new Date().toLocaleString()}</p>
+        <p>Generated: ${formatDateTimeWithDisplayTimeZone(new Date(), 'en-GB', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        })}</p>
       </div>
       
       <div class="summary">
@@ -5317,7 +11330,15 @@ function printTodaySalesWithTitle(salesData, title, dateRange) {
         <tbody>
           ${salesData.sales.map(sale => `
             <tr>
-              <td>${new Date(sale.sale_date).toLocaleString()}</td>
+              <td>${formatDateTimeWithDisplayTimeZone(parseAppDateTimeLoose(sale.sale_date), 'en-GB', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+              })}</td>
               <td>${sale.items?.map(item => item.product_name + ' (' + item.quantity + ')').join(', ') || 'N/A'}</td>
               <td>${currency}${(sale.subtotal || 0).toFixed(2)}</td>
               <td>${currency}${(sale.tax || 0).toFixed(2)}</td>
@@ -5353,7 +11374,7 @@ function printTodaySales(todayData) {
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Today's Sales Report - ${today.toLocaleDateString()}</title>
+      <title>Today's Sales Report - ${formatDateWithDisplayTimeZone(today, 'en-GB')}</title>
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -5449,7 +11470,15 @@ function printTodaySales(todayData) {
       <div class="header">
         <h1>${storeName}</h1>
         <h2>Daily Sales Report</h2>
-        <p>${today.toLocaleDateString()} - ${today.toLocaleTimeString()}</p>
+        <p>${formatDateTimeWithDisplayTimeZone(today, 'en-GB', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        })}</p>
       </div>
       
       <div class="summary">
@@ -5481,10 +11510,16 @@ function printTodaySales(todayData) {
         </thead>
         <tbody>
           ${todayData.sales.map(sale => {
-            const date = new Date(sale.sale_date);
+            const date = parseAppDateTimeLoose(sale.sale_date);
+            const saleTime = formatDateTimeWithDisplayTimeZone(date, 'en-GB', {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+              hour12: false,
+            });
             return `
               <tr>
-                <td>${date.toLocaleTimeString()}</td>
+                <td>${saleTime}</td>
                 <td>#${sale.id}</td>
                 <td>${currencySymbol}${sale.subtotal.toFixed(2)}</td>
                 <td>${currencySymbol}${sale.tax.toFixed(2)}</td>
@@ -5507,7 +11542,15 @@ function printTodaySales(todayData) {
       
       <div class="footer">
         <p>Generated by ${storeName} POS System</p>
-        <p>${today.toLocaleString()}</p>
+        <p>${formatDateTimeWithDisplayTimeZone(today, 'en-GB', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        })}</p>
       </div>
       
       <script>
@@ -5592,41 +11635,50 @@ function loadReportsView() {
   const generateSalesReportBtn = document.getElementById('generateSalesReportBtn');
   if (generateSalesReportBtn) {
     generateSalesReportBtn.onclick = async () => {
-      const periodType = document.getElementById('reportPeriodType').value;
-      
-      let startDate, endDate;
-      
-      if (periodType === 'custom') {
-        startDate = document.getElementById('reportStartDate').value;
-        endDate = document.getElementById('reportEndDate').value;
-        
-        if (!startDate || !endDate) {
-          showAlert('Please select date range', 'warning', 'Missing Information');
-          return;
+      try {
+        generateSalesReportBtn.disabled = true;
+
+        const periodType = document.getElementById('reportPeriodType').value;
+
+        let startDate, endDate;
+
+        if (periodType === 'custom') {
+          startDate = document.getElementById('reportStartDate').value;
+          endDate = document.getElementById('reportEndDate').value;
+
+          if (!startDate || !endDate) {
+            showAlert('Please select date range', 'warning', 'Missing Information');
+            return;
+          }
+        } else if (periodType === 'daily') {
+          const year = parseInt(document.getElementById('reportYear').value);
+          startDate = `${year}-01-01`;
+          endDate = `${year}-12-31`;
+        } else if (periodType === 'weekly') {
+          const year = parseInt(document.getElementById('reportYear').value);
+          startDate = `${year}-01-01`;
+          endDate = `${year}-12-31`;
+        } else if (periodType === 'monthly') {
+          const year = parseInt(document.getElementById('reportYear').value);
+          const month = parseInt(document.getElementById('reportMonth').value);
+          startDate = `${year}-${String(month).padStart(2, '0')}-01`;
+          const lastDay = new Date(year, month, 0).getDate();
+          endDate = `${year}-${String(month).padStart(2, '0')}-${lastDay}`;
+        } else if (periodType === 'yearly') {
+          const year = parseInt(document.getElementById('reportYear').value);
+          startDate = `${year}-01-01`;
+          endDate = `${year}-12-31`;
         }
-      } else if (periodType === 'daily') {
-        const year = parseInt(document.getElementById('reportYear').value);
-        startDate = `${year}-01-01`;
-        endDate = `${year}-12-31`;
-      } else if (periodType === 'weekly') {
-        const year = parseInt(document.getElementById('reportYear').value);
-        startDate = `${year}-01-01`;
-        endDate = `${year}-12-31`;
-      } else if (periodType === 'monthly') {
-        const year = parseInt(document.getElementById('reportYear').value);
-        const month = parseInt(document.getElementById('reportMonth').value);
-        startDate = `${year}-${String(month).padStart(2, '0')}-01`;
-        const lastDay = new Date(year, month, 0).getDate();
-        endDate = `${year}-${String(month).padStart(2, '0')}-${lastDay}`;
-      } else if (periodType === 'yearly') {
-        const year = parseInt(document.getElementById('reportYear').value);
-        startDate = `${year}-01-01`;
-        endDate = `${year}-12-31`;
+
+        const report = await window.api.getSalesReport(startDate, endDate);
+        currentSalesReportPrintContext = { report, periodType, startDate, endDate };
+        displayReport(report, periodType);
+      } catch (e) {
+        console.error('Sales report error:', e);
+        showAlert('Error generating report: ' + String(e?.message || e || 'Unknown error'), 'error', 'Report');
+      } finally {
+        generateSalesReportBtn.disabled = false;
       }
-      
-      const report = await window.api.getSalesReport(startDate, endDate);
-      currentSalesReportPrintContext = { report, periodType, startDate, endDate };
-      displayReport(report, periodType);
     };
   }
 
@@ -5664,11 +11716,20 @@ function loadReportsView() {
 function displayReport(report, periodType = 'custom') {
   const container = document.getElementById('reportResults');
   const currencySymbol = systemSettings?.currency_symbol || '€';
-  
-  const totalSales = report.sales.reduce((sum, day) => sum + (day.total_sales || 0), 0);
-  const totalTransactions = report.sales.reduce((sum, day) => sum + day.transaction_count, 0);
-  const totalTax = report.sales.reduce((sum, day) => sum + (day.tax || 0), 0);
-  const totalSubtotal = report.sales.reduce((sum, day) => sum + (day.subtotal || 0), 0);
+
+  const salesRows = Array.isArray(report?.sales) ? report.sales : [];
+  const topProductsRows = Array.isArray(report?.topProducts) ? report.topProducts : [];
+
+  const totalNetSales = salesRows.reduce((sum, day) => sum + (day.total_sales || 0), 0);
+  const totalGrossSales = salesRows.reduce((sum, day) => sum + (day.gross_sales || 0), 0);
+  const totalReturnsAmount = salesRows.reduce((sum, day) => sum + (day.returns_amount || 0), 0);
+
+  const totalGrossTransactions = salesRows.reduce((sum, day) => sum + (day.gross_transactions || 0), 0);
+  const totalReturnsCount = salesRows.reduce((sum, day) => sum + (day.return_count || 0), 0);
+  const totalTransactions = Math.max(0, totalGrossTransactions - totalReturnsCount);
+
+  const totalTax = salesRows.reduce((sum, day) => sum + (day.tax || 0), 0);
+  const totalSubtotal = salesRows.reduce((sum, day) => sum + (day.subtotal || 0), 0);
   
   let periodTitle = 'Sales Report';
   if (periodType === 'daily') periodTitle = 'Daily Sales Report';
@@ -5677,10 +11738,10 @@ function displayReport(report, periodType = 'custom') {
   else if (periodType === 'yearly') periodTitle = 'Yearly Sales Report';
   
   // Group by week for weekly reports
-  let groupedData = report.sales;
+  let groupedData = salesRows;
   if (periodType === 'weekly') {
     const weekMap = {};
-    report.sales.forEach(day => {
+    salesRows.forEach(day => {
       const date = new Date(day.date);
       const weekNum = getWeekNumber(date);
       const weekKey = `Week ${weekNum} (${date.getFullYear()})`;
@@ -5708,7 +11769,7 @@ function displayReport(report, periodType = 'custom') {
     const monthMap = {};
     const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     
-    report.sales.forEach(day => {
+    salesRows.forEach(day => {
       const date = new Date(day.date);
       const monthKey = monthNames[date.getMonth()];
       
@@ -5735,16 +11796,18 @@ function displayReport(report, periodType = 'custom') {
       <h3>${periodTitle}</h3>
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 20px;">
         <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
-          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Total Sales</div>
-          <div style="font-size: 32px; font-weight: 800;">${currencySymbol}${totalSales.toFixed(2)}</div>
+          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Total Sales (Net)</div>
+          <div style="font-size: 32px; font-weight: 800;">${currencySymbol}${totalNetSales.toFixed(2)}</div>
+          ${totalReturnsAmount > 0 ? `<div style="margin-top: 6px; font-size: 12px; opacity: 0.95;">Gross: ${currencySymbol}${totalGrossSales.toFixed(2)} | Returns: ${currencySymbol}${totalReturnsAmount.toFixed(2)}</div>` : ''}
         </div>
         <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
-          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Transactions</div>
+          <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Transactions (Net)</div>
           <div style="font-size: 32px; font-weight: 800;">${totalTransactions}</div>
+          ${totalReturnsCount > 0 ? `<div style="margin-top: 6px; font-size: 12px; opacity: 0.95;">Sales: ${totalGrossTransactions} | Returns: ${totalReturnsCount}</div>` : ''}
         </div>
         <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
           <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Avg Transaction</div>
-          <div style="font-size: 32px; font-weight: 800;">${currencySymbol}${(totalSales / totalTransactions || 0).toFixed(2)}</div>
+          <div style="font-size: 32px; font-weight: 800;">${currencySymbol}${(totalNetSales / totalTransactions || 0).toFixed(2)}</div>
         </div>
         <div style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); color: white; padding: 20px; border-radius: 12px; text-align: center;">
           <div style="font-size: 14px; opacity: 0.9; margin-bottom: 8px;">Total Tax</div>
@@ -5783,7 +11846,7 @@ function displayReport(report, periodType = 'custom') {
               <td>${totalTransactions}</td>
               <td>${currencySymbol}${totalSubtotal.toFixed(2)}</td>
               <td>${currencySymbol}${totalTax.toFixed(2)}</td>
-              <td style="color: #6E8FAF;">${currencySymbol}${totalSales.toFixed(2)}</td>
+              <td style="color: #6E8FAF;">${currencySymbol}${totalNetSales.toFixed(2)}</td>
             </tr>
           </tfoot>
         </table>
@@ -5803,7 +11866,7 @@ function displayReport(report, periodType = 'custom') {
             </tr>
           </thead>
           <tbody>
-            ${report.topProducts.map((product, index) => `
+            ${topProductsRows.map((product, index) => `
               <tr>
                 <td style="font-weight: 700; color: #6E8FAF;">${index + 1}</td>
                 <td style="font-weight: 600;">${product.product_name}</td>
@@ -5833,6 +11896,7 @@ async function printSalesReportThermal() {
     const settings = await window.api.getSystemSettings();
     const currencySymbol = settings?.currency_symbol || '€';
     const printerName = (settings?.printer_name || '').toString().toLowerCase();
+    const timeZone = getDisplayTimeZone();
 
     const inferLineWidth = (printer) => {
       const name = String(printer || '').toLowerCase();
@@ -5884,11 +11948,38 @@ async function printSalesReportThermal() {
       return num.toFixed(2).replace('.', ',') + currencySymbol;
     };
 
+    const fmtDateTz = (dt) => {
+      try {
+        return new Intl.DateTimeFormat('es-ES', {
+          timeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).format(dt);
+      } catch {
+        return formatDateWithDisplayTimeZone(dt, 'es-ES');
+      }
+    };
+
+    const fmtTimeTz = (dt) => {
+      try {
+        return new Intl.DateTimeFormat('es-ES', {
+          timeZone,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        }).format(dt);
+      } catch {
+        return formatTimeWithDisplayTimeZone(dt, 'es-ES');
+      }
+    };
+
     const fmtDate = (d) => {
       if (!d) return '';
       // Accept YYYY-MM-DD or ISO
       const dt = String(d).includes('T') ? new Date(d) : new Date(`${d}T00:00:00`);
-      return dt.toLocaleDateString('es-ES');
+      return fmtDateTz(dt);
     };
 
     const totalSales = (report.sales || []).reduce((sum, day) => sum + (day.total_sales || 0), 0);
@@ -5897,7 +11988,7 @@ async function printSalesReportThermal() {
     const totalSubtotal = (report.sales || []).reduce((sum, day) => sum + (day.subtotal || 0), 0);
 
     const now = new Date();
-    const time = now.toLocaleTimeString('es-ES');
+    const time = fmtTimeTz(now);
     const title = periodType === 'daily' ? 'INFORME DE VENTAS (DIARIO)'
       : periodType === 'weekly' ? 'INFORME DE VENTAS (SEMANAL)'
       : periodType === 'monthly' ? 'INFORME DE VENTAS (MENSUAL)'
@@ -6061,7 +12152,7 @@ function displayRestaurantReport(restaurants, month, year) {
               ${restaurant.orders.map(order => `
                 <tr>
                   <td>${order.receiptNumber}</td>
-                  <td>${new Date(order.date).toLocaleDateString()}</td>
+                  <td>${formatDateWithDisplayTimeZone(new Date(order.date), 'en-GB')}</td>
                   <td>€${order.amount.toFixed(2)}</td>
                   <td><span class="status-badge status-${order.status}">${order.status.toUpperCase()}</span></td>
                 </tr>
@@ -6082,6 +12173,7 @@ function displayRestaurantReport(restaurants, month, year) {
 async function loadInventoryView() {
   const inventory = await window.api.getInventoryReport();
   const tbody = document.querySelector('#inventoryTable tbody');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
   
   if (inventory.length === 0) {
     tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><div class="icon">📋</div><p>No inventory</p></td></tr>';
@@ -6100,7 +12192,7 @@ async function loadInventoryView() {
         <td>${item.stock}</td>
         <td>${item.min_stock}</td>
         <td><span class="status-badge ${statusClass}">${item.status}</span></td>
-        <td>$${item.inventory_value.toFixed(2)}</td>
+        <td>${currencySymbol}${Number(item.inventory_value || 0).toFixed(2)}</td>
       </tr>
     `;
   }).join('');
@@ -6110,7 +12202,7 @@ async function loadInventoryView() {
   const row = tbody.insertRow();
   row.innerHTML = `
     <td colspan="5" style="text-align: right; font-weight: bold;">Total Inventory Value:</td>
-    <td style="font-weight: bold;">$${totalValue.toFixed(2)}</td>
+    <td style="font-weight: bold;">${currencySymbol}${Number(totalValue || 0).toFixed(2)}</td>
   `;
 }
 
@@ -6149,14 +12241,16 @@ async function loadUsersView() {
   
   tbody.innerHTML = users.map(user => {
     const date = new Date(user.created_at);
-    const canDelete = user.id !== currentUser.id; // Can't delete self
+    const otherAdminExists = users.some(u => u.role === 'admin' && u.id !== currentUser.id);
+    const isSelf = user.id === currentUser.id;
+    const canDelete = !isSelf || (currentUser.role === 'admin' && otherAdminExists);
     
     return `
       <tr>
         <td>${user.username}</td>
         <td>${user.full_name}</td>
         <td><span class="role-badge ${user.role}">${user.role}</span></td>
-        <td>${date.toLocaleDateString()}</td>
+        <td>${formatDateWithDisplayTimeZone(date, 'en-GB')}</td>
         <td>
           <button class="action-btn" onclick="editUser(${user.id})" title="Edit">✏️</button>
           <button class="action-btn" onclick="changeUserPassword(${user.id})" title="Change Password">🔑</button>
@@ -6174,6 +12268,7 @@ function openUserModal(user = null) {
   const passwordGroup = document.getElementById('passwordGroup');
   const passwordInput = document.getElementById('userPassword');
   const usernameInput = document.getElementById('userUsername');
+  const fullNameInput = document.getElementById('userFullName');
   
   if (user) {
     title.textContent = 'Edit User';
@@ -6196,6 +12291,26 @@ function openUserModal(user = null) {
   }
   
   modal.classList.add('active');
+
+  // Touchscreen UX: focus the first editable field and force-open the
+  // on-screen keyboard. Without this, some Windows touch devices show the
+  // caret but skip opening the custom keyboard for edit-user flows.
+  try {
+    setTimeout(() => {
+      const field = usernameInput || fullNameInput || passwordInput;
+      if (!field || field.disabled || field.readOnly) return;
+      try { window.__virtualKeyboardForceOpen = true; } catch { /* ignore */ }
+      try {
+        field.focus();
+        field.select?.();
+        field.dispatchEvent(new Event('focusin', { bubbles: true }));
+      } catch {
+        // ignore
+      }
+    }, 50);
+  } catch {
+    // ignore
+  }
 }
 
 async function editUser(id) {
@@ -6206,15 +12321,54 @@ async function editUser(id) {
 }
 
 async function deleteUser(id) {
-  if (id === currentUser.id) {
-    alert('You cannot delete your own account');
+  const isSelf = id === currentUser.id;
+
+  // Self-delete is allowed only if another admin exists.
+  if (isSelf) {
+    if (currentUser.role !== 'admin') {
+      showAlert('You cannot delete your own account', 'warning', 'Not Allowed');
+      return;
+    }
+    try {
+      const users = await window.api.getAllUsers();
+      const otherAdminExists = Array.isArray(users) && users.some(u => u.role === 'admin' && u.id !== currentUser.id);
+      if (!otherAdminExists) {
+        showAlert('You cannot delete the last admin user. Create another admin first.', 'error', 'Not Allowed');
+        return;
+      }
+    } catch {
+      // If we can’t verify, DB will still protect the last admin.
+    }
+  }
+
+  const msg = isSelf
+    ? 'Are you sure you want to delete your own account?\n\nYou will be logged out immediately.'
+    : 'Are you sure you want to delete this user?';
+
+  if (!confirm(msg)) return;
+
+  const res = await window.api.deleteUser(id);
+  if (res && res.success === false) {
+    if (res.errorCode === 'LAST_ADMIN') {
+      showAlert('You cannot delete the last admin user. Create another admin first.', 'error', 'Not Allowed');
+      return;
+    }
+    if (res.errorCode === 'NOT_FOUND') {
+      showAlert('User not found (maybe already deleted).', 'warning', 'Not Found');
+      await loadUsersView();
+      return;
+    }
+    showAlert(res.message || 'Failed to delete user', 'error', 'Error');
     return;
   }
-  
-  if (confirm('Are you sure you want to delete this user?')) {
-    await window.api.deleteUser(id);
-    await loadUsersView();
+
+  if (isSelf) {
+    showAlert('Account deleted. Logging out...', 'info');
+    logoutToLoginScreen();
+    return;
   }
+
+  await loadUsersView();
 }
 
 async function saveUser() {
@@ -6228,17 +12382,40 @@ async function saveUser() {
   try {
     if (id) {
       // Update existing user
-      await window.api.updateUser(parseInt(id), user);
+      const res = await window.api.updateUser(parseInt(id), user);
+      if (res && res.success === false) {
+        const code = res.errorCode || 'UNKNOWN';
+        if (code === 'USERNAME_EXISTS') {
+          showAlert('This username already exists. Please choose a different username.', 'error', 'Duplicate Username');
+          return;
+        }
+        showAlert(res.message || 'Failed to update user', 'error', 'Error');
+        return;
+      }
     } else {
       // Add new user
       user.password = document.getElementById('userPassword').value;
-      await window.api.addUser(user);
+      const res = await window.api.addUser(user);
+      if (res && res.success === false) {
+        const code = res.errorCode || 'UNKNOWN';
+        if (code === 'USERNAME_EXISTS') {
+          showAlert('This username already exists. Please choose a different username.', 'error', 'Duplicate Username');
+          return;
+        }
+        showAlert(res.message || 'Failed to create user', 'error', 'Error');
+        return;
+      }
     }
     
     closeModal('userModal');
     await loadUsersView();
   } catch (error) {
-    alert('Error saving user: ' + error.message);
+    const msg = String(error?.message || error || 'Error saving user');
+    if (msg.includes('USERNAME_EXISTS') || msg.includes('UNIQUE constraint failed: users.username')) {
+      showAlert('This username already exists. Please choose a different username.', 'error', 'Duplicate Username');
+      return;
+    }
+    showAlert('Error saving user: ' + msg, 'error', 'Error');
   }
 }
 
@@ -6247,6 +12424,21 @@ function changeUserPassword(id) {
   document.getElementById('passwordUserId').value = id;
   document.getElementById('passwordForm').reset();
   modal.classList.add('active');
+
+  // The modal opens programmatically; on touch devices the virtual keyboard
+  // only auto-opens after an actual tap. Force it open for password entry.
+  try { window.__virtualKeyboardForceOpen = true; } catch { /* ignore */ }
+  setTimeout(() => {
+    try {
+      const first = document.getElementById('newPassword');
+      if (!first) return;
+      window.__virtualKeyboardForceOpen = true;
+      first.focus();
+      first.select?.();
+    } catch {
+      // ignore
+    }
+  }, 0);
 }
 
 async function changePassword() {
@@ -6255,21 +12447,21 @@ async function changePassword() {
   const confirmPassword = document.getElementById('confirmPassword').value;
   
   if (newPassword !== confirmPassword) {
-    alert('Passwords do not match');
+    showAlert('Passwords do not match', 'error', 'Invalid Password');
     return;
   }
   
   if (newPassword.length < 6) {
-    alert('Password must be at least 6 characters');
+    showAlert('Password must be at least 6 characters', 'error', 'Invalid Password');
     return;
   }
   
   try {
     await window.api.updateUserPassword(parseInt(id), newPassword);
     closeModal('passwordModal');
-    alert('Password updated successfully');
+    showAlert('Password updated successfully', 'success');
   } catch (error) {
-    alert('Error updating password: ' + error.message);
+    showAlert('Error updating password: ' + String(error?.message || error), 'error', 'Error');
   }
 }
 
@@ -6286,9 +12478,80 @@ function setupCategoryHandlers() {
     await saveCategory();
   });
 
+  // Bulk delete (Categories)
+  const bulkBtn = document.getElementById('bulkDeleteCategoriesBtn');
+  if (bulkBtn && !bulkBtn.dataset.listenerAttached) {
+    bulkBtn.dataset.listenerAttached = '1';
+    bulkBtn.addEventListener('click', async () => {
+      if (selectedCategoryIds.size === 0) return;
+      const ok = await showConfirmDialog({
+        title: 'Delete Selected Categories?',
+        message: `You selected ${selectedCategoryIds.size} category(s).\n\nThis will delete the category and its subcategories. Products keep their old category text in reports/history.`,
+        confirmText: 'Delete',
+        cancelText: 'Cancel',
+        tone: 'danger'
+      });
+      if (!ok) return;
+
+      const ids = Array.from(selectedCategoryIds);
+      let deleted = 0;
+      for (let i = 0; i < ids.length; i++) {
+        try {
+          await window.api.deleteCategory(ids[i]);
+          deleted++;
+        } catch {
+          // ignore per-item failures
+        }
+        if (i % 25 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+
+      selectedCategoryIds.clear();
+      await loadCategoriesView();
+      await loadCategoryTabs();
+      showAlert(`Deleted ${deleted} category(s).`, 'success');
+    });
+  }
+
+  // Selection handlers (Categories) - event delegation
+  const categoriesTable = document.getElementById('categoriesTable');
+  if (categoriesTable && !categoriesTable.dataset.selectionAttached) {
+    categoriesTable.dataset.selectionAttached = '1';
+    categoriesTable.addEventListener('change', (e) => {
+      const t = e.target;
+      if (!(t instanceof HTMLInputElement)) return;
+      if (t.id === 'categoriesSelectAll') {
+        const visible = Array.from(document.querySelectorAll('#categoriesTable tbody input.category-row-select'));
+        for (const cb of visible) {
+          cb.checked = t.checked;
+          const id = parseInt(cb.dataset.categoryId, 10);
+          if (!Number.isFinite(id)) continue;
+          if (t.checked) selectedCategoryIds.add(id);
+          else selectedCategoryIds.delete(id);
+        }
+        updateCategoriesBulkUi();
+        return;
+      }
+
+      if (t.classList.contains('category-row-select')) {
+        const id = parseInt(t.dataset.categoryId, 10);
+        if (!Number.isFinite(id)) return;
+        if (t.checked) selectedCategoryIds.add(id);
+        else selectedCategoryIds.delete(id);
+        updateCategoriesBulkUi();
+      }
+    });
+  }
+
   // Auto-update tax rate when category is selected in product form
   document.getElementById('productCategory')?.addEventListener('change', async (e) => {
     const categoryName = e.target.value;
+    if (!categoryName) {
+      const subcategorySelect = document.getElementById('productSubcategory');
+      const subcategoryGroup = document.getElementById('productSubcategoryGroup');
+      if (subcategoryGroup) subcategoryGroup.style.display = 'none';
+      if (subcategorySelect) subcategorySelect.innerHTML = '<option value="">-- No Subcategory --</option>';
+      return;
+    }
     const categories = await window.api.getAllCategories();
     const category = categories.find(c => c.name === categoryName);
     if (category) {
@@ -6316,35 +12579,103 @@ async function loadCategoriesView() {
   }
   
   const categories = await window.api.getAllCategories();
+  categoriesManagementList = Array.isArray(categories) ? categories : [];
+  categoriesPager.page = 1;
+  selectedCategoryIds.clear();
   const tbody = document.querySelector('#categoriesTable tbody');
   
-  if (categories.length === 0) {
+  if (categoriesManagementList.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><div class="icon">🏷️</div><p>No categories found. Add your first category!</p></td></tr>';
+    return;
+  }
+
+  ensurePaginationBar({
+    containerSelector: '#categoriesView .table-container',
+    barId: 'categoriesPagination',
+    onPrev: () => {
+      categoriesPager.page = Math.max(1, categoriesPager.page - 1);
+      renderCategoriesTable();
+    },
+    onNext: () => {
+      categoriesPager.page = categoriesPager.page + 1;
+      renderCategoriesTable();
+    },
+    onPerPage: (v) => {
+      categoriesPager.perPage = v;
+      categoriesPager.page = 1;
+      renderCategoriesTable();
+    }
+  });
+
+  renderCategoriesTable();
+}
+
+function renderCategoriesTable() {
+  const tbody = document.querySelector('#categoriesTable tbody');
+  if (!tbody) return;
+
+  const categories = categoriesManagementList || [];
+  const total = categories.length;
+  const totalPages = Math.max(1, Math.ceil(total / categoriesPager.perPage));
+  categoriesPager.page = Math.min(Math.max(1, categoriesPager.page), totalPages);
+  const startIndex = (categoriesPager.page - 1) * categoriesPager.perPage;
+  const pageRows = categories.slice(startIndex, startIndex + categoriesPager.perPage);
+
+  if (total === 0) {
     tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><div class="icon">🏷️</div><p>No categories found. Add your first category!</p></td></tr>';
+    updatePaginationBar('categoriesPagination', { page: 1, perPage: categoriesPager.perPage, total: 0 });
     return;
   }
   
-  tbody.innerHTML = categories.map(category => {
+  tbody.innerHTML = pageRows.map(category => {
     const date = new Date(category.created_at);
     const isFavorite = category.is_favorite === 1;
     const starIcon = isFavorite ? '⭐' : '☆';
     
     return `
       <tr>
+        <td style="text-align:center;">
+          <input class="category-row-select table-select" type="checkbox" data-category-id="${category.id}" ${selectedCategoryIds.has(category.id) ? 'checked' : ''} aria-label="Select category">
+        </td>
         <td>
           <button class="star-btn" onclick="toggleCategoryFavorite(${category.id}, ${!isFavorite})" title="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}">
             ${starIcon}
           </button>
         </td>
         <td>${category.name}</td>
-        <td>${(category.tax_rate * 100).toFixed(2)}%</td>
-        <td>${date.toLocaleDateString()}</td>
+        <td>${formatDateWithDisplayTimeZone(date, 'en-GB')}</td>
         <td>
           <button class="action-btn" onclick="editCategory(${category.id})" title="Edit">✏️</button>
-          <button class="action-btn" onclick="deleteCategory(${category.id})" title="Delete">🗑️</button>
+          <button class="action-btn delete-btn" onclick="deleteCategory(${category.id})" title="Delete">🗑️</button>
         </td>
       </tr>
     `;
   }).join('');
+
+  updatePaginationBar('categoriesPagination', { page: categoriesPager.page, perPage: categoriesPager.perPage, total });
+
+  updateCategoriesBulkUi(pageRows);
+}
+
+function updateCategoriesBulkUi(visibleRows = null) {
+  const bulkBtn = document.getElementById('bulkDeleteCategoriesBtn');
+  if (bulkBtn) bulkBtn.disabled = selectedCategoryIds.size === 0;
+
+  const selectAll = document.getElementById('categoriesSelectAll');
+  if (!selectAll) return;
+  const visible = visibleRows
+    ? visibleRows.map(c => c.id)
+    : Array.from(document.querySelectorAll('#categoriesTable tbody input.category-row-select')).map(cb => parseInt(cb.dataset.categoryId, 10)).filter(Number.isFinite);
+
+  if (visible.length === 0) {
+    selectAll.checked = false;
+    selectAll.indeterminate = false;
+    return;
+  }
+
+  const selectedVisible = visible.filter(id => selectedCategoryIds.has(id)).length;
+  selectAll.checked = selectedVisible === visible.length;
+  selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
 }
 
 async function toggleCategoryFavorite(id, isFavorite) {
@@ -6378,7 +12709,6 @@ async function openCategoryModal(category = null) {
     title.textContent = 'Edit Category';
     document.getElementById('categoryId').value = category.id;
     document.getElementById('categoryName').value = category.name;
-    document.getElementById('categoryTaxRate').value = (category.tax_rate * 100).toFixed(2);
     
     // Show subcategories section when editing
     subcategoriesSection.style.display = 'block';
@@ -6393,6 +12723,27 @@ async function openCategoryModal(category = null) {
   }
   
   modal.classList.add('active');
+
+  // Touchscreen UX: auto-focus name field and force-open the on-screen keyboard.
+  // Without this, focus may be set programmatically and the keyboard won't open.
+  try {
+    const nameEl = document.getElementById('categoryName');
+    if (nameEl) {
+      setTimeout(() => {
+        try {
+          window.__virtualKeyboardForceOpen = true;
+          nameEl.focus();
+          nameEl.select?.();
+          // Nudge focusin listeners in older Chromium builds.
+          nameEl.dispatchEvent(new Event('focusin', { bubbles: true }));
+        } catch {
+          // ignore
+        }
+      }, 30);
+    }
+  } catch {
+    // ignore
+  }
 }
 
 async function loadSubcategoriesForCategory(categoryId) {
@@ -6464,7 +12815,8 @@ async function saveCategory() {
   const id = document.getElementById('categoryId').value;
   const category = {
     name: document.getElementById('categoryName').value.trim(),
-    taxRate: parseFloat(document.getElementById('categoryTaxRate').value) / 100
+    // VAT is product-level; keep category tax rate at 0 for backwards compatibility.
+    taxRate: 0
   };
   
   if (!category.name) {
@@ -6658,14 +13010,18 @@ async function loadCategoriesForProductForm() {
   const categories = await window.api.getAllCategories();
   const categorySelect = document.getElementById('productCategory');
   const currentValue = categorySelect.value;
-  
-  categorySelect.innerHTML = categories.map(cat => 
-    `<option value="${cat.name}">${cat.name} (${(cat.tax_rate * 100).toFixed(2)}% tax)</option>`
-  ).join('');
-  
-  // Restore previous selection if it still exists
+
+  const opts = [
+    '<option value="">-- No Category --</option>',
+    ...categories.map(cat => `<option value="${cat.name}">${cat.name} (${(cat.tax_rate * 100).toFixed(2)}% tax)</option>`)
+  ];
+  categorySelect.innerHTML = opts.join('');
+
+  // Restore previous selection if it still exists; otherwise keep empty.
   if (currentValue && categories.some(c => c.name === currentValue)) {
     categorySelect.value = currentValue;
+  } else {
+    categorySelect.value = '';
   }
 }
 
@@ -6701,7 +13057,12 @@ async function loadSystemSettingsView() {
     
     document.getElementById('currencySymbol').value = systemSettings.currency_symbol || '€';
     document.getElementById('currencyCode').value = systemSettings.currency_code || 'EUR';
-    document.getElementById('taxRate').value = (systemSettings.tax_rate * 100) || 0;
+    try {
+      const taxEl = document.getElementById('taxRate');
+      if (taxEl) taxEl.value = (Number(systemSettings.tax_rate || 0) * 100) || 0;
+    } catch {
+      // ignore
+    }
     document.getElementById('receiptFooter').value = systemSettings.receipt_footer || '';
     document.getElementById('printerName').value = systemSettings.printer_name || '';
     // Customer display COM port (persisted)
@@ -6774,9 +13135,153 @@ async function refreshCustomerDisplayPortOptions(selectedPort = '') {
 }
 
 function setupSystemSettingsHandlers() {
+  const promptForDangerousText = ({ title, message, expectedText, placeholder = '', confirmText = 'Confirm', cancelText = 'Cancel' } = {}) => {
+    return new Promise((resolve) => {
+      const expected = String(expectedText || '').trim();
+      const expectedUpper = expected.toUpperCase();
+
+      const existing = document.getElementById('dangerTextConfirmOverlay');
+      if (existing) {
+        try { existing.remove(); } catch { /* ignore */ }
+      }
+
+      const overlay = document.createElement('div');
+      overlay.id = 'dangerTextConfirmOverlay';
+      overlay.style.cssText = [
+        'position:fixed',
+        'inset:0',
+        'background:rgba(0,0,0,0.62)',
+        'padding:24px 0 330px 0',
+        'display:flex',
+        'align-items:center',
+        'justify-content:center',
+        'z-index:10050'
+      ].join(';');
+
+      const card = document.createElement('div');
+      card.style.cssText = [
+        'width:min(560px, 92vw)',
+        'background:#fff',
+        'border-radius:22px',
+        'box-shadow:0 18px 60px rgba(0,0,0,0.35)',
+        'padding:26px 22px',
+        'font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial'
+      ].join(';');
+
+      const safeTitle = String(title || 'Confirm');
+      const safeMsg = String(message || '');
+      const safePlaceholder = String(placeholder || expected || '');
+
+      card.innerHTML = `
+        <div style="text-align:center;">
+          <div style="font-size:26px; font-weight:900; color:#991b1b; margin-bottom:6px;">${safeTitle}</div>
+          <div style="font-size:14px; color:#475569; margin-bottom:16px; white-space:pre-line; font-weight:800;">${safeMsg}</div>
+
+          <div style="display:flex; align-items:center; justify-content:center; gap:10px; margin-bottom:18px;">
+            <input id="dangerTextConfirmInput" type="text" autocomplete="off" enterkeyhint="done"
+              placeholder="${safePlaceholder}"
+              style="width:min(360px, 86vw); font-size:22px; text-align:center; padding:14px 12px; border-radius:14px; border:2px solid #fecaca; outline:none; font-weight:900;" />
+          </div>
+
+          <div style="display:flex; gap:14px; justify-content:center;">
+            <button id="dangerTextConfirmCancel" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:18px; font-weight:900; background:#94a3b8; color:#fff;">${cancelText}</button>
+            <button id="dangerTextConfirmOk" style="flex:1; max-width:220px; border:none; border-radius:16px; padding:16px 14px; font-size:18px; font-weight:900; background:#ef4444; color:#fff;">${confirmText}</button>
+          </div>
+          <div style="margin-top:10px; font-size:12px; color:#64748b; font-weight:800;">Type <span style="color:#0f172a;">${expectedUpper}</span> to confirm.</div>
+        </div>
+      `;
+
+      overlay.appendChild(card);
+      document.body.appendChild(overlay);
+
+      const input = card.querySelector('#dangerTextConfirmInput');
+      const okBtn = card.querySelector('#dangerTextConfirmOk');
+      const cancelBtn = card.querySelector('#dangerTextConfirmCancel');
+
+      const cleanup = () => {
+        try { overlay.remove(); } catch { /* ignore */ }
+      };
+
+      const close = (value) => {
+        cleanup();
+        resolve(value);
+      };
+
+      const isMatch = () => {
+        const v = String(input?.value || '').trim().toUpperCase();
+        return v === expectedUpper;
+      };
+
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) close(false);
+      });
+      cancelBtn?.addEventListener('click', () => close(false), { once: true });
+      okBtn?.addEventListener('click', () => close(isMatch()), { once: true });
+      input?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          close(isMatch());
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          close(false);
+        }
+      });
+
+      try { window.__virtualKeyboardForceOpen = true; } catch { /* ignore */ }
+      setTimeout(() => {
+        try {
+          window.__virtualKeyboardForceOpen = true;
+          input?.focus?.();
+          input?.select?.();
+        } catch {
+          // ignore
+        }
+      }, 0);
+    });
+  };
+
   document.getElementById('systemSettingsForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     await saveSystemSettings();
+  });
+
+  document.getElementById('backupDatabaseBtn')?.addEventListener('click', async () => {
+    try {
+      if (!window.api || typeof window.api.backupDatabase !== 'function') {
+        showAlert('Backup feature is not available in this build.', 'error');
+        return;
+      }
+      const result = await window.api.backupDatabase();
+      if (result?.success) {
+        showAlert('Backup saved successfully.', 'success');
+      } else if (!result?.canceled) {
+        showAlert('Backup failed: ' + (result?.error || 'Unknown error'), 'error');
+      }
+    } catch (error) {
+      showAlert('Backup failed: ' + error.message, 'error');
+    }
+  });
+
+  document.getElementById('restoreDatabaseBtn')?.addEventListener('click', async () => {
+    try {
+      if (!window.api || typeof window.api.restoreDatabase !== 'function') {
+        showAlert('Restore feature is not available in this build.', 'error');
+        return;
+      }
+
+      const ok = confirm('Restore will REPLACE the current database and restart the app. Continue?');
+      if (!ok) return;
+
+      const result = await window.api.restoreDatabase();
+      if (result?.success) {
+        showAlert('Restoring... the app will restart.', 'info');
+      } else if (!result?.canceled) {
+        showAlert('Restore failed: ' + (result?.error || 'Unknown error'), 'error');
+      }
+    } catch (error) {
+      showAlert('Restore failed: ' + error.message, 'error');
+    }
   });
 
   document.getElementById('refreshCustomerDisplayPortsBtn')?.addEventListener('click', async () => {
@@ -6853,6 +13358,13 @@ async function saveSystemSettings() {
   try {
     const logoValue = currentLogoData || document.getElementById('storeLogo').value;
     console.log('Saving logo:', logoValue.substring(0, 50));
+
+    // Tax Rate field was removed from the UI (VAT is product-level).
+    // Keep the existing stored value for backward compatibility.
+    const taxEl = document.getElementById('taxRate');
+    const taxRate = taxEl
+      ? (parseFloat(taxEl.value) / 100)
+      : Number(systemSettings?.tax_rate ?? 0);
     
     const settings = {
       storeName: document.getElementById('storeName').value,
@@ -6862,7 +13374,7 @@ async function saveSystemSettings() {
       companyAddress: document.getElementById('companyAddress').value,
       currencySymbol: document.getElementById('currencySymbol').value,
       currencyCode: document.getElementById('currencyCode').value,
-      taxRate: parseFloat(document.getElementById('taxRate').value) / 100,
+      taxRate: Number.isFinite(taxRate) ? taxRate : 0,
       receiptFooter: document.getElementById('receiptFooter').value,
       printerName: document.getElementById('printerName').value,
       customerDisplayPort: (document.getElementById('customerDisplayPort')?.value || '').toString().trim().toUpperCase() || null
@@ -6905,6 +13417,9 @@ async function updateSystemUI() {
 
 // ============== LOAN HANDLERS ==============
 function setupLoanHandlers() {
+  // Remember the currently chosen Quick Select party, so list reloads don't reset selection.
+  let selectedLoanPartyKey = '';
+
   const loadExistingRestaurantParkings = async () => {
     const selectEl = document.getElementById('loanExistingRestaurant');
     const helpEl = document.getElementById('existingRestaurantHelp');
@@ -6975,6 +13490,91 @@ function setupLoanHandlers() {
     }
   };
 
+  const loadLoanParties = async (query = '') => {
+    const selectEl = document.getElementById('loanPartySelect');
+    const helpEl = document.getElementById('loanPartyHelp');
+    if (!selectEl) return;
+
+    const selectedType = (document.getElementById('loanCustomerType')?.value || '').toString().toLowerCase();
+    const typeFilter = (selectedType === 'restaurant' || selectedType === 'regular') ? selectedType : '';
+
+    selectEl.innerHTML = '';
+    try {
+      const list = await window.api.listLoanParties(query, 80);
+
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = typeFilter === 'restaurant'
+        ? 'Select a restaurant (optional)...'
+        : typeFilter === 'regular'
+          ? 'Select a customer (optional)...'
+          : 'Select a customer/restaurant (optional)...';
+      selectEl.appendChild(placeholder);
+
+      for (const p of (list || [])) {
+        const type = (p.customer_type || 'regular').toString().toLowerCase();
+        const isRestaurant = type === 'restaurant';
+
+        if (typeFilter && type !== typeFilter) continue;
+
+        const restName = (p.restaurant_name || '').toString().trim();
+        const restNie = (p.restaurant_nie || '').toString().trim();
+        const custName = (p.customer_name || '').toString().trim();
+        const phone = (p.customer_phone || '').toString().trim();
+
+        const activeId = Number(p.active_loan_id || 0) || null;
+        const activeReceipt = (p.active_receipt_number || '').toString().trim();
+
+        const labelCore = isRestaurant
+          ? `${restName}${restNie ? ' (' + restNie + ')' : ''}`
+          : `${custName}`;
+
+        const sub = isRestaurant
+          ? (custName ? ` — ${custName}` : '')
+          : (phone ? ` — ${phone}` : '');
+
+        const badge = activeId ? `  [UNPAID: ${activeReceipt || activeId}]` : '';
+        const label = `${isRestaurant ? '🍽️ ' : '👤 '}${labelCore}${sub}${badge}`.trim();
+
+        // Skip empty options
+        if (!labelCore) continue;
+
+        const opt = document.createElement('option');
+        opt.value = p.key;
+        opt.textContent = label;
+        opt.dataset.customerType = type;
+        opt.dataset.customerName = custName;
+        opt.dataset.customerPhone = phone;
+        opt.dataset.restaurantName = restName;
+        opt.dataset.restaurantNie = restNie;
+        opt.dataset.activeLoanId = activeId ? String(activeId) : '';
+        opt.dataset.activeReceiptNumber = activeReceipt;
+        selectEl.appendChild(opt);
+      }
+
+      // Re-apply selection after reload (if still present under the current filter).
+      if (selectedLoanPartyKey) {
+        const has = Array.from(selectEl.options).some(o => o.value === selectedLoanPartyKey);
+        selectEl.value = has ? selectedLoanPartyKey : '';
+        if (!has) selectedLoanPartyKey = '';
+      }
+
+      if (helpEl) {
+        helpEl.textContent = typeFilter === 'restaurant'
+          ? 'Pick a restaurant to auto-fill. If an unpaid tab exists, the sale will be added to it.'
+          : typeFilter === 'regular'
+            ? 'Pick a customer to auto-fill.'
+            : 'Pick an existing customer/restaurant to auto-fill. If an unpaid tab exists, the sale will be added to it.';
+      }
+    } catch (e) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'Failed to load list';
+      selectEl.appendChild(opt);
+      if (helpEl) helpEl.textContent = e?.message ? String(e.message) : 'Error loading list';
+    }
+  };
+
   const syncRestaurantParkingModeUi = async () => {
     const type = document.getElementById('loanCustomerType')?.value;
     const mode = document.querySelector('input[name="loanParkingMode"]:checked')?.value || 'append';
@@ -7008,22 +13608,28 @@ function setupLoanHandlers() {
       if (restaurantNameInput) {
         restaurantNameInput.required = true;
         restaurantNameInput.readOnly = false;
-        restaurantNameInput.value = '';
       }
       if (restaurantNieInput) {
         restaurantNieInput.readOnly = false;
-        restaurantNieInput.value = '';
       }
       if (customerNameInput) {
         customerNameInput.readOnly = false;
-        customerNameInput.value = '';
       }
       if (customerPhoneInput) {
         customerPhoneInput.readOnly = false;
-        customerPhoneInput.value = '';
       }
     }
   };
+
+  const syncLoanQuickSelectVisibility = () => {
+    const field = document.getElementById('loanQuickSelectField');
+    if (!field) return;
+    // Always show: user can pick a party first, which will auto-set the customer type.
+    field.style.display = 'block';
+  };
+
+  // Show Quick Select by default
+  syncLoanQuickSelectVisibility();
 
   // Customer type change handler
   document.getElementById('loanCustomerType')?.addEventListener('change', (e) => {
@@ -7043,6 +13649,7 @@ function setupLoanHandlers() {
       const defaultMode = document.querySelector('input[name="loanParkingMode"][value="append"]');
       if (defaultMode) defaultMode.checked = true;
       syncRestaurantParkingModeUi();
+      syncLoanQuickSelectVisibility();
     } else {
       restaurantFields.style.display = 'none';
       restaurantNieField.style.display = 'none';
@@ -7055,7 +13662,100 @@ function setupLoanHandlers() {
       // Reset parking mode choice to default
       const defaultMode = document.querySelector('input[name="loanParkingMode"][value="append"]');
       if (defaultMode) defaultMode.checked = true;
+
+      syncLoanQuickSelectVisibility();
     }
+
+    // Refresh quick select list to match the selected type filter
+    const q = (document.getElementById('loanPartySearch')?.value || '').toString();
+    loadLoanParties(q).catch(() => {
+      // ignore
+    });
+  });
+
+  // Quick select: initial load + actions
+  const quickSearchInput = document.getElementById('loanPartySearch');
+  const quickSelect = document.getElementById('loanPartySelect');
+
+  const runQuickSearch = async () => {
+    const q = String(quickSearchInput?.value || '').trim();
+    await loadLoanParties(q);
+  };
+
+  document.getElementById('loanPartySearchBtn')?.addEventListener('click', runQuickSearch);
+  document.getElementById('loanPartyRefreshBtn')?.addEventListener('click', async () => {
+    if (quickSearchInput) quickSearchInput.value = '';
+    await loadLoanParties('');
+  });
+
+  quickSearchInput?.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      runQuickSearch();
+    }
+  });
+
+  quickSelect?.addEventListener('change', async (e) => {
+    const opt = e.target.selectedOptions?.[0];
+    if (!opt || !opt.value) return;
+
+    // Persist selection so a customer type change (triggered below) won't reset the dropdown.
+    selectedLoanPartyKey = opt.value;
+
+    const type = (opt.dataset.customerType || 'regular').toString().toLowerCase();
+    const customerTypeSelect = document.getElementById('loanCustomerType');
+    const restaurantNameInput = document.getElementById('loanRestaurantName');
+    const restaurantNieInput = document.getElementById('loanRestaurantNie');
+    const customerNameInput = document.getElementById('loanCustomerName');
+    const customerPhoneInput = document.getElementById('loanCustomerPhone');
+
+    // Switch the modal to the selected type
+    if (customerTypeSelect) {
+      customerTypeSelect.value = type;
+      customerTypeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // Restaurants: if an unpaid tab exists, auto-select append + that tab.
+    // Otherwise, switch to "new" and then fill fields (so sync doesn't wipe them).
+    if (type === 'restaurant') {
+      const activeLoanId = parseInt(opt.dataset.activeLoanId || '', 10);
+      const hasActive = Number.isFinite(activeLoanId) && activeLoanId > 0;
+
+      const appendRadio = document.querySelector('input[name="loanParkingMode"][value="append"]');
+      const newRadio = document.querySelector('input[name="loanParkingMode"][value="new"]');
+
+      if (hasActive && appendRadio) {
+        appendRadio.checked = true;
+      } else if (newRadio) {
+        newRadio.checked = true;
+      }
+
+      await syncRestaurantParkingModeUi();
+
+      if (hasActive) {
+        const selectEl = document.getElementById('loanExistingRestaurant');
+        if (selectEl) {
+          // Ensure options are loaded, then pick the active one.
+          if (!selectEl.options || selectEl.options.length <= 1) {
+            await loadExistingRestaurantParkings();
+          }
+          selectEl.value = String(activeLoanId);
+          selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      } else {
+        // New tab but with prefilled info
+        if (restaurantNameInput) restaurantNameInput.value = opt.dataset.restaurantName || '';
+        if (restaurantNieInput) restaurantNieInput.value = opt.dataset.restaurantNie || '';
+        if (customerNameInput) customerNameInput.value = opt.dataset.customerName || '';
+        if (customerPhoneInput) customerPhoneInput.value = opt.dataset.customerPhone || '';
+      }
+
+      return;
+    }
+
+    // Regular customers: always prefill for a new tab
+    if (customerNameInput) customerNameInput.value = opt.dataset.customerName || '';
+    if (customerPhoneInput) customerPhoneInput.value = opt.dataset.customerPhone || '';
   });
 
   // Parking mode change (append/new)
@@ -7083,6 +13783,12 @@ function setupLoanHandlers() {
   // Refresh button
   document.getElementById('refreshExistingRestaurantBtn')?.addEventListener('click', async () => {
     await loadExistingRestaurantParkings();
+  });
+
+  // Load quick select list on first open
+  // (loanModal opens before handlers run in some flows; keep this best-effort)
+  loadLoanParties('').catch(() => {
+    // ignore
   });
 
   // Loan form submit
@@ -7145,14 +13851,23 @@ function setupLoanHandlers() {
   // Search loan button
   document.getElementById('searchLoanBtn')?.addEventListener('click', () => {
     const receiptNumber = document.getElementById('loanReceiptSearch').value;
-    searchLoanByReceipt(receiptNumber);
+    handleLoanSearchSubmit(receiptNumber);
+  });
+
+  // Clear search
+  document.getElementById('clearLoanSearchBtn')?.addEventListener('click', async () => {
+    const input = document.getElementById('loanReceiptSearch');
+    if (input) input.value = '';
+    currentLoansSearchQuery = '';
+    await loadLoansView(currentLoansStatus || 'active');
+    try { input?.focus?.(); } catch { /* ignore */ }
   });
   
   // Loan receipt search - allow Enter key
   document.getElementById('loanReceiptSearch')?.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') {
       const receiptNumber = e.target.value;
-      searchLoanByReceipt(receiptNumber);
+      handleLoanSearchSubmit(receiptNumber);
     }
   });
   
@@ -7176,10 +13891,6 @@ function setupModalHandlers() {
     btn.addEventListener('click', async (e) => {
       const modal = e.target.closest('.modal');
       if (modal) {
-        // If closing the receipt modal, open cash drawer only for cash transactions
-        if (modal.id === 'receiptModal' && lastSale && lastSale.payment_method === 'cash') {
-          await openCashDrawer();
-        }
         closeModal(modal.id);
       }
     });
@@ -7188,6 +13899,12 @@ function setupModalHandlers() {
   // Close on outside click
   document.querySelectorAll('.modal').forEach(modal => {
     modal.addEventListener('click', (e) => {
+      // Guard against touch devices generating a delayed click after pressing
+      // the on-screen keyboard buttons ("click-through" onto the backdrop).
+      const vkLast = Number(window.__virtualKeyboardLastPressAt || 0);
+      if (vkLast && (Date.now() - vkLast) < 600) {
+        return;
+      }
       if (e.target === modal) {
         closeModal(modal.id);
       }
@@ -7214,8 +13931,14 @@ function setupModalHandlers() {
       }
 
       isPrinting = true;
-      console.log('Reprinting receipt...');
-      await printReceiptToThermalPrinter(lastSale);
+      const saleId = Number(lastSale?.id);
+      const prev = Number(printedReceiptCounts.get(saleId) || 0);
+      const next = prev + 1;
+      printedReceiptCounts.set(saleId, next);
+
+      const duplicateNumber = next > 1 ? (next - 1) : 0;
+      console.log(duplicateNumber ? `Printing receipt (DUPLICATE ${duplicateNumber})...` : 'Printing receipt...');
+      await printReceiptToThermalPrinter(lastSale, { duplicateNumber, kickDrawer: false });
 
       // Do NOT open cash drawer here; it is only opened on complete sale
 
@@ -7229,8 +13952,7 @@ function setupModalHandlers() {
     });
   }
   
-  // Setup virtual keyboard
-  setupVirtualKeyboard();
+  // Virtual keyboard removed
 }
 
 function openModal(modalId) {
@@ -7239,6 +13961,17 @@ function openModal(modalId) {
 
 function closeModal(modalId) {
   document.getElementById(modalId).classList.remove('active');
+
+  // If a CASH sale just finished, show the cashier summary after the receipt is closed.
+  if (modalId === 'receiptModal' && pendingCashierPaySummary) {
+    try {
+      showCashierPaymentSummaryOverlay(pendingCashierPaySummary);
+    } catch {
+      // ignore
+    } finally {
+      pendingCashierPaySummary = null;
+    }
+  }
 }
 
 // ============== PRODUCT IMAGE HANDLING ==============
@@ -7269,10 +14002,185 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ============== VIRTUAL KEYBOARD ==============
 let currentKeyboardInput = null;
+let virtualKeyboardInitialized = false;
+let lastPointerInteractionAt = 0;
+let lastVirtualKeyboardOpenAt = 0;
+
+function markPointerInteraction(e) {
+  // Only treat taps/clicks on real input fields as "intent to type".
+  // This prevents the keyboard from popping up when the user taps elsewhere
+  // (e.g., product cards) and the app focuses an input programmatically.
+  try {
+    const target = e?.target;
+    if (!target) return;
+
+    // In modals/overlays, users often tap near/around the field first.
+    // Treat ANY tap inside an active modal as intent-to-type so the keyboard
+    // reliably opens when an input inside that modal receives focus.
+    const inModal = typeof target.closest === 'function'
+      ? target.closest('.modal.active, #unitPriceEntryOverlay, #rolePasswordOverlay, #copilotConfirmOverlay, #quickAddProductOverlay, #quickVatPromptOverlay')
+      : null;
+    if (inModal) {
+      lastPointerInteractionAt = Date.now();
+      return;
+    }
+
+    const field = typeof target.closest === 'function'
+      ? target.closest('input, textarea, select')
+      : null;
+    if (!field) return;
+
+    // Ignore hidden/readonly/disabled fields
+    const tag = (field.tagName || '').toUpperCase();
+    if (tag === 'INPUT') {
+      const type = (field.getAttribute('type') || 'text').toLowerCase();
+      const excluded = new Set(['hidden', 'checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'color', 'date', 'datetime-local', 'month', 'week', 'time']);
+      if (excluded.has(type)) return;
+      if (field.readOnly || field.disabled) return;
+    } else if (tag === 'TEXTAREA') {
+      if (field.readOnly || field.disabled) return;
+    } else if (tag === 'SELECT') {
+      if (field.disabled) return;
+    } else {
+      return;
+    }
+
+    lastPointerInteractionAt = Date.now();
+  } catch {
+    // ignore
+  }
+}
+
+function shouldAutoOpenVirtualKeyboard() {
+  // Only auto-open the on-screen keyboard after an actual tap/click.
+  // This prevents the keyboard from popping up at app launch when we programmatically focus inputs.
+  const now = Date.now();
+  // Allow code paths to programmatically focus fields (e.g. refocusing the
+  // scanner/search target) without triggering the on-screen keyboard.
+  // One-shot: callers should set window.__virtualKeyboardSuppressOnce = true
+  // immediately before calling .focus().
+  const suppressed = window.__virtualKeyboardSuppressOnce === true;
+  const forced = window.__virtualKeyboardForceOpen === true;
+  if (forced) {
+    window.__virtualKeyboardForceOpen = false;
+    return true;
+  }
+  if (suppressed) {
+    window.__virtualKeyboardSuppressOnce = false;
+    return false;
+  }
+  return (now - lastPointerInteractionAt) < 1500;
+}
 
 function setupVirtualKeyboard() {
+  if (virtualKeyboardInitialized) return;
   const keyboard = document.getElementById('virtualKeyboard');
-  const keyButtons = document.querySelectorAll('.key-btn');
+  if (!keyboard) return;
+
+  // Expose keyboard height so modals can avoid being covered.
+  // We keep it on :root so CSS can use it anywhere.
+  const syncVirtualKeyboardInset = () => {
+    try {
+      const isActive = keyboard.classList.contains('active');
+      const rect = keyboard.getBoundingClientRect();
+      const height = isActive ? Math.max(0, Math.round(rect.height || 0)) : 0;
+      document.documentElement.style.setProperty('--vk-height', `${height}px`);
+      document.body.classList.toggle('vk-open', isActive && height > 0);
+    } catch {
+      // ignore
+    }
+  };
+
+  const closeVirtualKeyboard = ({ blurInput = false } = {}) => {
+    try {
+      if (currentKeyboardInput) {
+        currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    } catch {
+      // ignore
+    }
+
+    if (blurInput) {
+      try {
+        const activeEl = document.activeElement;
+        const fieldToBlur = currentKeyboardInput || activeEl;
+        const tag = (fieldToBlur?.tagName || '').toUpperCase();
+        if (fieldToBlur && typeof fieldToBlur.blur === 'function' && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')) {
+          fieldToBlur.blur();
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    keyboard.classList.remove('active');
+    currentKeyboardInput = null;
+    isShiftActive = false;
+    isCapsLocked = false;
+    lastShiftTapAt = 0;
+    updateKeyboardCase();
+    syncVirtualKeyboardInset();
+  };
+
+  // Close button (optional)
+  try {
+    const closeBtn = document.getElementById('virtualKeyboardClose');
+    if (closeBtn && !closeBtn.dataset.listenerAttached) {
+      closeBtn.dataset.listenerAttached = '1';
+      closeBtn.addEventListener('click', () => {
+        closeVirtualKeyboard({ blurInput: true });
+      });
+    }
+  } catch {
+    // ignore
+  }
+
+  // Mark initialized early to avoid double-binding in case setupVirtualKeyboard()
+  // is invoked more than once during startup.
+  virtualKeyboardInitialized = true;
+
+  // Hard reset: if any handlers were accidentally bound multiple times in previous
+  // runs/versions, replace the keyboard button subtree to strip all listeners.
+  // We then attach ONE delegated handler below.
+  try {
+    const btnRoot = keyboard.querySelector('.keyboard-buttons');
+    if (btnRoot && keyboard.dataset.vkButtonsReset !== '1') {
+      keyboard.dataset.vkButtonsReset = '1';
+      const clone = btnRoot.cloneNode(true);
+      btnRoot.parentNode.replaceChild(clone, btnRoot);
+    }
+  } catch {
+    // ignore
+  }
+
+  // Track pointer/touch interactions so we only auto-open on real user taps.
+  try {
+    if (!setupVirtualKeyboard._pointerTrackingAttached) {
+      setupVirtualKeyboard._pointerTrackingAttached = true;
+      document.addEventListener('pointerdown', markPointerInteraction, true);
+      document.addEventListener('touchstart', markPointerInteraction, { capture: true, passive: true });
+      document.addEventListener('mousedown', markPointerInteraction, true);
+    }
+  } catch {
+    // ignore
+  }
+
+  // Keep inset synced while opening/closing and on resize.
+  try {
+    if (!setupVirtualKeyboard._vkInsetAttached) {
+      setupVirtualKeyboard._vkInsetAttached = true;
+      syncVirtualKeyboardInset();
+      if (typeof MutationObserver !== 'undefined') {
+        const obs = new MutationObserver(() => syncVirtualKeyboardInset());
+        obs.observe(keyboard, { attributes: true, attributeFilter: ['class', 'style'] });
+        setupVirtualKeyboard._vkInsetObserver = obs;
+      }
+      window.addEventListener('resize', () => syncVirtualKeyboardInset(), true);
+    }
+  } catch {
+    // ignore
+  }
+  const keyButtons = keyboard.querySelectorAll('.key-btn');
   let isShiftActive = false;
   let isCapsLocked = false;
   let lastShiftTapAt = 0;
@@ -7308,8 +14216,10 @@ function setupVirtualKeyboard() {
   function isNumericKeyboardTarget(el) {
     if (!el || el.tagName !== 'INPUT') return false;
 
-    const inputMode = (el.getAttribute('inputmode') || '').toLowerCase();
-    const type = (el.getAttribute('type') || '').toLowerCase();
+    const attrInputMode = (el.getAttribute('inputmode') || '').toLowerCase();
+    const propInputMode = (el.inputMode || '').toLowerCase();
+    const inputMode = attrInputMode || propInputMode;
+    const type = ((el.getAttribute('type') || el.type) || '').toLowerCase();
 
     if (inputMode === 'numeric' || inputMode === 'decimal' || inputMode === 'tel') return true;
     if (type === 'number' || type === 'tel') return true;
@@ -7363,151 +14273,353 @@ function setupVirtualKeyboard() {
       row.style.display = hasVisibleButton ? '' : 'none';
     });
   }
+
+  function isVisibleFocusable(el) {
+    if (!el || el.disabled) return false;
+    const tag = (el.tagName || '').toUpperCase();
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (typeof el.getClientRects === 'function' && el.getClientRects().length === 0) return false;
+
+    if (tag === 'INPUT') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      const excluded = new Set(['hidden', 'checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'color', 'date', 'datetime-local', 'month', 'week', 'time']);
+      if (excluded.has(type)) return false;
+      if (el.readOnly) return false;
+      return true;
+    }
+    if (tag === 'TEXTAREA') {
+      if (el.readOnly) return false;
+      return true;
+    }
+    if (tag === 'SELECT') return true;
+    return false;
+  }
+
+  function isKeyboardEligibleField(el) {
+    if (!isVisibleFocusable(el)) return false;
+    if ((el?.tagName || '').toUpperCase() === 'INPUT' && el.id === 'barcodeInput') return false;
+    if (el?.dataset?.noVk === '1' || el?.dataset?.noVk === 'true') return false;
+    return true;
+  }
+
+  function activateVirtualKeyboardForField(target, { ensureFocus = false } = {}) {
+    if (!isKeyboardEligibleField(target)) return false;
+
+    currentKeyboardInput = target;
+    setKeyboardMode(isNumericKeyboardTarget(target) ? 'numeric' : 'text');
+    keyboard.classList.add('active');
+    lastVirtualKeyboardOpenAt = Date.now();
+    syncVirtualKeyboardInset();
+
+    if (ensureFocus) {
+      try {
+        target.focus();
+      } catch {
+        // ignore
+      }
+    }
+
+    try {
+      const len = String(target.value || '').length;
+      if (typeof target.setSelectionRange === 'function') {
+        target.setSelectionRange(len, len);
+      }
+    } catch {
+      // ignore selection errors for some input types
+    }
+
+    return true;
+  }
+
+  function focusNextFieldInModal(modalEl, currentEl) {
+    if (!modalEl) return false;
+    const fields = Array.from(modalEl.querySelectorAll('input, select, textarea')).filter(isVisibleFocusable);
+    if (fields.length === 0) return false;
+
+    const currentIndex = fields.indexOf(currentEl);
+    const nextEl = (currentIndex >= 0) ? fields[currentIndex + 1] : fields[0];
+    if (!nextEl) return false;
+
+    try {
+      nextEl.focus();
+      const len = (nextEl.value || '').length;
+      if (typeof nextEl.setSelectionRange === 'function') {
+        nextEl.setSelectionRange(len, len);
+      }
+    } catch {
+      // ignore
+    }
+
+    return activateVirtualKeyboardForField(nextEl);
+  }
   
-  // Show keyboard when text inputs are focused (except barcode input)
+  // Show keyboard when inputs are focused (except barcode input)
   document.addEventListener('focusin', (e) => {
-    if (e.target.tagName === 'INPUT' && 
-        (e.target.type === 'text' || e.target.type === 'tel' || e.target.type === 'number') && 
-        e.target.id !== 'barcodeInput' &&
-        e.target.id !== 'paymentAmount') {
-      const previousInput = currentKeyboardInput;
-      currentKeyboardInput = e.target;
-      setKeyboardMode(isNumericKeyboardTarget(e.target) ? 'numeric' : 'text');
-      keyboard.classList.add('active');
-      
-      // Always move cursor to end when focusing an input
-      const len = e.target.value.length;
-      e.target.setSelectionRange(len, len);
-      e.target.focus();
-    }
-    if (e.target.tagName === 'TEXTAREA') {
-      const previousInput = currentKeyboardInput;
-      currentKeyboardInput = e.target;
-      setKeyboardMode('text');
-      keyboard.classList.add('active');
-      
-      // Always move cursor to end when focusing a textarea
-      const len = e.target.value.length;
-      e.target.setSelectionRange(len, len);
-      e.target.focus();
-    }
+    const target = e.target;
+
+    // Do not pop up automatically unless user actually tapped/clicked,
+    // or the app explicitly requested it via __virtualKeyboardForceOpen.
+    if (!shouldAutoOpenVirtualKeyboard()) return;
+
+    activateVirtualKeyboardForField(target);
   });
   
-  // Handle key presses
-  keyButtons.forEach(btn => {
-    btn.addEventListener('mousedown', (e) => {
-      // Prevent keyboard buttons from stealing focus from input
-      e.preventDefault();
-    });
-    
-    btn.addEventListener('click', () => {
-      const key = btn.dataset.key;
-      const mode = btn.dataset.mode;
-      
-      // Handle mode switch (123 / ABC buttons)
-      if (mode) {
-        setKeyboardMode(mode);
-        return;
-      }
-      
-      if (key === 'Shift') {
-        const now = Date.now();
-        const isDoubleTap = (now - lastShiftTapAt) < SHIFT_DOUBLE_TAP_MS;
-        lastShiftTapAt = now;
+  // Handle key presses (delegated). This avoids double-binding issues and prevents
+  // touchscreen environments from inserting duplicate characters.
+  const supportsPointerEvents = typeof window !== 'undefined' && 'PointerEvent' in window;
+  let lastTouchLikeAt = 0;
+  let lastActivationAt = 0;
+  let lastActivationSig = '';
 
-        if (isDoubleTap) {
-          // Double-tap toggles caps-lock (sticky uppercase)
-          isCapsLocked = !isCapsLocked;
-          isShiftActive = isCapsLocked;
-        } else {
-          // Single tap: shift for next key; if caps-lock was on, turn it off
-          if (isCapsLocked) {
-            isCapsLocked = false;
-            isShiftActive = false;
-          } else {
-            isShiftActive = !isShiftActive;
-          }
-        }
+  const handleKeyPressForButton = (btn) => {
+    const key = btn?.dataset?.key;
+    const mode = btn?.dataset?.mode;
+      
+    // Handle mode switch (123 / ABC buttons)
+    if (mode) {
+      setKeyboardMode(mode);
+      return;
+    }
+      
+    if (key === 'Shift') {
+      const now = Date.now();
+      const isDoubleTap = (now - lastShiftTapAt) < SHIFT_DOUBLE_TAP_MS;
+      lastShiftTapAt = now;
 
-        updateKeyboardCase();
-      } else if (key === 'Backspace') {
-        if (currentKeyboardInput) {
-          currentKeyboardInput.value = currentKeyboardInput.value.slice(0, -1);
-          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-      } else if (key === 'Done') {
-        if (currentKeyboardInput) {
-          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
-          // Trigger Enter key event to save edits
-          const enterEvent = new KeyboardEvent('keydown', {
-            key: 'Enter',
-            code: 'Enter',
-            keyCode: 13,
-            which: 13,
-            bubbles: true
-          });
-          currentKeyboardInput.dispatchEvent(enterEvent);
-        }
-        keyboard.classList.remove('active');
-        currentKeyboardInput = null;
-        isShiftActive = false;
-        isCapsLocked = false;
-        lastShiftTapAt = 0;
-        updateKeyboardCase();
+      if (isDoubleTap) {
+        // Double-tap toggles caps-lock (sticky uppercase)
+        isCapsLocked = !isCapsLocked;
+        isShiftActive = isCapsLocked;
       } else {
-        // Use the actual displayed text (respects shift state)
-        const actualKey = btn.textContent === 'SPACE' ? ' ' : btn.textContent;
-        if (currentKeyboardInput) {
-          // Extra guard: never inject letters into numeric mode.
-          if (keyboardMode === 'numeric' && /[a-zA-Z]/.test(actualKey)) return;
-          
-          // For numeric inputs, always append to the end
-          if (keyboardMode === 'numeric') {
-            currentKeyboardInput.value += actualKey;
-            currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
-          } else {
-            // For text inputs, insert at cursor position
-            const start = currentKeyboardInput.selectionStart;
-            const end = currentKeyboardInput.selectionEnd;
-            const currentValue = currentKeyboardInput.value;
-            
-            currentKeyboardInput.value = currentValue.substring(0, start) + actualKey + currentValue.substring(end);
-            
-            // Move cursor after inserted character
-            const newCursorPos = start + actualKey.length;
-            currentKeyboardInput.setSelectionRange(newCursorPos, newCursorPos);
-            
-            currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        }
-        // Auto-turn off shift after typing one character
-        if (isShiftActive && !isCapsLocked) {
+        // Single tap: shift for next key; if caps-lock was on, turn it off
+        if (isCapsLocked) {
+          isCapsLocked = false;
           isShiftActive = false;
-          updateKeyboardCase();
+        } else {
+          isShiftActive = !isShiftActive;
         }
       }
-    });
-  });
-  
-  // Close keyboard when clicking outside
-  document.addEventListener('click', (e) => {
-    if (keyboard.classList.contains('active')) {
-      // Check if click is outside keyboard and not on an input field
-      if (!keyboard.contains(e.target) && 
-          e.target.tagName !== 'INPUT' && 
-          e.target.tagName !== 'TEXTAREA') {
-        if (currentKeyboardInput) {
-          currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-        keyboard.classList.remove('active');
-        currentKeyboardInput = null;
-        isShiftActive = false;
-        isCapsLocked = false;
-        lastShiftTapAt = 0;
-        updateKeyboardCase();
-      }
+
+      updateKeyboardCase();
+      return;
     }
-  });
+
+    if (key === 'Backspace') {
+      if (currentKeyboardInput) {
+        try {
+          const v = String(currentKeyboardInput.value || '');
+          const start = Number.isFinite(currentKeyboardInput.selectionStart) ? currentKeyboardInput.selectionStart : v.length;
+          const end = Number.isFinite(currentKeyboardInput.selectionEnd) ? currentKeyboardInput.selectionEnd : start;
+
+          if (start !== end) {
+            // Delete selected range
+            currentKeyboardInput.value = v.substring(0, start) + v.substring(end);
+            currentKeyboardInput.setSelectionRange(start, start);
+          } else if (start > 0) {
+            // Delete one char before cursor
+            currentKeyboardInput.value = v.substring(0, start - 1) + v.substring(end);
+            const newPos = Math.max(0, start - 1);
+            currentKeyboardInput.setSelectionRange(newPos, newPos);
+          }
+        } catch {
+          // Fallback
+          currentKeyboardInput.value = String(currentKeyboardInput.value || '').slice(0, -1);
+        }
+        currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      return;
+    }
+
+    if (key === 'Done') {
+      if (currentKeyboardInput) {
+        currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+
+          // In Product + Category modals, "Done" should act like "Next": jump to next field.
+          // This avoids implicit form submit and speeds up data entry on touchscreens.
+          const modal = currentKeyboardInput.closest('#productModal, #categoryModal');
+          if (modal) {
+            currentKeyboardInput.dispatchEvent(new Event('change', { bubbles: true }));
+            const moved = focusNextFieldInModal(modal, currentKeyboardInput);
+            if (moved) {
+              isShiftActive = false;
+              isCapsLocked = false;
+              lastShiftTapAt = 0;
+              updateKeyboardCase();
+              return;
+            }
+          }
+
+          // Touchscreen keyboards commonly map "Done" to Enter.
+          // For inputs inside a <form>, synthesizing Enter triggers an implicit submit,
+          // which closes modals like "Add Product" unexpectedly.
+          const isInsideForm = !!currentKeyboardInput.closest('form');
+          if (!isInsideForm) {
+            // Trigger Enter key event to save edits for non-form inline editors/search fields.
+            const enterEvent = new KeyboardEvent('keydown', {
+              key: 'Enter',
+              code: 'Enter',
+              keyCode: 13,
+              which: 13,
+              bubbles: true
+            });
+            currentKeyboardInput.dispatchEvent(enterEvent);
+          }
+
+          // Commit value and release focus
+          currentKeyboardInput.dispatchEvent(new Event('change', { bubbles: true }));
+          try {
+            currentKeyboardInput.blur();
+          } catch {
+            // ignore
+          }
+      }
+      keyboard.classList.remove('active');
+      currentKeyboardInput = null;
+      isShiftActive = false;
+      isCapsLocked = false;
+      lastShiftTapAt = 0;
+      updateKeyboardCase();
+      syncVirtualKeyboardInset();
+      return;
+    }
+
+    // Normal character key
+    const actualKey = btn.textContent === 'SPACE' ? ' ' : btn.textContent;
+    if (currentKeyboardInput) {
+      // Extra guard: never inject letters into numeric mode.
+      if (keyboardMode === 'numeric' && /[a-zA-Z]/.test(actualKey)) return;
+
+      // Insert at cursor position (works for both text + numeric), and respect selection.
+      try {
+        let v = String(currentKeyboardInput.value || '');
+        let start = Number.isFinite(currentKeyboardInput.selectionStart) ? currentKeyboardInput.selectionStart : v.length;
+        let end = Number.isFinite(currentKeyboardInput.selectionEnd) ? currentKeyboardInput.selectionEnd : start;
+
+        // Some inline editors want the first key to replace the entire value.
+        const replaceAllOnNextKey = currentKeyboardInput.dataset?.replaceOnNextKey === '1';
+        if (replaceAllOnNextKey) {
+          start = 0;
+          end = v.length;
+          try { currentKeyboardInput.dataset.replaceOnNextKey = '0'; } catch { /* ignore */ }
+        }
+
+        v = v.substring(0, start) + actualKey + v.substring(end);
+        currentKeyboardInput.value = v;
+
+        const newCursorPos = start + actualKey.length;
+        if (typeof currentKeyboardInput.setSelectionRange === 'function') {
+          currentKeyboardInput.setSelectionRange(newCursorPos, newCursorPos);
+        }
+      } catch {
+        // Fallback: append
+        currentKeyboardInput.value = String(currentKeyboardInput.value || '') + actualKey;
+      }
+
+      currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    // Auto-turn off shift after typing one character
+    if (isShiftActive && !isCapsLocked) {
+      isShiftActive = false;
+      updateKeyboardCase();
+    }
+  };
+
+  const delegatedPressHandler = (e) => {
+    try {
+      // Allow the keyboard close button to work normally
+      if (e?.target?.closest?.('.keyboard-close')) return;
+
+      const btn = e?.target?.closest?.('.key-btn');
+      if (!btn) return;
+      if (btn.disabled) return;
+
+      const now = Date.now();
+
+      // Mark touch-like interactions.
+      try {
+        const pt = e?.pointerType;
+        if (e?.type === 'touchstart' || pt === 'touch' || pt === 'pen') {
+          lastTouchLikeAt = now;
+        }
+      } catch {
+        // ignore
+      }
+
+      // Some touchscreens emit events twice: once as touch, then as mouse.
+      try {
+        const pt = e?.pointerType;
+        if ((e?.type === 'pointerdown' || e?.type === 'mousedown') && pt === 'mouse' && (now - lastTouchLikeAt) < 1200) return;
+        if (e?.type === 'mousedown' && (now - lastTouchLikeAt) < 1200) return;
+      } catch {
+        // ignore
+      }
+
+      // One-tap == one activation: de-dupe by key signature within a short window.
+      const sig = String(btn.dataset.key || btn.textContent || '').trim();
+      if (sig && sig === lastActivationSig && (now - lastActivationAt) < 250) return;
+      lastActivationSig = sig;
+      lastActivationAt = now;
+
+      // Stop the event before it reaches button-level handlers (capture).
+      try {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+      } catch {
+        // ignore
+      }
+
+      window.__virtualKeyboardLastPressAt = now;
+      handleKeyPressForButton(btn);
+    } catch {
+      // ignore
+    }
+  };
+
+  // Attach delegated handler once
+  if (keyboard.dataset.vkDelegatedAttached !== '1') {
+    keyboard.dataset.vkDelegatedAttached = '1';
+    if (supportsPointerEvents) {
+      keyboard.addEventListener('pointerdown', delegatedPressHandler, true);
+    } else {
+      keyboard.addEventListener('touchstart', delegatedPressHandler, { capture: true, passive: false });
+      keyboard.addEventListener('mousedown', delegatedPressHandler, true);
+    }
+  }
+  
+  // Use pointerdown instead of click so long-press gestures don't generate a
+  // delayed "outside click" that immediately hides the keyboard after opening.
+  document.addEventListener('pointerdown', (e) => {
+    if (keyboard.contains(e.target)) return;
+
+    const tappedField = typeof e?.target?.closest === 'function'
+      ? e.target.closest('input, textarea, select')
+      : null;
+    const fieldContainer = !tappedField && typeof e?.target?.closest === 'function'
+      ? e.target.closest('label, .form-group, .input-group')
+      : null;
+    const containerField = fieldContainer && typeof fieldContainer.querySelector === 'function'
+      ? fieldContainer.querySelector('input, textarea, select')
+      : null;
+    const targetField = isKeyboardEligibleField(tappedField)
+      ? tappedField
+      : (isKeyboardEligibleField(containerField) ? containerField : null);
+
+    if (targetField) {
+      try { window.__virtualKeyboardForceOpen = true; } catch { /* ignore */ }
+      activateVirtualKeyboardForField(targetField, { ensureFocus: document.activeElement !== targetField });
+      return;
+    }
+
+    if (!keyboard.classList.contains('active')) return;
+
+    // Ignore the same gesture window that just opened the keyboard.
+    if ((Date.now() - lastVirtualKeyboardOpenAt) < 250) return;
+
+    closeVirtualKeyboard({ blurInput: true });
+  }, true);
 }
 
 // ============== RETURNS HANDLERS ==============
@@ -7549,13 +14661,24 @@ function displayReturns(returns) {
     const date = new Date(ret.return_date);
     const items = ret.items ? JSON.parse(ret.items) : [];
     const itemCount = items.length;
+    const computedTotal = Array.isArray(items)
+      ? items.reduce((sum, it) => sum + (Number(it?.subtotal) || 0), 0)
+      : (Number(ret.total) || 0);
     
     return `
       <tr>
-        <td>${date.toLocaleString()}</td>
+        <td>${formatDateTimeWithDisplayTimeZone(date, 'en-GB', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        })}</td>
         <td>#${ret.original_sale_id}</td>
         <td>${itemCount} item(s)</td>
-        <td>${currencySymbol}${ret.total.toFixed(2)}</td>
+        <td>${currencySymbol}${computedTotal.toFixed(2)}</td>
         <td><span class=\"status-badge\">${ret.refund_method.toUpperCase()}</span></td>
         <td>${ret.reason || '-'}</td>
         <td>
@@ -7578,6 +14701,37 @@ function openReturnModal() {
 let currentReturnSale = null;
 let selectedReturnItems = [];
 
+async function getExistingReturnForSaleId(originalSaleId) {
+  // Preferred fast path (requires new IPC handler)
+  try {
+    if (window.api?.getReturnBySaleId) {
+      const r = await window.api.getReturnBySaleId(originalSaleId);
+      if (r) return r;
+    }
+  } catch (e) {
+    // Fallback for older running main process (no handler registered)
+  }
+
+  try {
+    const all = await window.api.getAllReturns();
+    const returns = Array.isArray(all) ? all : (all?.returns || []);
+    let latest = null;
+    returns.forEach(r => {
+      if (Number(r?.original_sale_id) !== Number(originalSaleId)) return;
+      if (!latest) {
+        latest = r;
+        return;
+      }
+      const a = new Date(latest?.return_date || 0).getTime();
+      const b = new Date(r?.return_date || 0).getTime();
+      if (b >= a) latest = r;
+    });
+    return latest;
+  } catch {
+    return null;
+  }
+}
+
 async function lookupSaleForReturn() {
   const receiptNumber = document.getElementById('returnReceiptNumber').value.trim();
   
@@ -7592,6 +14746,24 @@ async function lookupSaleForReturn() {
     
     if (!sale) {
       showAlert('Sale not found with receipt #' + receiptNumber, 'error', 'Not Found');
+      return;
+    }
+
+    // Only allow one return per receipt
+    const existingReturn = await getExistingReturnForSaleId(sale.id);
+    if (existingReturn) {
+      const when = existingReturn.return_date
+        ? formatDateTimeWithDisplayTimeZone(new Date(existingReturn.return_date), 'en-GB', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        })
+        : 'unknown date';
+      showAlert(`Receipt #${sale.id} was already refunded.\nReturn ID: ${existingReturn.id}\nDate: ${when}`, 'warning', 'Already Refunded');
       return;
     }
     
@@ -7629,22 +14801,30 @@ async function lookupSaleForReturn() {
 function calculateReturnTotal() {
   const checkboxes = document.querySelectorAll('.return-item-checkbox:checked');
   selectedReturnItems = [];
-  let subtotal = 0;
-  let tax = 0;
+  let subtotalCents = 0;
+  let taxCents = 0;
+  let totalCents = 0;
   
   checkboxes.forEach(checkbox => {
     const index = parseInt(checkbox.dataset.index);
     const item = currentReturnSale.items[index];
     selectedReturnItems.push(item);
-    subtotal += item.subtotal;
     
-    // Calculate tax for this item (find product to get tax rate)
+    // Sale item subtotals are tax-inclusive. Extract base + tax from the gross.
     const product = allProducts.find(p => p.id === item.product_id);
-    const taxRate = product?.tax_rate || 0.19;
-    tax += item.subtotal * taxRate;
+    const taxRateRaw = Number(product?.tax_rate);
+    const taxRate = Number.isFinite(taxRateRaw) ? taxRateRaw : 0;
+
+    const lineTotalCents = moneyToCents(item.subtotal || 0);
+    const baseCents = taxRate > 0 ? Math.round(lineTotalCents / (1 + taxRate)) : lineTotalCents;
+    const lineTaxCents = lineTotalCents - baseCents;
+
+    totalCents += lineTotalCents;
+    subtotalCents += baseCents;
+    taxCents += lineTaxCents;
   });
-  
-  const total = subtotal + tax;
+
+  const total = centsToMoney(totalCents);
   const currencySymbol = systemSettings?.currency_symbol || '€';
   
   document.getElementById('returnTotalDisplay').value = `${currencySymbol}${total.toFixed(2)}`;
@@ -7655,18 +14835,29 @@ async function completeReturn() {
     showAlert('Please select at least one item to return', 'warning', 'No Items Selected');
     return;
   }
-  
-  const subtotal = selectedReturnItems.reduce((sum, item) => sum + item.subtotal, 0);
-  let tax = 0;
-  
-  // Calculate tax for selected items
+
+  // Sale item subtotals are tax-inclusive. Extract base + tax from the gross.
+  let subtotalCents = 0;
+  let taxCents = 0;
+  let totalCents = 0;
+
   selectedReturnItems.forEach(item => {
     const product = allProducts.find(p => p.id === item.product_id);
-    const taxRate = product?.tax_rate || 0.19;
-    tax += item.subtotal * taxRate;
+    const taxRateRaw = Number(product?.tax_rate);
+    const taxRate = Number.isFinite(taxRateRaw) ? taxRateRaw : 0;
+
+    const lineTotalCents = moneyToCents(item.subtotal || 0);
+    const baseCents = taxRate > 0 ? Math.round(lineTotalCents / (1 + taxRate)) : lineTotalCents;
+    const lineTaxCents = lineTotalCents - baseCents;
+
+    totalCents += lineTotalCents;
+    subtotalCents += baseCents;
+    taxCents += lineTaxCents;
   });
-  
-  const total = subtotal + tax;
+
+  const subtotal = centsToMoney(subtotalCents);
+  const tax = centsToMoney(taxCents);
+  const total = centsToMoney(totalCents);
   
   const returnData = {
     originalSaleId: currentReturnSale.id,
@@ -7692,20 +14883,357 @@ async function completeReturn() {
     // Return processed - no popup
     await loadReturnsView();
   } catch (error) {
-    showAlert('Error processing return: ' + error.message, 'error', 'Error');
+    const msg = String(error?.message || error || 'Unknown error');
+    if (msg.includes('RETURN_ALREADY_EXISTS')) {
+      showAlert('This receipt was already refunded.', 'warning', 'Already Refunded');
+    } else {
+      showAlert('Error processing return: ' + msg, 'error', 'Error');
+    }
   }
 }
 
 async function viewReturnDetails(returnId) {
   const returnRecord = await window.api.getReturnById(returnId);
   if (returnRecord) {
+    const computedTotal = Array.isArray(returnRecord.items)
+      ? returnRecord.items.reduce((sum, it) => sum + (Number(it?.subtotal) || 0), 0)
+      : (Number(returnRecord.total) || 0);
     // Could show a detailed modal here
-    showAlert(`Return Details:\\nDate: ${new Date(returnRecord.return_date).toLocaleString()}\\nAmount: ${systemSettings?.currency_symbol || '€'}${returnRecord.total.toFixed(2)}\\nReason: ${returnRecord.reason}`, 'info', 'Return Information');
+    showAlert(`Return Details:\nDate: ${formatDateTimeWithDisplayTimeZone(new Date(returnRecord.return_date), 'en-GB', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })}\nAmount: ${systemSettings?.currency_symbol || '€'}${computedTotal.toFixed(2)}\nReason: ${returnRecord.reason}`, 'info', 'Return Information');
   }
+}
+
+function getReturnGrossTotal(ret) {
+  const items = ret?.items;
+  if (Array.isArray(items)) {
+    return items.reduce((sum, it) => sum + (Number(it?.subtotal) || 0), 0);
+  }
+  return Number(ret?.total) || 0;
+}
+
+function dedupeReturnsByOriginalSaleId(returns) {
+  const bySaleId = new Map();
+  (returns || []).forEach(r => {
+    const saleId = Number(r?.original_sale_id);
+    if (!Number.isFinite(saleId)) return;
+    const prev = bySaleId.get(saleId);
+    if (!prev) {
+      bySaleId.set(saleId, r);
+      return;
+    }
+    const prevTime = new Date(prev?.return_date || 0).getTime();
+    const nextTime = new Date(r?.return_date || 0).getTime();
+    if (nextTime >= prevTime) bySaleId.set(saleId, r);
+  });
+  return Array.from(bySaleId.values());
 }
 
 // ============== Z-REPORT HANDLERS ==============
 let currentZReportData = null;
+
+function setZReportRangeUiVisibility() {
+  try {
+    const typeEl = document.getElementById('zReportRangeType');
+    const monthGroup = document.getElementById('zReportMonthGroup');
+    const yearGroup = document.getElementById('zReportYearGroup');
+    const customRow = document.getElementById('zReportCustomRangeRow');
+    const type = (typeEl?.value || 'today').toString();
+
+    if (monthGroup) monthGroup.style.display = type === 'month' ? '' : 'none';
+    if (yearGroup) yearGroup.style.display = type === 'year' ? '' : 'none';
+    if (customRow) customRow.style.display = type === 'custom' ? '' : 'none';
+  } catch {
+    // ignore
+  }
+}
+
+function getZReportRangeSelection() {
+  const typeEl = document.getElementById('zReportRangeType');
+  const monthEl = document.getElementById('zReportRangeMonth');
+  const yearEl = document.getElementById('zReportRangeYear');
+  const startEl = document.getElementById('zReportRangeStart');
+  const endEl = document.getElementById('zReportRangeEnd');
+
+  const type = (typeEl?.value || 'today').toString();
+  const now = new Date();
+
+  const atStartOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0);
+  const atEndOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59);
+  const toYmd = (d) => d.toISOString().split('T')[0];
+
+  if (type === 'month') {
+    const monthValue = (monthEl?.value || '').toString().trim();
+    const [yStr, mStr] = monthValue.split('-');
+    const year = Number(yStr) || now.getFullYear();
+    const monthIndex = (Number(mStr) ? Number(mStr) - 1 : now.getMonth());
+    const start = new Date(year, monthIndex, 1);
+    const end = new Date(year, monthIndex + 1, 0);
+    return {
+      type,
+      startDate: toYmd(start),
+      endDate: toYmd(end),
+      startDateTime: atStartOfDay(start).toISOString(),
+      endDateTime: atEndOfDay(end).toISOString(),
+      label: `${formatDateWithDisplayTimeZone(start, 'en-GB')} - ${formatDateWithDisplayTimeZone(end, 'en-GB')}`,
+      monthKey: `${year}-${String(monthIndex + 1).padStart(2, '0')}`
+    };
+  }
+
+  if (type === 'year') {
+    const yearValue = (yearEl?.value || '').toString().trim();
+    const year = Number(yearValue) || now.getFullYear();
+    const start = new Date(year, 0, 1);
+    const end = new Date(year, 11, 31);
+    return {
+      type,
+      startDate: toYmd(start),
+      endDate: toYmd(end),
+      startDateTime: atStartOfDay(start).toISOString(),
+      endDateTime: atEndOfDay(end).toISOString(),
+      label: `${formatDateWithDisplayTimeZone(start, 'en-GB')} - ${formatDateWithDisplayTimeZone(end, 'en-GB')}`,
+      monthKey: `${year}`
+    };
+  }
+
+  if (type === 'custom') {
+    const startStr = (startEl?.value || '').toString();
+    const endStr = (endEl?.value || '').toString();
+    const start = startStr ? new Date(startStr + 'T00:00:00') : atStartOfDay(now);
+    const end = endStr ? new Date(endStr + 'T00:00:00') : atStartOfDay(now);
+    const s = atStartOfDay(start);
+    const e = atEndOfDay(end);
+    // If user swapped dates, normalize
+    const s2 = (s.getTime() <= e.getTime()) ? s : atStartOfDay(end);
+    const e2 = (s.getTime() <= e.getTime()) ? e : atEndOfDay(start);
+    return {
+      type,
+      startDate: toYmd(s2),
+      endDate: toYmd(e2),
+      startDateTime: s2.toISOString(),
+      endDateTime: e2.toISOString(),
+      label: `${formatDateWithDisplayTimeZone(new Date(s2), 'en-GB')} - ${formatDateWithDisplayTimeZone(new Date(e2), 'en-GB')}`,
+      monthKey: null
+    };
+  }
+
+  // today
+  const start = atStartOfDay(now);
+  const end = now;
+  return {
+    type: 'today',
+    startDate: toYmd(start),
+    endDate: toYmd(start),
+    startDateTime: start.toISOString(),
+    endDateTime: end.toISOString(),
+    label: `${formatDateWithDisplayTimeZone(start, 'en-GB')} - ${formatTimeWithDisplayTimeZone(end, 'en-GB')}`,
+    monthKey: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+  };
+}
+
+function updateZReportBalanceUi({ currencySymbol }) {
+  try {
+    const balanceEl = document.getElementById('zReportBalance');
+    if (!balanceEl) return;
+    const netSales = Number(currentZReportData?.net_sales || 0) || 0;
+    const autoAmount = Number(currentZReportData?._auto_expenses_total || 0) || 0;
+    const manualAmount = parseFloat(document.getElementById('zReportExpenseAmount')?.value || '') || 0;
+    const balance = netSales - (autoAmount + manualAmount);
+    balanceEl.textContent = `${currencySymbol}${balance.toFixed(2)}`;
+    balanceEl.style.color = balance >= 0 ? '#059669' : '#dc2626';
+  } catch {
+    // ignore
+  }
+}
+
+function updateZReportExpectedCashUi({ currencySymbol }) {
+  try {
+    if (!currentZReportData) return;
+    const expectedEl = document.getElementById('zReportExpectedCash');
+    if (!expectedEl) return;
+
+    // Base expected cash already accounts for net cash collected and auto cash expenses.
+    const baseExpected = Number(currentZReportData._expected_cash_base ?? currentZReportData.expected_cash ?? 0) || 0;
+    const manualExpense = parseFloat(document.getElementById('zReportExpenseAmount')?.value || '') || 0;
+
+    // Manual expense is treated as CASH paid-out.
+    const expected = baseExpected - manualExpense;
+    expectedEl.value = `${currencySymbol}${expected.toFixed(2)}`;
+
+    // Keep runtime data updated for save.
+    currentZReportData.expected_cash = expected;
+
+    // If actual cash is already entered, update the difference display.
+    try { calculateCashDifference(); } catch { /* ignore */ }
+  } catch {
+    // ignore
+  }
+}
+
+function getTaxRateForSaleItem(item, { productById, categoryByName, defaultTaxRate }) {
+  try {
+    const product = productById?.get?.(item?.product_id);
+    const productTaxRate = Number(product?.tax_rate);
+    if (Number.isFinite(productTaxRate)) return productTaxRate;
+
+    // Category tax is legacy (many deployments keep it at 0). Only use if product has none.
+    const category = product ? categoryByName?.get?.(product.category) : null;
+    const categoryTaxRate = Number(category?.tax_rate);
+    if (Number.isFinite(categoryTaxRate)) return categoryTaxRate;
+
+    const fallback = Number(defaultTaxRate);
+    return Number.isFinite(fallback) ? fallback : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function safeParseRecordItems(record) {
+  if (!record) return [];
+  const items = record.items;
+  if (!items) return [];
+  if (Array.isArray(items)) return items;
+  try {
+    return JSON.parse(items);
+  } catch {
+    return [];
+  }
+}
+
+async function computeVatBreakdownRowsForPeriod({ startDateTime, endDateTime, cashierId, settings }) {
+  const defaultTaxRate = Number(settings?.tax_rate ?? 0);
+
+  const [salesData, returnsData, loanPaymentsDetailed] = await Promise.all([
+    (window.api?.getSalesByDateTimeRange
+      ? window.api.getSalesByDateTimeRange(startDateTime, endDateTime, cashierId)
+      : window.api.getSalesByDateRange(startDateTime, endDateTime, cashierId)),
+    (window.api?.getReturnsByDateTimeRange
+      ? window.api.getReturnsByDateTimeRange(startDateTime, endDateTime, cashierId)
+      : window.api.getReturnsByDateRange(startDateTime, endDateTime, cashierId)),
+    (window.api?.getLoanPaymentsDetailedByDateTimeRange
+      ? window.api.getLoanPaymentsDetailedByDateTimeRange(startDateTime, endDateTime, cashierId)
+      : Promise.resolve([]))
+  ]);
+
+  // IMPORTANT BUSINESS RULE:
+  // - PARKING/loan sales are NOT counted for VAT on the day they are created.
+  // - VAT is counted on the day money is collected (loan_payments), allocated proportionally.
+  const salesAll = Array.isArray(salesData) ? salesData : (salesData?.sales || []);
+  const sales = (salesAll || []).filter(s => (String(s?.payment_method || '').toLowerCase() !== 'loan'));
+  const returns = Array.isArray(returnsData) ? returnsData : (returnsData?.returns || []);
+  const dedupedReturns = dedupeReturnsByOriginalSaleId(returns);
+
+  // Ensure product/category caches exist for tax lookup
+  if (!allProducts || allProducts.length === 0) {
+    try { allProducts = await window.api.getAllProducts(); } catch { allProducts = []; }
+  }
+  if (!allCategories || allCategories.length === 0) {
+    try { allCategories = await window.api.getAllCategories(); } catch { allCategories = []; }
+  }
+
+  const productById = new Map((allProducts || []).map(p => [p.id, p]));
+  const categoryByName = new Map((allCategories || []).map(c => [c.name, c]));
+
+  const rowsByRatePct = new Map();
+  const addLine = (ratePct, lineTotal, direction) => {
+    const total = Number(lineTotal);
+    if (!Number.isFinite(total) || total === 0) return;
+    const r = Math.max(0, Number(ratePct) || 0);
+    const taxRate = r / 100;
+    const base = taxRate > 0 ? (total / (1 + taxRate)) : total;
+    const cuota = total - base;
+
+    const existing = rowsByRatePct.get(r) || { rate: r, base: 0, cuota: 0, total: 0 };
+    existing.base += base * direction;
+    existing.cuota += cuota * direction;
+    existing.total += total * direction;
+    rowsByRatePct.set(r, existing);
+  };
+
+  // Sales add
+  for (const sale of (sales || [])) {
+    for (const item of safeParseRecordItems(sale)) {
+      const taxRate = getTaxRateForSaleItem(item, { productById, categoryByName, defaultTaxRate });
+      const ratePct = Math.round((Number.isFinite(taxRate) ? taxRate : 0) * 100);
+      const lineTotal = Number(item.subtotal) || (Number(item.quantity) * Number(item.unit_price)) || 0;
+      addLine(ratePct, lineTotal, +1);
+    }
+  }
+
+  // Loan/PARKING payments add (allocate VAT from original sale items proportionally)
+  for (const p of (loanPaymentsDetailed || [])) {
+    const payAmt = Number(p?.amount || 0);
+    if (!Number.isFinite(payAmt) || payAmt <= 0) continue;
+    const saleTotal = Number(p?.sale_total || 0);
+    const denom = (Number.isFinite(saleTotal) && saleTotal > 0) ? saleTotal : null;
+    if (!denom) continue;
+    const factor = Math.max(0, Math.min(1, payAmt / denom));
+    if (factor <= 0) continue;
+
+    const items = Array.isArray(p?.items) ? p.items : safeParseRecordItems(p);
+    for (const item of (items || [])) {
+      const taxRate = getTaxRateForSaleItem(item, { productById, categoryByName, defaultTaxRate });
+      const ratePct = Math.round((Number.isFinite(taxRate) ? taxRate : 0) * 100);
+      const lineTotal = Number(item.subtotal) || (Number(item.quantity) * Number(item.unit_price)) || 0;
+      addLine(ratePct, lineTotal * factor, +1);
+    }
+  }
+
+  // Returns subtract (net VAT)
+  for (const ret of (dedupedReturns || [])) {
+    for (const item of safeParseRecordItems(ret)) {
+      const taxRate = getTaxRateForSaleItem(item, { productById, categoryByName, defaultTaxRate });
+      const ratePct = Math.round((Number.isFinite(taxRate) ? taxRate : 0) * 100);
+      const lineTotal = Number(item.subtotal) || (Number(item.quantity) * Number(item.unit_price)) || 0;
+      addLine(ratePct, lineTotal, -1);
+    }
+  }
+
+  return Array.from(rowsByRatePct.values())
+    .filter(r => Number.isFinite(r.rate))
+    .sort((a, b) => a.rate - b.rate);
+}
+
+function renderVatBreakdownGridHtml(vatRows, currencySymbol) {
+  const safeMoney = (n) => {
+    const num = Number(n || 0);
+    return `${currencySymbol}${(Number.isFinite(num) ? num : 0).toFixed(2)}`;
+  };
+
+  const rows = Array.isArray(vatRows) ? vatRows : [];
+  const totalTax = rows.reduce((sum, r) => sum + (Number(r?.cuota) || 0), 0);
+
+  const parts = [];
+  for (const r of rows) {
+    const pct = Number(r?.rate) || 0;
+    parts.push(`
+      <div class="summary-item">
+        <span class="summary-label">IVA ${pct}% Base:</span>
+        <span class="summary-value">${safeMoney(r.base)}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">IVA ${pct}% Amount:</span>
+        <span class="summary-value">${safeMoney(r.cuota)}</span>
+      </div>
+    `);
+  }
+
+  parts.push(`
+    <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
+      <span class="summary-label" style="font-weight: bold;">Total Tax:</span>
+      <span class="summary-value" style="font-weight: bold;" id="zReportTotalTax">${safeMoney(totalTax)}</span>
+    </div>
+  `);
+
+  return { html: parts.join(''), totalTax };
+}
 
 function setupZReportHandlers() {
   const generateZReportBtn = document.getElementById('generateZReportBtn');
@@ -7732,7 +15260,7 @@ function setupZReportHandlers() {
   
   if (generateZReportBtn) {
     generateZReportBtn.addEventListener('click', async () => {
-      await openZReportModal();
+      await openArqueoOverlay();
     });
   }
   
@@ -7754,8 +15282,52 @@ function setupZReportHandlers() {
   if (expenseAmountInput) {
     expenseAmountInput.addEventListener('input', () => {
       updateExpenseDisplay();
+      updateZReportBalanceUi({ currencySymbol: systemSettings?.currency_symbol || '€' });
+      updateZReportExpectedCashUi({ currencySymbol: systemSettings?.currency_symbol || '€' });
     });
   }
+
+  // Range selector (Today / Month / Custom)
+  const rangeType = document.getElementById('zReportRangeType');
+  const rangeMonth = document.getElementById('zReportRangeMonth');
+  const rangeYear = document.getElementById('zReportRangeYear');
+  const rangeStart = document.getElementById('zReportRangeStart');
+  const rangeEnd = document.getElementById('zReportRangeEnd');
+
+  // Populate year dropdown once
+  try {
+    if (rangeYear && !rangeYear.dataset.optionsLoaded) {
+      const currentYear = new Date().getFullYear();
+      rangeYear.innerHTML = '';
+      for (let y = currentYear; y >= currentYear - 5; y--) {
+        const opt = document.createElement('option');
+        opt.value = String(y);
+        opt.textContent = String(y);
+        rangeYear.appendChild(opt);
+      }
+      rangeYear.value = String(currentYear);
+      rangeYear.dataset.optionsLoaded = '1';
+    }
+  } catch {
+    // ignore
+  }
+
+  const attachOnce = (el, handler) => {
+    if (!el || el.dataset.listenerAttached) return;
+    el.dataset.listenerAttached = '1';
+    el.addEventListener('change', handler);
+  };
+
+  const refresh = () => {
+    setZReportRangeUiVisibility();
+    openZReportModal().catch(() => { /* ignore */ });
+  };
+
+  attachOnce(rangeType, refresh);
+  attachOnce(rangeMonth, refresh);
+  attachOnce(rangeYear, refresh);
+  attachOnce(rangeStart, refresh);
+  attachOnce(rangeEnd, refresh);
 }
 
 async function loadZReportsView() {
@@ -7785,19 +15357,18 @@ function displayZReports(zReports) {
     const row = document.createElement('tr');
     row.innerHTML = `
       <td>${report.report_number}</td>
-      <td>${new Date(report.report_date).toLocaleDateString()}</td>
+      <td>${formatDateWithDisplayTimeZone(new Date(report.report_date), 'en-GB')}</td>
       <td>${report.cashier_name}</td>
       <td>${report.total_sales}</td>
       <td>${report.total_returns}</td>
       <td>${currencySymbol}${report.net_sales.toFixed(2)}</td>
       <td>${currencySymbol}${report.cash_sales.toFixed(2)}</td>
       <td>${currencySymbol}${report.card_sales.toFixed(2)}</td>
-      <td>${currencySymbol}${report.loan_sales.toFixed(2)}</td>
       <td style="font-weight: bold; color: #059669;">${currencySymbol}${(report.total_sales_amount || 0).toFixed(2)}</td>
       <td style="color: #dc2626;">${currencySymbol}${(report.total_expenses || 0).toFixed(2)}</td>
       <td>${currencySymbol}${report.total_tax.toFixed(2)}</td>
       <td>
-        <button class="btn-action" onclick="viewZReportDetails(${report.id})" title="View Details">👁️</button>
+        <button class="btn-action" onclick="arqueoViewSaved(${report.id})" title="View Details">👁️</button>
       </td>
     `;
     tbody.appendChild(row);
@@ -7806,18 +15377,56 @@ function displayZReports(zReports) {
 
 async function openZReportModal() {
   try {
-    // Calculate report data
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
-    const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+    // Calculate report data for the selected range
+    setZReportRangeUiVisibility();
+    let range = getZReportRangeSelection();
+
+    // For "today", use the business-day window (resets on Z-report close)
+    // so creating a Z report truly closes the day/shift.
+    try {
+      if (range?.type === 'today' && window.api?.getBusinessDayRange) {
+        const biz = await window.api.getBusinessDayRange('today');
+        if (biz?.startDateTime && biz?.endDateTime) {
+          const toYmdMadrid = (iso) => {
+            try {
+              return new Intl.DateTimeFormat('en-CA', {
+                timeZone: 'Europe/Madrid',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+              }).format(new Date(iso));
+            } catch {
+              return (new Date(iso)).toISOString().slice(0, 10);
+            }
+          };
+
+          range = {
+            ...range,
+            startDateTime: biz.startDateTime,
+            endDateTime: biz.endDateTime,
+            startDate: toYmdMadrid(biz.startDateTime),
+            endDate: toYmdMadrid(biz.endDateTime),
+            label: `${toYmdMadrid(biz.startDateTime)} - ${toYmdMadrid(biz.endDateTime)}`
+          };
+        }
+      }
+    } catch {
+      // ignore and fall back to UI selection
+    }
+
+    const startDateTime = range.startDateTime;
+    const endDateTime = range.endDateTime;
     
-    const startDateTime = todayStart.toISOString();
-    const endDateTime = todayEnd.toISOString();
-    
-    // Get sales and returns for today
-    const salesData = await window.api.getSalesByDateRange(startDateTime, endDateTime, currentUser.id);
-    const returnsData = await window.api.getReturnsByDateRange(startDateTime, endDateTime, currentUser.id);
-    const loanPayments = await window.api.getLoanPaymentsByDateRange(startDateTime, endDateTime, currentUser.id);
+    // Get sales/returns/payments for the selected range (store-wide)
+    const salesData = await (window.api?.getSalesByDateTimeRange
+      ? window.api.getSalesByDateTimeRange(startDateTime, endDateTime, null)
+      : window.api.getSalesByDateRange(startDateTime, endDateTime, null));
+    const returnsData = await (window.api?.getReturnsByDateTimeRange
+      ? window.api.getReturnsByDateTimeRange(startDateTime, endDateTime, null)
+      : window.api.getReturnsByDateRange(startDateTime, endDateTime, null));
+    const loanPayments = await (window.api?.getLoanPaymentsByDateTimeRange
+      ? window.api.getLoanPaymentsByDateTimeRange(startDateTime, endDateTime, null)
+      : window.api.getLoanPaymentsByDateRange(startDateTime, endDateTime, null));
     
     // Extract the actual arrays from the response objects
     const sales = Array.isArray(salesData) ? salesData : (salesData?.sales || []);
@@ -7844,18 +15453,38 @@ async function openZReportModal() {
       }
     });
     
-    // Calculate totals
-    const totalSales = sales.length;
-    const totalReturns = returns.length;
-    const netSalesCount = totalSales - totalReturns;
+    // BUSINESS RULE: PARKING/loan sales are not counted until paid.
+    const nonLoanSales = (sales || []).filter(s => (String(s?.payment_method || '').toLowerCase() !== 'loan'));
+
+
+    // Count PARKING payments as documents on the paid day.
+    // Use unique loan_id to avoid double-counting if multiple partial payments happen.
+    const loanPaymentDocCount = (() => {
+      try {
+        const ids = new Set((loanPayments || []).map(p => String(p?.loan_id ?? p?.loanId ?? '')).filter(Boolean));
+        return ids.size;
+      } catch {
+        return 0;
+      }
+    })();
+
+    // Calculate totals (paid sales + paid PARKING documents)
+    const totalSales = nonLoanSales.length + loanPaymentDocCount;
+    const dedupedReturns = dedupeReturnsByOriginalSaleId(returns);
+    const totalReturns = dedupedReturns.length;
+    const saleIds = new Set(nonLoanSales.map(s => Number(s?.id)).filter(Number.isFinite));
+    const refundedSalesCount = dedupedReturns.filter(r => saleIds.has(Number(r?.original_sale_id))).length;
+    const netSalesCount = Math.max(0, (nonLoanSales.length - refundedSalesCount) + loanPaymentDocCount);
     
-    const grossSales = sales.reduce((sum, sale) => sum + sale.total, 0);
-    const totalReturnsAmount = returns.reduce((sum, ret) => sum + ret.total, 0);
-    const netSales = grossSales - totalReturnsAmount;
+    const totalReturnsAmount = dedupedReturns.reduce((sum, ret) => sum + getReturnGrossTotal(ret), 0);
     
-    // Calculate payment methods
-    const cashSalesFromSales = sales.filter(s => s.payment_method?.toLowerCase() === 'cash').reduce((sum, s) => sum + s.total, 0);
-    const cardSalesFromSales = sales.filter(s => s.payment_method?.toLowerCase() === 'card').reduce((sum, s) => sum + s.total, 0);
+    // Calculate payment methods (paid sales)
+    const cashSalesFromSales = nonLoanSales
+      .filter(s => (s.payment_method || '').toString().toLowerCase() === 'cash')
+      .reduce((sum, s) => sum + (Number(s.total) || 0), 0);
+    const cardSalesFromSales = nonLoanSales
+      .filter(s => (s.payment_method || '').toString().toLowerCase() === 'card')
+      .reduce((sum, s) => sum + (Number(s.total) || 0), 0);
 
     // PARKING payments: count the money on the day it is paid
     const loanCashPayments = (loanPayments || [])
@@ -7869,37 +15498,70 @@ async function openZReportModal() {
     const cardSales = cardSalesFromSales + loanCardPayments;
     // Store PARKING payments separately for visibility (they are already included in cash/card totals)
     const loanSales = loanCashPayments + loanCardPayments;
+
     
-    // Calculate tax breakdown (7% and 19%)
-    let tax7Base = 0;
-    let tax7Amount = 0;
-    let tax19Base = 0;
-    let tax19Amount = 0;
-    
-    sales.forEach(sale => {
-      if (sale.items && Array.isArray(sale.items)) {
-        sale.items.forEach(item => {
-          const product = allProducts.find(p => p.id === item.product_id);
-          const taxRate = product?.tax_rate || 0.19;
-          const itemSubtotal = item.subtotal || (item.quantity * item.unit_price);
-          const itemTax = itemSubtotal * taxRate;
-          
-          if (taxRate === 0.07) {
-            tax7Base += itemSubtotal;
-            tax7Amount += itemTax;
-          } else {
-            tax19Base += itemSubtotal;
-            tax19Amount += itemTax;
-          }
-        });
-      }
+    // VAT breakdown (dynamic, same as products) - computed on NET (sales - returns)
+    const vatRows = await computeVatBreakdownRowsForPeriod({
+      startDateTime,
+      endDateTime,
+      cashierId: null,
+      settings: systemSettings
     });
+    const totalTax = vatRows.reduce((sum, r) => sum + (Number(r?.cuota) || 0), 0);
     
-    const totalTax = tax7Amount + tax19Amount;
-    
-    // Cash reconciliation - cash sales minus cash refunds
-    const cashReturns = returns.filter(r => r.refund_method?.toLowerCase() === 'cash').reduce((sum, r) => sum + r.total, 0);
-    const expectedCash = cashSales - cashReturns;
+    // Returns by method so cash/card match what was actually collected
+    const cashReturns = dedupedReturns
+      .filter(r => (r.refund_method || '').toString().toLowerCase() === 'cash')
+      .reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
+    const cardReturns = dedupedReturns
+      .filter(r => (r.refund_method || '').toString().toLowerCase() === 'card')
+      .reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
+
+    // Financial summary based on money movement (not including unpaid PARKING)
+    const grossSales = cashSales + cardSales;
+    const netSales = (cashSales - cashReturns) + (cardSales - cardReturns);
+
+    // Expenses: auto-fetch from Expenses table for the selected range.
+    // total_expenses = ALL expenses (cash + card) for reporting.
+    // expected_cash should only be reduced by CASH-paid expenses.
+    const startYmd = range.startDate;
+    const endYmd = range.endDate;
+    let autoExpensesTotal = 0;
+    let autoCashExpensesTotal = 0;
+    let autoExpensesCount = 0;
+    let autoExpensesList = [];
+    try {
+      if (window.api?.getExpenses) {
+        const expenses = await (window.api?.getExpensesByDateTimeRange
+          ? window.api.getExpensesByDateTimeRange(startDateTime, endDateTime)
+          : window.api.getExpenses(startYmd, endYmd));
+        const list = Array.isArray(expenses) ? expenses : (expenses?.expenses || []);
+        autoExpensesCount = Array.isArray(list) ? list.length : 0;
+        autoExpensesList = Array.isArray(list) ? list : [];
+        (list || []).forEach((e) => {
+          const amt = Number(e?.amount || 0);
+          if (!Number.isFinite(amt)) return;
+          autoExpensesTotal += amt;
+          const pm = String(e?.payment_method || '').toLowerCase();
+          if (pm === 'cash') autoCashExpensesTotal += amt;
+        });
+      } else if (window.api?.getExpenseSummary) {
+        const sum = await window.api.getExpenseSummary(startYmd, endYmd);
+        autoExpensesTotal = Number(sum?.total_amount || 0) || 0;
+      }
+    } catch {
+      // ignore expense auto-fetch errors; fall back to 0
+      autoExpensesTotal = 0;
+      autoCashExpensesTotal = 0;
+      autoExpensesCount = 0;
+      autoExpensesList = [];
+    }
+
+    const netCashCollected = cashSales - cashReturns;
+    const netCardCollected = cardSales - cardReturns;
+
+    // Cash in register reduced by cash-paid expenses
+    const expectedCashBase = netCashCollected - autoCashExpensesTotal;
     
     // Ensure currentUser is properly set
     if (!currentUser || !currentUser.id || !currentUser.full_name) {
@@ -7919,23 +15581,38 @@ async function openZReportModal() {
       gross_sales: grossSales,
       total_returns_amount: totalReturnsAmount,
       net_sales: netSales,
-      cash_sales: cashSales,
-      card_sales: cardSales,
+      cash_sales: netCashCollected,
+      card_sales: netCardCollected,
       loan_sales: loanSales,
       loan_cash_payments: loanCashPayments,
       loan_card_payments: loanCardPayments,
-      tax_7_base: tax7Base,
-      tax_7_amount: tax7Amount,
-      tax_19_base: tax19Base,
-      tax_19_amount: tax19Amount,
+      // Legacy columns (kept for backwards compatibility)
+      tax_7_base: (vatRows.find(r => Number(r?.rate) === 7)?.base) || 0,
+      tax_7_amount: (vatRows.find(r => Number(r?.rate) === 7)?.cuota) || 0,
+      tax_19_base: (vatRows.find(r => Number(r?.rate) === 19)?.base) || 0,
+      tax_19_amount: (vatRows.find(r => Number(r?.rate) === 19)?.cuota) || 0,
       total_tax: totalTax,
-      expected_cash: expectedCash
+      tax_breakdown_json: (() => {
+        try { return JSON.stringify(vatRows); } catch { return null; }
+      })(),
+      expected_cash: expectedCashBase,
+
+      // For live UI recalculation when manual expense changes
+      _expected_cash_base: expectedCashBase,
+      _net_cash_collected: netCashCollected,
+      _net_card_collected: netCardCollected,
+
+      // Runtime-only helpers (not stored directly unless merged into reportData)
+      _auto_expenses_total: autoExpensesTotal,
+      _auto_cash_expenses_total: autoCashExpensesTotal,
+      _auto_expenses_count: autoExpensesCount,
+      _auto_expenses_list: autoExpensesList
     };
     
     const currencySymbol = systemSettings?.currency_symbol || '€';
     
     // Populate modal
-    document.getElementById('zReportPeriod').textContent = `${todayStart.toLocaleDateString()} - ${todayEnd.toLocaleTimeString()}`;
+    document.getElementById('zReportPeriod').textContent = range.label;
     document.getElementById('zReportTotalSales').textContent = totalSales;
     document.getElementById('zReportTotalReturns').textContent = totalReturns;
     document.getElementById('zReportNetCount').textContent = netSalesCount;
@@ -7944,30 +15621,35 @@ async function openZReportModal() {
     document.getElementById('zReportReturnsAmount').textContent = `${currencySymbol}${totalReturnsAmount.toFixed(2)}`;
     document.getElementById('zReportNetSales').textContent = `${currencySymbol}${netSales.toFixed(2)}`;
     
-    document.getElementById('zReportCash').textContent = `${currencySymbol}${cashSales.toFixed(2)}`;
-    document.getElementById('zReportCard').textContent = `${currencySymbol}${cardSales.toFixed(2)}`;
+    document.getElementById('zReportCash').textContent = `${currencySymbol}${netCashCollected.toFixed(2)}`;
+    document.getElementById('zReportCard').textContent = `${currencySymbol}${netCardCollected.toFixed(2)}`;
+
+    // (No separate PARKING lines in Z-report; PARKING payments are included in cash/card totals.)
     
-    // Calculate and display total sales amount
-    const totalSalesAmount = cashSales + cardSales;
+    // Calculate and display total collected amount (net)
+    const totalSalesAmount = netCashCollected + netCardCollected;
     document.getElementById('zReportTotalAmount').textContent = `${currencySymbol}${totalSalesAmount.toFixed(2)}`;
     
-    // Initialize expenses to 0
-    document.getElementById('zReportTotalExpenses').textContent = `${currencySymbol}0.00`;
+    // Initialize expenses with auto-fetched total
+    document.getElementById('zReportTotalExpenses').textContent = `${currencySymbol}${(Number(autoExpensesTotal) || 0).toFixed(2)}`;
     document.getElementById('zReportExpenseAmount').value = '';
     document.getElementById('zReportExpenseDescription').value = '';
     
-    document.getElementById('zReportTax7Base').textContent = `${currencySymbol}${tax7Base.toFixed(2)}`;
-    document.getElementById('zReportTax7Amount').textContent = `${currencySymbol}${tax7Amount.toFixed(2)}`;
-    document.getElementById('zReportTax19Base').textContent = `${currencySymbol}${tax19Base.toFixed(2)}`;
-    document.getElementById('zReportTax19Amount').textContent = `${currencySymbol}${tax19Amount.toFixed(2)}`;
-    document.getElementById('zReportTotalTax').textContent = `${currencySymbol}${totalTax.toFixed(2)}`;
+    const taxGrid = document.getElementById('zReportTaxBreakdownGrid');
+    if (taxGrid) {
+      const rendered = renderVatBreakdownGridHtml(vatRows, currencySymbol);
+      taxGrid.innerHTML = rendered.html;
+    }
     
-    document.getElementById('zReportExpectedCash').value = `${currencySymbol}${expectedCash.toFixed(2)}`;
+    document.getElementById('zReportExpectedCash').value = `${currencySymbol}${expectedCashBase.toFixed(2)}`;
     document.getElementById('zReportActualCash').value = '';
     document.getElementById('zReportDifference').value = '';
     document.getElementById('zReportNotes').value = '';
+
+    updateZReportBalanceUi({ currencySymbol });
+    updateZReportExpectedCashUi({ currencySymbol });
     
-    openModal('zReportModal');
+    if (!_skipZReportModalOpen) openModal('zReportModal');
   } catch (error) {
     console.error('Error generating Z-report:', error);
     showAlert('Error generating Z-report: ' + error.message, 'error', 'Error');
@@ -7999,9 +15681,12 @@ function updateExpenseDisplay() {
   
   if (!expenseInput || !expenseDisplay) return;
   
-  const expenseAmount = parseFloat(expenseInput.value) || 0;
-  expenseDisplay.textContent = `${currencySymbol}${expenseAmount.toFixed(2)}`;
-  expenseDisplay.style.color = expenseAmount > 0 ? '#dc2626' : '#94a3b8';
+  const manualAmount = parseFloat(expenseInput.value) || 0;
+  const autoAmount = Number(currentZReportData?._auto_expenses_total || 0) || 0;
+  const total = autoAmount + manualAmount;
+
+  expenseDisplay.textContent = `${currencySymbol}${total.toFixed(2)}`;
+  expenseDisplay.style.color = total > 0 ? '#dc2626' : '#94a3b8';
 }
 
 async function completeZReport() {
@@ -8010,29 +15695,83 @@ async function completeZReport() {
     return;
   }
   
-  const actualCash = parseFloat(document.getElementById('zReportActualCash').value);
-  if (isNaN(actualCash)) {
-    showAlert('Please enter the actual cash count', 'warning', 'Missing Information');
-    return;
-  }
-  
-  const cashDifference = actualCash - currentZReportData.expected_cash;
+  // Ensure expected cash is updated based on any manual expense entry
+  const manualExpenseAmount = parseFloat(document.getElementById('zReportExpenseAmount').value) || 0;
+  const baseExpectedCash = Number(currentZReportData._expected_cash_base ?? currentZReportData.expected_cash ?? 0) || 0;
+  const finalExpectedCash = baseExpectedCash - manualExpenseAmount;
+
+  const actualCashRaw = (document.getElementById('zReportActualCash').value || '').toString().trim();
+  const actualCash = actualCashRaw ? (parseFloat(actualCashRaw) || 0) : null;
+  const cashDifference = (actualCash === null) ? null : (actualCash - finalExpectedCash);
   
   // Get expense information
-  const expenseAmount = parseFloat(document.getElementById('zReportExpenseAmount').value) || 0;
-  const expenseDescription = document.getElementById('zReportExpenseDescription').value || '';
+  // - Auto: from Expenses table (today)
+  // - Manual: optional extra cash-out not recorded in Expenses
+  const autoExpenseAmount = Number(currentZReportData?._auto_expenses_total || 0) || 0;
+  const totalExpenseAmount = autoExpenseAmount + manualExpenseAmount;
+  const manualExpenseDescription = (document.getElementById('zReportExpenseDescription').value || '').toString().trim();
+
+  // Build a structured expense payload so the printed Z report can show a detailed list.
+  const autoList = Array.isArray(currentZReportData?._auto_expenses_list) ? currentZReportData._auto_expenses_list : [];
+  const normalizedAuto = autoList.map(e => ({
+    id: e?.id ?? null,
+    expense_date: e?.expense_date ?? null,
+    category: e?.category ?? null,
+    description: e?.description ?? null,
+    amount: Number(e?.amount ?? 0) || 0,
+    payment_method: e?.payment_method ?? null,
+    user_name: e?.user_name ?? e?.cashier_name ?? null
+  }));
+
+  const normalizedManual = (manualExpenseAmount > 0)
+    ? [{
+      id: null,
+      expense_date: null,
+      category: 'Manual',
+      description: manualExpenseDescription || 'Manual expense',
+      amount: manualExpenseAmount,
+      payment_method: 'cash',
+      user_name: (currentUser?.full_name || currentUser?.name || currentUser?.username || null)
+    }]
+    : [];
+
+  const expensesJson = (() => {
+    try {
+      return JSON.stringify({
+        auto: normalizedAuto,
+        manual: normalizedManual
+      });
+    } catch {
+      return null;
+    }
+  })();
+
+  const autoCount = Number(currentZReportData?._auto_expenses_count || 0) || 0;
+  const autoCash = Number(currentZReportData?._auto_cash_expenses_total || 0) || 0;
+  const autoCard = Math.max(0, autoExpenseAmount - autoCash);
+  const autoNote = autoExpenseAmount > 0
+    ? `Auto expenses (today): ${autoCount} item(s), cash ${autoCash.toFixed(2)}, card ${autoCard.toFixed(2)}`
+    : '';
+  const expenseDescription = [autoNote, manualExpenseDescription].filter(Boolean).join(' | ');
   
   // Calculate total sales amount (cash/card already include PARKING payments)
   const totalSalesAmount = currentZReportData.cash_sales + currentZReportData.card_sales;
   
+  const range = getZReportRangeSelection();
+  // Keep Z-report numbering consistent across Today/Month/Year/Custom.
+  // (Some users expect the same "ARQUEO" number format regardless of range.)
+  const reportNumber = `Z${Date.now()}`;
+
   const reportData = {
     ...currentZReportData,
-    report_number: `Z${Date.now()}`,
+    report_number: reportNumber,
+    expected_cash: finalExpectedCash,
     actual_cash: actualCash,
     cash_difference: cashDifference,
     total_sales_amount: totalSalesAmount,
-    total_expenses: expenseAmount,
-    expense_description: expenseDescription,
+    total_expenses: totalExpenseAmount,
+    expense_description: expenseDescription || null,
+    expenses_json: expensesJson,
     notes: document.getElementById('zReportNotes').value || null
   };
   
@@ -8058,7 +15797,116 @@ async function viewZReportDetails(reportId) {
     
     const currencySymbol = systemSettings?.currency_symbol || '€';
     const content = document.getElementById('zReportDetailsContent');
+
+    // VAT breakdown: prefer stored JSON if available; otherwise fall back to legacy 7%/19% fields.
+    let vatRows = null;
+    try {
+      if (report.tax_breakdown_json) {
+        const parsed = typeof report.tax_breakdown_json === 'string' ? JSON.parse(report.tax_breakdown_json) : report.tax_breakdown_json;
+        if (Array.isArray(parsed)) vatRows = parsed;
+      }
+    } catch {
+      vatRows = null;
+    }
+
+    if (!vatRows) {
+      vatRows = [
+        { rate: 7, base: Number(report.tax_7_base || 0), cuota: Number(report.tax_7_amount || 0), total: Number(report.tax_7_base || 0) + Number(report.tax_7_amount || 0) },
+        { rate: 19, base: Number(report.tax_19_base || 0), cuota: Number(report.tax_19_amount || 0), total: Number(report.tax_19_base || 0) + Number(report.tax_19_amount || 0) }
+      ].filter(r => (Number(r.base) !== 0) || (Number(r.cuota) !== 0));
+    }
+
+    const vatRendered = renderVatBreakdownGridHtml(vatRows, currencySymbol);
     
+    // Expenses detail (optional)
+    let expenseDetailHtml = '';
+    try {
+      if (report.expenses_json) {
+        const parsed = typeof report.expenses_json === 'string' ? JSON.parse(report.expenses_json) : report.expenses_json;
+        const auto = Array.isArray(parsed?.auto) ? parsed.auto : [];
+        const manual = Array.isArray(parsed?.manual) ? parsed.manual : [];
+        const all = [...auto, ...manual].filter(e => Number(e?.amount) > 0);
+
+        if (all.length) {
+          const rows = all.map(e => {
+            const pm = String(e?.payment_method || '').toUpperCase() || '-';
+            const desc = (e?.description || e?.category || '-').toString();
+            const amt = Number(e?.amount || 0);
+            return `
+              <tr>
+                <td style="padding:8px 10px; border-bottom:1px solid #e2e8f0; color:#334155; font-weight:700;">${desc}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid #e2e8f0; color:#64748b; font-weight:800; text-align:center;">${pm}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid #e2e8f0; color:#dc2626; font-weight:900; text-align:right;">${currencySymbol}${amt.toFixed(2)}</td>
+              </tr>
+            `;
+          }).join('');
+
+          expenseDetailHtml = `
+            <div style="grid-column: span 3; margin-top: 10px;">
+              <div style="border:2px solid #e2e8f0; border-radius: 12px; overflow:hidden;">
+                <div style="display:flex; justify-content:space-between; gap:10px; padding:10px 12px; background:#f8fafc; font-weight:900; color:#0f172a;">
+                  <div style="flex:1;">Reason</div>
+                  <div style="width:90px; text-align:center;">Pay</div>
+                  <div style="width:120px; text-align:right;">Amount</div>
+                </div>
+                <table style="width:100%; border-collapse:collapse;">
+                  <tbody>
+                    ${rows}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          `;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    // Recompute counts using the same business rule as Z-report generation:
+    // - Exclude loan-origin sales documents
+    // - Include PARKING payments as documents on the paid day
+    let computedTotalSales = Number(report.total_sales || 0) || 0;
+    let computedNetSalesCount = Number(report.net_sales_count || 0) || 0;
+    try {
+      const start = report.start_datetime;
+      const end = report.end_datetime;
+      const cashierId = null;
+      const salesData = await (window.api?.getSalesByDateTimeRange
+        ? window.api.getSalesByDateTimeRange(start, end, cashierId)
+        : window.api.getSalesByDateRange(start, end, cashierId));
+      const sales = Array.isArray(salesData) ? salesData : (salesData?.sales || []);
+      const nonLoanSales = (sales || []).filter(s => String(s?.payment_method || '').toLowerCase() !== 'loan');
+
+      const loanPayments = await (window.api?.getLoanPaymentsByDateTimeRange
+        ? window.api.getLoanPaymentsByDateTimeRange(start, end, cashierId)
+        : window.api.getLoanPaymentsByDateRange(start, end, cashierId));
+      const loanPaymentDocCount = (() => {
+        try {
+          const ids = new Set((loanPayments || []).map(p => String(p?.loan_id ?? p?.loanId ?? '')).filter(Boolean));
+          return ids.size;
+        } catch {
+          return 0;
+        }
+      })();
+
+      computedTotalSales = nonLoanSales.length + loanPaymentDocCount;
+
+      // Net = exclude refunded non-loan receipts, but keep loan payment docs
+      const returnsData = await (window.api?.getReturnsByDateTimeRange
+        ? window.api.getReturnsByDateTimeRange(start, end, cashierId)
+        : window.api.getReturnsByDateRange(start, end, cashierId));
+      const returns = Array.isArray(returnsData) ? returnsData : (returnsData?.returns || []);
+      const dedupedReturns = dedupeReturnsByOriginalSaleId(returns);
+      const saleIds = new Set(nonLoanSales.map(s => Number(s?.id)).filter(Number.isFinite));
+      const refundedSalesCount = dedupedReturns.filter(r => saleIds.has(Number(r?.original_sale_id))).length;
+      computedNetSalesCount = Math.max(0, (nonLoanSales.length - refundedSalesCount) + loanPaymentDocCount);
+    } catch {
+      // ignore
+    }
+
+    // No separate PARKING lines in Z-report details.
+
     content.innerHTML = `
       <div class="z-report-summary">
         <h4>Report Information</h4>
@@ -8069,7 +15917,29 @@ async function viewZReportDetails(reportId) {
           </div>
           <div class="summary-item">
             <span class="summary-label">Report Date:</span>
-            <span class="summary-value">${new Date(report.report_date).toLocaleString()}</span>
+            <span class="summary-value">${(() => {
+              try {
+                return new Intl.DateTimeFormat('en-GB', {
+                  timeZone: 'Europe/Madrid',
+                  year: 'numeric',
+                  month: '2-digit',
+                  day: '2-digit',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit'
+                }).format(new Date(report.report_date));
+              } catch {
+                return formatDateTimeWithDisplayTimeZone(new Date(report.report_date), 'en-GB', {
+                  year: 'numeric',
+                  month: '2-digit',
+                  day: '2-digit',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                  hour12: false,
+                });
+              }
+            })()}</span>
           </div>
           <div class="summary-item">
             <span class="summary-label">Cashier:</span>
@@ -8083,7 +15953,7 @@ async function viewZReportDetails(reportId) {
         <div class="summary-grid">
           <div class="summary-item">
             <span class="summary-label">Total Sales:</span>
-            <span class="summary-value">${report.total_sales}</span>
+            <span class="summary-value">${computedTotalSales}</span>
           </div>
           <div class="summary-item">
             <span class="summary-label">Total Returns:</span>
@@ -8091,7 +15961,7 @@ async function viewZReportDetails(reportId) {
           </div>
           <div class="summary-item">
             <span class="summary-label">Net Sales Count:</span>
-            <span class="summary-value">${report.net_sales_count}</span>
+            <span class="summary-value">${computedNetSalesCount}</span>
           </div>
         </div>
       </div>
@@ -8111,6 +15981,10 @@ async function viewZReportDetails(reportId) {
             <span class="summary-label">Net Sales:</span>
             <span class="summary-value">${currencySymbol}${report.net_sales.toFixed(2)}</span>
           </div>
+          <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
+            <span class="summary-label" style="font-weight: bold; font-size: 16px;">Balance (Net Sales - Expenses):</span>
+            <span class="summary-value" style="font-weight: bold; font-size: 16px; color: ${(Number(report.net_sales || 0) - Number(report.total_expenses || 0)) >= 0 ? '#059669' : '#dc2626'};">${currencySymbol}${(Number(report.net_sales || 0) - Number(report.total_expenses || 0)).toFixed(2)}</span>
+          </div>
         </div>
       </div>
 
@@ -8126,7 +16000,7 @@ async function viewZReportDetails(reportId) {
             <span class="summary-value">${currencySymbol}${report.card_sales.toFixed(2)}</span>
           </div>
           <div class="summary-item" style="grid-column: span 3; border-top: 2px solid #e2e8f0; padding-top: 10px; margin-top: 10px;">
-            <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL SALES AMOUNT:</span>
+            <span class="summary-label" style="font-weight: bold; font-size: 16px;">💰 TOTAL COLLECTED (Cash + Card):</span>
             <span class="summary-value" style="font-weight: bold; font-size: 16px; color: #059669;">${currencySymbol}${(report.total_sales_amount || 0).toFixed(2)}</span>
           </div>
         </div>
@@ -8145,32 +16019,14 @@ async function viewZReportDetails(reportId) {
               <span class="summary-value">${report.expense_description}</span>
             </div>
           ` : ''}
+          ${expenseDetailHtml}
         </div>
       </div>
 
       <div class="z-report-section">
         <h4>Tax Breakdown</h4>
         <div class="summary-grid">
-          <div class="summary-item">
-            <span class="summary-label">7% Tax Base:</span>
-            <span class="summary-value">${currencySymbol}${report.tax_7_base.toFixed(2)}</span>
-          </div>
-          <div class="summary-item">
-            <span class="summary-label">7% Tax Amount:</span>
-            <span class="summary-value">${currencySymbol}${report.tax_7_amount.toFixed(2)}</span>
-          </div>
-          <div class="summary-item">
-            <span class="summary-label">19% Tax Base:</span>
-            <span class="summary-value">${currencySymbol}${report.tax_19_base.toFixed(2)}</span>
-          </div>
-          <div class="summary-item">
-            <span class="summary-label">19% Tax Amount:</span>
-            <span class="summary-value">${currencySymbol}${report.tax_19_amount.toFixed(2)}</span>
-          </div>
-          <div class="summary-item">
-            <span class="summary-label">Total Tax:</span>
-            <span class="summary-value">${currencySymbol}${report.total_tax.toFixed(2)}</span>
-          </div>
+          ${vatRendered.html}
         </div>
       </div>
 
@@ -8183,11 +16039,11 @@ async function viewZReportDetails(reportId) {
           </div>
           <div class="summary-item">
             <span class="summary-label">Actual Cash:</span>
-            <span class="summary-value">${currencySymbol}${report.actual_cash ? report.actual_cash.toFixed(2) : 'N/A'}</span>
+            <span class="summary-value">${currencySymbol}${(report.actual_cash === null || report.actual_cash === undefined) ? 'N/A' : Number(report.actual_cash).toFixed(2)}</span>
           </div>
           <div class="summary-item">
             <span class="summary-label">Difference:</span>
-            <span class="summary-value" style="color: ${report.cash_difference < 0 ? 'red' : (report.cash_difference > 0 ? 'green' : 'black')}">${currencySymbol}${report.cash_difference ? report.cash_difference.toFixed(2) : 'N/A'}</span>
+            <span class="summary-value" style="color: ${(report.cash_difference === null || report.cash_difference === undefined) ? 'black' : (Number(report.cash_difference) < 0 ? 'red' : (Number(report.cash_difference) > 0 ? 'green' : 'black'))}">${currencySymbol}${(report.cash_difference === null || report.cash_difference === undefined) ? 'N/A' : Number(report.cash_difference).toFixed(2)}</span>
           </div>
         </div>
       </div>
@@ -8224,6 +16080,7 @@ async function printZReport(report) {
     const settings = await window.api.getSystemSettings();
     const currencySymbol = settings?.currency_symbol || '€';
     const printerName = (settings?.printer_name || '').toString().toLowerCase();
+    const timeZone = getDisplayTimeZone();
 
     const inferLineWidth = (printer) => {
       const name = String(printer || '').toLowerCase();
@@ -8275,90 +16132,161 @@ async function printZReport(report) {
       return num.toFixed(2).replace('.', ',') + currencySymbol;
     };
 
-    const formatDateTime = (isoString) => {
-      const dt = isoString ? new Date(isoString) : new Date();
-      const date = dt.toLocaleDateString('es-ES');
-      const time = dt.toLocaleTimeString('es-ES');
-      return { date, time };
+    const parseDateTimeLoose = (value) => {
+      if (!value) return new Date();
+      const s = String(value).trim();
+      // SQLite CURRENT_TIMESTAMP is often like: "YYYY-MM-DD HH:MM:SS" (UTC).
+      if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) {
+        return new Date(s.replace(' ', 'T') + 'Z');
+      }
+      // If already ISO-like, let Date parse it.
+      return new Date(s);
     };
 
-    // Fetch sales/returns for the report period to compute VAT breakdown accurately
+    const formatDateTime = (isoString) => {
+      const dt = parseDateTimeLoose(isoString);
+      try {
+        const date = new Intl.DateTimeFormat('es-ES', {
+          timeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).format(dt);
+        const time = new Intl.DateTimeFormat('es-ES', {
+          timeZone,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        }).format(dt);
+        return { date, time };
+      } catch {
+        const date = formatDateWithDisplayTimeZone(dt, 'es-ES');
+        const time = formatTimeWithDisplayTimeZone(dt, 'es-ES');
+        return { date, time };
+      }
+    };
+
+    const getYmdPartsInTimeZone = (dateObj) => {
+      const dt = dateObj instanceof Date ? dateObj : new Date(dateObj);
+      try {
+        const parts = new Intl.DateTimeFormat('en-CA', {
+          timeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).formatToParts(dt);
+        const get = (t) => parts.find(p => p.type === t)?.value;
+        return {
+          year: Number(get('year')),
+          month: Number(get('month')),
+          day: Number(get('day'))
+        };
+      } catch {
+        return { year: dt.getFullYear(), month: dt.getMonth() + 1, day: dt.getDate() };
+      }
+    };
+
+    const inferRangeLabel = ({ startIso, endIso }) => {
+      try {
+        const startDt = parseDateTimeLoose(startIso);
+        const endDt = parseDateTimeLoose(endIso);
+        const s = getYmdPartsInTimeZone(startDt);
+        const e = getYmdPartsInTimeZone(endDt);
+
+        const sameDay = s.year === e.year && s.month === e.month && s.day === e.day;
+        const lastDayOfMonth = (year, month1to12) => {
+          // day count doesn't depend on timezone
+          return new Date(Date.UTC(year, month1to12, 0)).getUTCDate();
+        };
+
+        const isFullMonth = (
+          s.year === e.year &&
+          s.month === e.month &&
+          s.day === 1 &&
+          e.day === lastDayOfMonth(s.year, s.month)
+        );
+
+        const isFullYear = (
+          s.year === e.year &&
+          s.month === 1 && s.day === 1 &&
+          e.month === 12 && e.day === 31
+        );
+
+        if (isFullYear) {
+          return { kind: 'year', label: String(s.year) };
+        }
+
+        if (isFullMonth) {
+          const monthName = new Intl.DateTimeFormat('es-ES', { timeZone, month: 'long' }).format(startDt);
+          return { kind: 'month', label: `${String(monthName || '').toUpperCase()} ${s.year}`.trim() };
+        }
+
+        if (sameDay) {
+          const weekday = new Intl.DateTimeFormat('es-ES', { timeZone, weekday: 'long' }).format(startDt);
+          return { kind: 'day', label: String(weekday || '').toUpperCase() };
+        }
+
+        // custom / other
+        const sd = formatDateTime(startIso).date;
+        const ed = formatDateTime(endIso).date;
+        return { kind: 'custom', label: `${sd} - ${ed}` };
+      } catch {
+        return null;
+      }
+    };
+
+    // VAT breakdown (dynamic) - must follow business rule:
+    // Don't include PARKING/loan sales until paid; include loan payments on paid day.
     const start = report.start_datetime;
     const end = report.end_datetime;
-    const cashierId = report.cashier_id || null;
-    const [salesData, returnsData] = await Promise.all([
-      window.api.getSalesByDateRange(start, end, cashierId),
-      window.api.getReturnsByDateRange(start, end, cashierId)
-    ]);
-    
-    // Extract the actual sales and returns arrays from the response objects
-    const sales = Array.isArray(salesData) ? salesData : (salesData?.sales || []);
-    const returns = Array.isArray(returnsData) ? returnsData : (returnsData?.returns || []);
-
-    const safeParseItems = (record) => {
-      if (!record) return [];
-      const items = record.items;
-      if (!items) return [];
-      if (Array.isArray(items)) return items;
-      try {
-        return JSON.parse(items);
-      } catch {
-        return [];
-      }
-    };
-
-    // Ensure we can map product_id -> tax_rate
-    if (!allProducts || allProducts.length === 0) {
-      try {
-        allProducts = await window.api.getAllProducts();
-      } catch (e) {
-        allProducts = [];
-      }
-    }
-    if (!allCategories || allCategories.length === 0) {
-      try {
-        allCategories = await window.api.getAllCategories();
-      } catch (e) {
-        allCategories = [];
-      }
-    }
-
-    const productById = new Map((allProducts || []).map(p => [p.id, p]));
-    const categoryByName = new Map((allCategories || []).map(c => [c.name, c]));
-    const defaultTaxRate = Number(settings?.tax_rate ?? 0);
-
-    const taxBreakdown = new Map();
-    (sales || []).forEach(sale => {
-      safeParseItems(sale).forEach(item => {
-        const lineTotal = Number(item.subtotal || 0);
-        if (!Number.isFinite(lineTotal) || lineTotal === 0) return;
-
-        const product = productById.get(item.product_id);
-        const category = product ? categoryByName.get(product.category) : null;
-        const taxRate = Number(category?.tax_rate ?? product?.tax_rate ?? defaultTaxRate ?? 0);
-        const ratePercent = Math.round(taxRate * 100);
-
-        const base = lineTotal / (1 + taxRate);
-        const cuota = lineTotal - base;
-
-        const row = taxBreakdown.get(ratePercent) || { rate: ratePercent, base: 0, cuota: 0, total: 0 };
-        row.base += base;
-        row.cuota += cuota;
-        row.total += lineTotal;
-        taxBreakdown.set(ratePercent, row);
-      });
+    const vatRows = await computeVatBreakdownRowsForPeriod({
+      startDateTime: start,
+      endDateTime: end,
+      cashierId: null,
+      settings
     });
-
-    const vatRows = Array.from(taxBreakdown.values()).sort((a, b) => a.rate - b.rate);
 
     const cashSales = Number(report.cash_sales || 0);
     const cardSales = Number(report.card_sales || 0);
-    const loanSales = Number(report.loan_sales || 0);
     const totalSalesAmount = Number(report.total_sales_amount ?? (cashSales + cardSales) ?? 0);
     const totalExpenses = Number(report.total_expenses || 0);
     const expectedCash = Number(report.expected_cash || 0);
-    const actualCash = Number(report.actual_cash || 0);
-    const difference = Number(report.cash_difference || (actualCash - expectedCash) || 0);
+    const hasActualCash = !(report.actual_cash === null || report.actual_cash === undefined);
+    const actualCash = hasActualCash ? (Number(report.actual_cash) || 0) : null;
+    const hasDifference = !(report.cash_difference === null || report.cash_difference === undefined);
+    const difference = hasDifference
+      ? (Number(report.cash_difference) || 0)
+      : (hasActualCash ? ((Number(actualCash) || 0) - expectedCash) : null);
+
+    // Expense detail (for printing): prefer stored JSON, else fetch for the date.
+    const parseExpenseJson = (payload) => {
+      try {
+        if (!payload) return null;
+        const obj = (typeof payload === 'string') ? JSON.parse(payload) : payload;
+        const auto = Array.isArray(obj?.auto) ? obj.auto : [];
+        const manual = Array.isArray(obj?.manual) ? obj.manual : [];
+        return [...auto, ...manual].filter(e => Number(e?.amount) > 0);
+      } catch {
+        return null;
+      }
+    };
+
+    let expensesList = parseExpenseJson(report.expenses_json);
+    if (!expensesList) {
+      try {
+        const startDate = start ? new Date(start).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+        const endDate = end ? new Date(end).toISOString().split('T')[0] : startDate;
+        const fetched = await window.api.getExpenses(startDate, endDate);
+        const list = Array.isArray(fetched) ? fetched : (fetched?.expenses || []);
+        expensesList = Array.isArray(list) ? list : [];
+      } catch {
+        expensesList = [];
+      }
+    }
+
+    const cashExpensesList = (expensesList || []).filter(e => String(e?.payment_method || '').toLowerCase() === 'cash');
+    const cashExpensesTotal = cashExpensesList.reduce((sum, e) => sum + (Number(e?.amount) || 0), 0);
     
     // Format Z report for thermal printer
     const ESC = '\x1B';
@@ -8366,10 +16294,16 @@ async function printZReport(report) {
     
     let receipt = '';
     
-    // Initialize printer
+    // Initialize printer (the main process raw-print path will also apply
+    // the configured ESC/POS code table so symbols like € render correctly).
     receipt += ESC + '@';
 
-    const { date: reportDate, time: reportTime } = formatDateTime(report.report_date);
+    // Prefer end_datetime as the "close time"; fall back to report_date.
+    const printedAt = report?.end_datetime || report?.report_date;
+    const { date: reportDate, time: reportTime } = formatDateTime(printedAt);
+
+    const startFmt = start ? formatDateTime(start) : null;
+    const endFmt = end ? formatDateTime(end) : null;
 
     // Header
     receipt += center((settings?.store_name || 'SUPERMARKET POS').toString().toUpperCase()) + '\n';
@@ -8379,6 +16313,25 @@ async function printZReport(report) {
     receipt += `ARQUEO.....: ${report.report_number || ''}\n`;
     receipt += `FECHA......: ${reportDate}\n`;
     receipt += `HORA.......: ${reportTime}\n`;
+
+    // Range name line (requested):
+    // - Daily: weekday name
+    // - Monthly: month name
+    // - Yearly: year
+    const inferred = inferRangeLabel({ startIso: start, endIso: end });
+    if (inferred?.kind === 'day' && inferred.label) {
+      receipt += `DIA........: ${inferred.label}\n`;
+    } else if (inferred?.kind === 'month' && inferred.label) {
+      receipt += `MES........: ${inferred.label}\n`;
+    } else if (inferred?.kind === 'year' && inferred.label) {
+      receipt += `ANO........: ${inferred.label}\n`;
+    }
+
+    if (startFmt?.date && endFmt?.date) {
+      // Keep range in the same compact style as the daily Z report.
+      receipt += `DESDE ARQ..: ${startFmt.date}\n`;
+      receipt += `HASTA ARQ..: ${endFmt.date}\n`;
+    }
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
 
     // Sales summary
@@ -8398,19 +16351,39 @@ async function printZReport(report) {
     receipt += rightLabelValue('CONTADO', formatMoney(cashSales)) + '\n';
     receipt += rightLabelValue('TARJETA', formatMoney(cardSales)) + '\n';
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
-    receipt += rightLabelValue('TOTAL', formatMoney(totalSalesAmount)) + '\n';
+    receipt += rightLabelValue('TOTAL COBRADO', formatMoney(totalSalesAmount)) + '\n';
+    receipt += rightLabelValue('GASTOS', formatMoney(totalExpenses)) + '\n';
+    receipt += rightLabelValue('BALANCE', formatMoney((Number(report.net_sales || 0) - totalExpenses) || 0)) + '\n';
     receipt += '\n';
 
     // Cash movements
     receipt += center('MOVIMIENTOS DE EFECTIVO') + '\n';
     receipt += rightLabelValue('ENTREGAS AL CONTADO', formatMoney(cashSales)) + '\n';
-    receipt += rightLabelValue('SALIDAS DE CAJA', formatMoney(totalExpenses)) + '\n';
+    receipt += rightLabelValue('SALIDAS DE CAJA', formatMoney(cashExpensesTotal)) + '\n';
+
+    // Detailed cash expense lines (similar to the reference printer output)
+    if (cashExpensesList.length) {
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+      receipt += padRight('MOTIVO', Math.max(8, LINE_WIDTH - 12)) + padLeft('TOTAL', 12) + '\n';
+      for (const e of cashExpensesList) {
+        const label = String(e?.description || e?.category || 'Gasto').trim();
+        const amt = Number(e?.amount || 0);
+        if (!Number.isFinite(amt) || amt <= 0) continue;
+        const leftWidth = Math.max(8, LINE_WIDTH - 12);
+        const left = label.length > leftWidth ? label.slice(0, leftWidth) : label;
+        receipt += padRight(left, leftWidth) + padLeft(formatMoney(amt), 12) + '\n';
+      }
+    }
+
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
     receipt += rightLabelValue('EFECTIVO ESPERADO', formatMoney(expectedCash)) + '\n';
-    if (Number.isFinite(actualCash) && actualCash > 0) {
+    if (hasActualCash && Number.isFinite(Number(actualCash))) {
       receipt += rightLabelValue('EFECTIVO REAL', formatMoney(actualCash)) + '\n';
-      const diffText = (difference < 0 ? '-' : '') + formatMoney(Math.abs(difference));
-      receipt += rightLabelValue('DIFERENCIA', diffText) + '\n';
+      if (difference !== null && difference !== undefined && Number.isFinite(Number(difference))) {
+        const diffNum = Number(difference) || 0;
+        const diffText = (diffNum < 0 ? '-' : '') + formatMoney(Math.abs(diffNum));
+        receipt += rightLabelValue('DIFERENCIA', diffText) + '\n';
+      }
     }
     receipt += '\n';
 
@@ -8504,9 +16477,9 @@ async function loadExpensesView() {
       currentExpensePeriod = period;
       
       if (period === 'custom') {
-        document.getElementById('customDateRange').style.display = 'flex';
+        document.getElementById('expenseCustomDateRange').style.display = 'flex';
       } else {
-        document.getElementById('customDateRange').style.display = 'none';
+        document.getElementById('expenseCustomDateRange').style.display = 'none';
         loadExpensesByPeriod(period);
       }
     });
@@ -8534,32 +16507,199 @@ async function loadExpensesView() {
 }
 
 async function loadExpensesByPeriod(period) {
-  const today = new Date();
+  const APP_TIME_ZONE = 'Europe/Madrid';
+  const ymdInTz = (date, timeZone = APP_TIME_ZONE) => {
+    try {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).format(date);
+    } catch {
+      // Fallback: local date (best-effort)
+      const y = date.getFullYear();
+      const m = String(date.getMonth() + 1).padStart(2, '0');
+      const d = String(date.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+  };
+
+  const madridAnchorNoonUtc = () => {
+    const now = new Date();
+    // Build a stable anchor representing the current Madrid date.
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: APP_TIME_ZONE,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(now);
+    const get = (t) => parts.find(p => p.type === t)?.value;
+    const year = Number(get('year'));
+    const month = Number(get('month'));
+    const day = Number(get('day'));
+    // Noon UTC avoids DST edge cases when subtracting days.
+    return new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+  };
+
+  const weekdayIndexInMadrid = (date) => {
+    const wd = new Intl.DateTimeFormat('en-US', { timeZone: APP_TIME_ZONE, weekday: 'short' }).format(date);
+    const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    return map[wd] ?? 0;
+  };
+
+  const anchor = madridAnchorNoonUtc();
   let startDate, endDate;
   
   switch(period) {
     case 'today':
-      startDate = endDate = today.toISOString().split('T')[0];
+      // Use business-day boundary (resets on Z-report close)
+      try {
+        if (window.api?.getBusinessDayRange && window.api?.getExpensesByDateTimeRange) {
+          const biz = await window.api.getBusinessDayRange('today');
+          if (biz?.startDateTime && biz?.endDateTime) {
+            currentExpenseStartDate = null;
+            currentExpenseEndDate = null;
+            await loadExpensesByDateTimeRange(biz.startDateTime, biz.endDateTime);
+            return;
+          }
+        }
+      } catch {
+        // fall back to calendar day
+      }
+
+      startDate = endDate = ymdInTz(anchor);
       break;
+    case 'yesterday': {
+      const y = new Date(anchor);
+      y.setUTCDate(y.getUTCDate() - 1);
+      startDate = endDate = ymdInTz(y);
+      break;
+    }
     case 'week':
-      const weekStart = new Date(today);
-      weekStart.setDate(today.getDate() - today.getDay());
-      startDate = weekStart.toISOString().split('T')[0];
-      endDate = today.toISOString().split('T')[0];
+      {
+        const idx = weekdayIndexInMadrid(anchor);
+        const weekStart = new Date(anchor);
+        weekStart.setUTCDate(weekStart.getUTCDate() - idx);
+        startDate = ymdInTz(weekStart);
+        endDate = ymdInTz(anchor);
+      }
       break;
     case 'month':
-      startDate = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().split('T')[0];
-      endDate = today.toISOString().split('T')[0];
+      {
+        const parts = new Intl.DateTimeFormat('en-US', {
+          timeZone: APP_TIME_ZONE,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).formatToParts(anchor);
+        const get = (t) => parts.find(p => p.type === t)?.value;
+        const year = Number(get('year'));
+        const month = Number(get('month'));
+        const monthStart = new Date(Date.UTC(year, month - 1, 1, 12, 0, 0));
+        startDate = ymdInTz(monthStart);
+        endDate = ymdInTz(anchor);
+      }
       break;
     case 'year':
-      startDate = new Date(today.getFullYear(), 0, 1).toISOString().split('T')[0];
-      endDate = today.toISOString().split('T')[0];
+      {
+        const parts = new Intl.DateTimeFormat('en-US', {
+          timeZone: APP_TIME_ZONE,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).formatToParts(anchor);
+        const year = Number(parts.find(p => p.type === 'year')?.value);
+        const yearStart = new Date(Date.UTC(year, 0, 1, 12, 0, 0));
+        startDate = ymdInTz(yearStart);
+        endDate = ymdInTz(anchor);
+      }
       break;
   }
   
   currentExpenseStartDate = startDate;
   currentExpenseEndDate = endDate;
   await loadExpenses(startDate, endDate);
+}
+
+async function loadExpensesByDateTimeRange(startDateTime, endDateTime) {
+  try {
+    const expenses = await window.api.getExpensesByDateTimeRange(startDateTime, endDateTime);
+    const summary = await window.api.getExpenseSummaryByDateTimeRange(startDateTime, endDateTime);
+
+    // Compute "sales" for net profit as money collected in this window:
+    // - Non-loan sales totals (cash/card/split)
+    // - Plus loan payments (paid PARKING)
+    // - Minus returns (refunds) by return_date
+    let totalSales = 0;
+    try {
+      const salesData = await (window.api?.getSalesByDateTimeRange
+        ? window.api.getSalesByDateTimeRange(startDateTime, endDateTime, null)
+        : window.api.getSalesByDateRange(startDateTime, endDateTime, null));
+      const sales = Array.isArray(salesData) ? salesData : (salesData?.sales || []);
+      const nonLoanSales = (sales || []).filter(s => String(s?.payment_method || '').toLowerCase() !== 'loan');
+      totalSales += nonLoanSales.reduce((sum, s) => sum + (Number(s?.total) || 0), 0);
+
+      const loanPays = await (window.api?.getLoanPaymentsByDateTimeRange
+        ? window.api.getLoanPaymentsByDateTimeRange(startDateTime, endDateTime, null)
+        : window.api.getLoanPaymentsByDateRange(startDateTime, endDateTime, null));
+      totalSales += (loanPays || []).reduce((sum, p) => sum + (Number(p?.amount) || 0), 0);
+
+      const returnsData = await (window.api?.getReturnsByDateTimeRange
+        ? window.api.getReturnsByDateTimeRange(startDateTime, endDateTime, null)
+        : window.api.getReturnsByDateRange(startDateTime, endDateTime, null));
+      const returns = Array.isArray(returnsData) ? returnsData : (returnsData?.returns || []);
+      (returns || []).forEach(r => {
+        if (r.items) {
+          try { r.items = typeof r.items === 'string' ? JSON.parse(r.items) : r.items; } catch { r.items = []; }
+        }
+      });
+      const deduped = dedupeReturnsByOriginalSaleId(returns);
+      totalSales -= deduped.reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
+    } catch {
+      // ignore sales calc errors
+    }
+
+    const totalExpenses = summary?.total_amount || 0;
+    const netProfit = totalSales - totalExpenses;
+
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    document.getElementById('netProfit').textContent = `${currencySymbol}${netProfit.toFixed(2)}`;
+    document.getElementById('netProfit').style.color = netProfit >= 0 ? 'white' : '#ffeb3b';
+
+    document.getElementById('totalExpenseAmount').textContent = `${currencySymbol}${(Number(totalExpenses) || 0).toFixed(2)}`;
+    document.getElementById('totalExpenseCount').textContent = summary?.total_count || 0;
+    document.getElementById('avgExpenseAmount').textContent = `${currencySymbol}${(summary?.avg_amount || 0).toFixed(2)}`;
+
+    const tbody = document.getElementById('expensesTableBody');
+    tbody.innerHTML = '';
+    const list = Array.isArray(expenses) ? expenses : [];
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 20px;">No expenses found for this period</td></tr>';
+      return;
+    }
+
+    list.forEach(expense => {
+      const row = document.createElement('tr');
+      const who = expense.user_name || expense.cashier_name || 'Unknown';
+      row.innerHTML = `
+        <td>${formatDateWithDisplayTimeZone(new Date(expense.expense_date), 'en-GB')}</td>
+        <td>${expense.category}</td>
+        <td>${expense.description}</td>
+        <td>${currencySymbol}${parseFloat(expense.amount).toFixed(2)}</td>
+        <td>${expense.payment_method}</td>
+        <td>${who}</td>
+        <td>
+          <button class="btn-icon" onclick="editExpense(${expense.id})" title="Edit">✏️</button>
+          <button class="btn-icon" onclick="deleteExpense(${expense.id})" title="Delete">🗑️</button>
+        </td>
+      `;
+      tbody.appendChild(row);
+    });
+  } catch (error) {
+    console.error('Error loading expenses (datetime range):', error);
+    showAlert('Error loading expenses: ' + error.message, 'error');
+  }
 }
 
 async function loadExpenses(startDate, endDate) {
@@ -8595,13 +16735,14 @@ async function loadExpenses(startDate, endDate) {
     
     expenses.forEach(expense => {
       const row = document.createElement('tr');
+      const who = expense.user_name || expense.cashier_name || 'Unknown';
       row.innerHTML = `
-        <td>${new Date(expense.expense_date).toLocaleDateString()}</td>
+        <td>${formatDateWithDisplayTimeZone(new Date(expense.expense_date), 'en-GB')}</td>
         <td>${expense.category}</td>
         <td>${expense.description}</td>
         <td>${currencySymbol}${parseFloat(expense.amount).toFixed(2)}</td>
         <td>${expense.payment_method}</td>
-        <td>${expense.user_name || 'Unknown'}</td>
+        <td>${who}</td>
         <td>
           <button class="btn-icon" onclick="editExpense(${expense.id})" title="Edit">✏️</button>
           <button class="btn-icon" onclick="deleteExpense(${expense.id})" title="Delete">🗑️</button>
@@ -8615,6 +16756,10 @@ async function loadExpenses(startDate, endDate) {
   }
 }
 
+// Expense modal no longer asks for description.
+// Keep a cached description for edit-mode so we don't wipe it.
+let expenseEditCachedDescription = '';
+
 function openExpenseModal(expenseId = null) {
   const modal = document.getElementById('expenseModal');
   const form = document.getElementById('expenseForm');
@@ -8623,6 +16768,7 @@ function openExpenseModal(expenseId = null) {
   // Reset form
   form.reset();
   document.getElementById('expenseId').value = '';
+  expenseEditCachedDescription = '';
   
   if (expenseId) {
     title.textContent = 'Edit Expense';
@@ -8631,10 +16777,36 @@ function openExpenseModal(expenseId = null) {
   } else {
     title.textContent = 'Add Expense';
     // Set today's date
-    document.getElementById('expenseDate').value = new Date().toISOString().split('T')[0];
+    try {
+      document.getElementById('expenseDate').value = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Europe/Madrid',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).format(new Date());
+    } catch {
+      document.getElementById('expenseDate').value = new Date().toISOString().split('T')[0];
+    }
   }
   
   modal.classList.add('active');
+
+  // Touchscreen UX: focus the first field and force-open the on-screen keyboard.
+  try {
+    setTimeout(() => {
+      const field = document.getElementById('expenseCategory') || document.getElementById('expenseAmount');
+      if (!field) return;
+      try { window.__virtualKeyboardForceOpen = true; } catch { /* ignore */ }
+      try {
+        field.focus();
+        field.dispatchEvent(new Event('focusin', { bubbles: true }));
+      } catch {
+        // ignore
+      }
+    }, 50);
+  } catch {
+    // ignore
+  }
 }
 
 async function loadExpenseData(id) {
@@ -8644,7 +16816,7 @@ async function loadExpenseData(id) {
       document.getElementById('expenseId').value = expense.id;
       document.getElementById('expenseDate').value = expense.expense_date;
       document.getElementById('expenseCategory').value = expense.category;
-      document.getElementById('expenseDescription').value = expense.description;
+      expenseEditCachedDescription = (expense.description || '').toString();
       document.getElementById('expenseAmount').value = expense.amount;
       document.getElementById('expensePaymentMethod').value = expense.payment_method;
     }
@@ -8658,13 +16830,24 @@ async function handleExpenseSubmit(e) {
   e.preventDefault();
   
   const expenseId = document.getElementById('expenseId').value;
+  const cashierName = (currentUser?.full_name || currentUser?.name || currentUser?.username || '').toString().trim();
+
+  const category = (document.getElementById('expenseCategory')?.value || '').toString().trim();
+  // DB requires description NOT NULL. Since UI no longer collects it:
+  // - On edit: preserve existing description
+  // - On create: use category as description (or a safe fallback)
+  const description = expenseId
+    ? (expenseEditCachedDescription || category || 'Expense')
+    : (category || 'Expense');
+
   const expenseData = {
     expenseDate: document.getElementById('expenseDate').value,
-    category: document.getElementById('expenseCategory').value,
-    description: document.getElementById('expenseDescription').value,
+    category,
+    description,
     amount: parseFloat(document.getElementById('expenseAmount').value),
     paymentMethod: document.getElementById('expensePaymentMethod').value,
-    userId: currentUser.id
+    userId: currentUser?.id,
+    cashierName: cashierName
   };
   
   try {
@@ -8714,17 +16897,92 @@ window.deleteExpense = async function(id) {
 };
 
 // ============== UTILITIES ==============
-function updateDateTime() {
-  const now = new Date();
-  const dateTimeStr = now.toLocaleString('en-US', {
-    weekday: 'short',
+function getDisplayTimeZone() {
+  return 'Europe/Madrid';
+}
+
+function formatDateTimeInAppTimeZone(date) {
+  const timeZone = getDisplayTimeZone();
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      ...(timeZone ? { timeZone } : {}),
+      weekday: 'short',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }).format(date);
+  } catch {
+    // Fallback to local time if Intl timeZone isn't available for some reason.
+    return date.toLocaleString('en-US', {
+      weekday: 'short',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  }
+}
+
+function formatReceiptStyleDateTime(date) {
+  return formatDateTimeWithDisplayTimeZone(date, 'es-ES', {
     year: 'numeric',
-    month: 'short',
-    day: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
-    second: '2-digit'
+    second: '2-digit',
+    hour12: false,
   });
+}
+
+function formatDateTimeWithDisplayTimeZone(date, locale = 'en-GB', options = {}) {
+  const dt = (date instanceof Date) ? date : new Date(date);
+  const timeZone = getDisplayTimeZone();
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      ...(timeZone ? { timeZone } : {}),
+      ...options,
+    }).format(dt);
+  } catch {
+    return dt.toLocaleString(locale, options);
+  }
+}
+
+function parseAppDateTimeLoose(value) {
+  if (!value) return new Date();
+  const s = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) {
+    const dt = new Date(s.replace(' ', 'T') + 'Z');
+    return Number.isNaN(dt.getTime()) ? new Date(s) : dt;
+  }
+  return new Date(s);
+}
+
+function formatDateWithDisplayTimeZone(date, locale = 'en-GB') {
+  return formatDateTimeWithDisplayTimeZone(date, locale, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+}
+
+function formatTimeWithDisplayTimeZone(date, locale = 'en-GB') {
+  return formatDateTimeWithDisplayTimeZone(date, locale, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+}
+
+function updateDateTime() {
+  const now = new Date();
+  const dateTimeStr = formatReceiptStyleDateTime(now);
   const elem = document.getElementById('currentDateTime');
   if (elem) elem.textContent = dateTimeStr;
 }
@@ -8781,30 +17039,6 @@ function showAlert(message, type = 'success', title = null) {
   });
 }
 
-// Generate barcode visual display
-function generateBarcodeDisplay(barcode) {
-  const barcodeDisplay = document.getElementById('barcodeDisplay');
-  if (!barcodeDisplay) return;
-  
-  // Create simple barcode representation using bars
-  const bars = [];
-  for (let i = 0; i < barcode.length; i++) {
-    const digit = barcode[i];
-    // Alternate between thick and thin bars based on digit
-    const thickness = parseInt(digit) % 2 === 0 ? 'thick' : 'thin';
-    bars.push(`<div class="barcode-bar ${thickness}"></div>`);
-  }
-  
-  barcodeDisplay.innerHTML = `
-    <div class="barcode-container">
-      <div class="barcode-bars">
-        ${bars.join('')}
-      </div>
-      <div class="barcode-number">${barcode}</div>
-    </div>
-  `;
-}
-
 // Customer Display Functions
 async function updateCustomerDisplayData() {
   if (cart.length === 0) {
@@ -8838,6 +17072,7 @@ async function toggleCustomerDisplay() {
     await window.api.openCustomerDisplay();
     // Customer display opened - no popup
     updateCustomerDisplayData();
+    pushMonitorCustomerDisplay();
   } catch (error) {
     showAlert('Failed to open customer display', 'error');
   }
@@ -8860,7 +17095,7 @@ async function openCashDrawer() {
   }
 }
 
-async function printReceiptToThermalPrinter(sale) {
+async function printReceiptToThermalPrinter(sale, options = {}) {
   try {
     if (!systemSettings) {
       systemSettings = await window.api.getSystemSettings();
@@ -8888,10 +17123,19 @@ async function printReceiptToThermalPrinter(sale) {
     // Calculate tax breakdown by rate (to match the on-screen receipt)
     const taxBreakdown = {};
     (sale.items || []).forEach(item => {
-      const product = allProducts.find(p => p.id === item.product_id);
-      if (!product) return;
-      const category = allCategories.find(c => c.name === product.category);
-      const taxRate = category ? category.tax_rate : 0;
+      let taxRate = Number(item?.tax_rate ?? item?.taxRate);
+      if (!Number.isFinite(taxRate)) {
+        const product = allProducts.find(p => p.id === item.product_id);
+        const productTaxRate = Number(product?.tax_rate);
+        if (Number.isFinite(productTaxRate)) {
+          taxRate = productTaxRate;
+        } else {
+          const category = product ? allCategories.find(c => c.name === product.category) : null;
+          taxRate = Number(category?.tax_rate || 0);
+        }
+      }
+      if (!Number.isFinite(taxRate) || taxRate < 0) taxRate = 0;
+
       const taxRatePercent = Math.round(taxRate * 100);
 
       const basePrice = item.subtotal / (1 + taxRate);
@@ -8917,18 +17161,30 @@ async function printReceiptToThermalPrinter(sale) {
         total: taxBreakdown[rate].total
       }));
     
+    const duplicateNumber = Number(options?.duplicateNumber || 0);
+    const shouldKickDrawerInReceipt = options?.kickDrawer === true
+      && String(sale?.payment_method || '').toLowerCase() === 'cash'
+      && !(duplicateNumber > 0);
+
     const receiptData = {
       storeName: storeName,
       ownerName: ownerName,
       nieNumber: nieNumber,
       companyAddress: companyAddress,
       lineWidth: looks80mm ? 48 : undefined,
+      restaurantName: sale?.loan_restaurant_name || null,
+      restaurantNie: sale?.loan_restaurant_nie || null,
+      customerName: sale?.loan_customer_name || null,
+      customerPhone: sale?.loan_customer_phone || null,
       receiptId: sale.id,
-      date: new Date(sale.sale_date).toLocaleString(),
+      duplicateNumber: duplicateNumber > 0 ? Math.floor(duplicateNumber) : 0,
+      // Use ISO/DB timestamp and let the main process format it in the correct timezone.
+      dateIso: sale?.sale_date || new Date().toISOString(),
       items: sale.items.map(item => ({
         name: item.product_name,
         quantity: item.quantity,
         unitPrice: item.unit_price,
+        taxRate: item.tax_rate,
         discountPercent: item.discount_percent,
         subtotal: item.subtotal
       })),
@@ -8939,6 +17195,7 @@ async function printReceiptToThermalPrinter(sale) {
       paymentMethod: sale.payment_method,
       paymentAmount: sale.payment_amount || sale.total,
       changeAmount: sale.change_amount || 0,
+      kickDrawer: shouldKickDrawerInReceipt,
       currency: currencySymbol,
       footer: receiptFooter,
       cashier: currentUser.full_name
@@ -8964,39 +17221,8 @@ async function printReceiptToThermalPrinter(sale) {
 
 
 
-async function printBarcodeLabel(product) {
-  try {
-    const barcodeData = {
-      barcode: product.barcode,
-      name: product.name,
-      price: product.price
-    };
-    const result = await window.api.printBarcodeLabel(barcodeData);
-    if (result.success) {
-      // Barcode sent - no popup
-    } else {
-      showAlert('Failed to print barcode label', 'error');
-    }
-  } catch (error) {
-    showAlert('Error printing barcode label', 'error');
-  }
-}
-
-function printProductBarcode() {
-  const productId = document.getElementById('productId').value;
-  if (!productId) {
-    showAlert('Please save the product first', 'warning');
-    return;
-  }
-  
-  const product = allProducts.find(p => p.id == productId);
-  if (product) {
-    printBarcodeLabel(product);
-  }
-}
-
-// Override native alert
-window.alert = showAlert;
+// Override native alert: default to non-success (prevents green "Success" for errors)
+window.alert = (message) => showAlert(String(message ?? ''), 'info');
 
 // Make functions globally available
 window.addToCart = addToCart;
@@ -9006,7 +17232,6 @@ window.promptForWeight = promptForWeight;
 window.editCartWeight = editCartWeight;
 window.editProduct = editProduct;
 window.deleteProduct = deleteProduct;
-window.generateBarcodeDisplay = generateBarcodeDisplay;
 window.viewSale = viewSale;
 window.editUser = editUser;
 window.deleteUser = deleteUser;
@@ -9019,8 +17244,6 @@ window.deleteSubcategory = deleteSubcategory;
 window.openCategoryModalFromProduct = openCategoryModalFromProduct;
 window.toggleCustomerDisplay = toggleCustomerDisplay;
 window.openCashDrawer = openCashDrawer;
-window.printBarcodeLabel = printBarcodeLabel;
-window.printProductBarcode = printProductBarcode;
 window.showAlert = showAlert;
 window.viewZReportDetails = viewZReportDetails;
 window.printSalesReportThermal = printSalesReportThermal;
@@ -9110,7 +17333,7 @@ async function loadAnalyticsData() {
     displayAnalytics(data);
   } catch (error) {
     console.error('Error loading analytics:', error);
-    showAlert('Error loading analytics data', 'error');
+    showAlert('Error loading analytics data: ' + String(error?.message || error || 'Unknown error'), 'error');
   }
 }
 
@@ -9142,7 +17365,7 @@ function displayAnalytics(data) {
   analyticsCharts.salesTrends = new Chart(salesTrendsCtx, {
     type: 'line',
     data: {
-      labels: data.salesTrends.map(d => new Date(d.date).toLocaleDateString()),
+      labels: data.salesTrends.map(d => formatDateWithDisplayTimeZone(new Date(d.date), 'en-GB')),
       datasets: [{
         label: 'Total Sales',
         data: data.salesTrends.map(d => d.total_sales),
@@ -9391,6 +17614,97 @@ window.selectPrinter = selectPrinter;
 
 // ============== CUSTOMER DISPLAY FUNCTIONS ==============
 
+function buildMonitorCustomerDisplayPayload(extra = {}) {
+  const currencySymbol = systemSettings?.currency_symbol || '€';
+  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+
+  // Prices in this POS are tax-included; derive base/tax via reverse calc.
+  let totalCents = 0;
+  let subtotalBaseCents = 0;
+  let taxCents = 0;
+
+  const items = (cart || []).slice(0, 10).map(item => {
+    recalcCartItemMoney(item);
+
+    const taxRate = item.taxRate || 0;
+    const discountPercent = item.discountPercent || 0;
+    const lineSubtotalCents = item.subtotalCents ?? moneyToCents(item.subtotal);
+    const discountCents = calcDiscountCents(lineSubtotalCents, discountPercent);
+    const finalCents = lineSubtotalCents - discountCents;
+
+    const baseCents = Math.round(finalCents / (1 + taxRate));
+    const lineTaxCents = finalCents - baseCents;
+
+    subtotalBaseCents += baseCents;
+    taxCents += lineTaxCents;
+    totalCents += finalCents;
+
+    const quantity = Number(item.quantity);
+    const unitPrice = Number(item.unitPrice);
+    return {
+      productName: String(item.productName || 'ITEM'),
+      quantity: Number.isFinite(quantity) ? quantity : 1,
+      unitPrice: Number.isFinite(unitPrice) ? unitPrice : 0,
+      subtotal: centsToMoney(finalCents)
+    };
+  });
+
+  return {
+    storeName,
+    currencySymbol,
+    items,
+    subtotal: centsToMoney(subtotalBaseCents),
+    tax: centsToMoney(taxCents),
+    total: centsToMoney(totalCents),
+    ...extra
+  };
+}
+
+let monitorDisplayPushTimer = null;
+let monitorDisplayHold = null;
+
+function holdMonitorCustomerDisplay(extra = {}, holdMs = 8000) {
+  const ms = Number(holdMs);
+  const duration = Number.isFinite(ms) ? Math.max(0, ms) : 8000;
+  monitorDisplayHold = {
+    extra: extra || {},
+    expiresAt: Date.now() + duration
+  };
+}
+
+function clearMonitorCustomerDisplayHold() {
+  monitorDisplayHold = null;
+}
+
+function pushMonitorCustomerDisplay(extra = {}) {
+  try {
+    if (!window?.api?.updateCustomerDisplay) return;
+    if (monitorDisplayPushTimer) clearTimeout(monitorDisplayPushTimer);
+    monitorDisplayPushTimer = setTimeout(async () => {
+      try {
+        const now = Date.now();
+        const holdActive = monitorDisplayHold && now < (monitorDisplayHold.expiresAt || 0);
+        if (monitorDisplayHold && !holdActive) {
+          clearMonitorCustomerDisplayHold();
+        }
+
+        // If a hold is active (e.g. payment summary), keep those fields even if
+        // the cart clears or welcome screen updates.
+        const mergedExtra = holdActive
+          ? { ...(extra || {}), ...(monitorDisplayHold.extra || {}) }
+          : (extra || {});
+
+        const payload = buildMonitorCustomerDisplayPayload(mergedExtra);
+        await window.api.updateCustomerDisplay(payload);
+      } catch {
+        // ignore
+      }
+    }, 60);
+  } catch {
+    // ignore
+  }
+}
+
 // Update customer display when item is added to cart
 async function updateCustomerDisplayItem(itemName, price, meta = null) {
   try {
@@ -9399,6 +17713,9 @@ async function updateCustomerDisplayItem(itemName, price, meta = null) {
     const unitPrice = meta?.unitPrice ?? null;
     const unit = meta?.unit ?? null;
     await window.api.showCurrentItem(itemName, price, currencySymbol, quantity, unitPrice, unit);
+
+    // If the modern monitor window is open, show a quick banner with the last item.
+    pushMonitorCustomerDisplay({ bannerText: String(itemName || '').trim().slice(0, 120), paid: null, change: null });
   } catch (error) {
     console.warn('Customer display error:', error);
   }
@@ -9409,6 +17726,7 @@ async function updateCustomerDisplayTotal(total) {
   try {
     const currencySymbol = systemSettings?.currency_symbol || '€';
     await window.api.showTotal(total, currencySymbol);
+    pushMonitorCustomerDisplay({ bannerText: 'TOTAL', paid: null, change: null });
   } catch (error) {
     console.warn('Customer display error:', error);
   }
@@ -9472,6 +17790,7 @@ async function flashCustomerDisplayRemovedItem(removedItem, returnToTotalDelayMs
 async function updateCustomerDisplayPayment(paymentMethod) {
   try {
     await window.api.showPaymentProcessing(paymentMethod);
+    pushMonitorCustomerDisplay({ bannerText: `PAYMENT: ${String(paymentMethod || '').toUpperCase()}` });
   } catch (error) {
     console.warn('Customer display error:', error);
   }
@@ -9481,6 +17800,12 @@ async function updateCustomerDisplayPayment(paymentMethod) {
 async function updateCustomerDisplayChange(changeAmount, currencySymbol = '€') {
   try {
     await window.api.showChange(changeAmount, currencySymbol);
+    const c = Number(changeAmount);
+    pushMonitorCustomerDisplay({
+      bannerText: 'CHANGE',
+      paid: null,
+      change: Number.isFinite(c) ? c : null
+    });
   } catch (error) {
     console.warn('Customer display change error:', error);
   }
@@ -9491,6 +17816,32 @@ async function updateCustomerDisplayPaymentSummary(total, paid, changeAmount) {
   try {
     const currencySymbol = systemSettings?.currency_symbol || '€';
     await window.api.showPaymentSummary(total, paid, changeAmount, currencySymbol);
+    const p = Number(paid);
+    const c = Number(changeAmount);
+
+    const totalNum = Number(total);
+    const paymentSummary = {
+      total: Number.isFinite(totalNum) ? totalNum : null,
+      paid: Number.isFinite(p) ? p : null,
+      change: Number.isFinite(c) ? c : null
+    };
+
+    // Keep the payment summary visible for a few seconds even after the cart clears.
+    holdMonitorCustomerDisplay({
+      bannerText: 'PAYMENT SUMMARY',
+      paymentSummary,
+      paid: paymentSummary.paid,
+      change: paymentSummary.change,
+      showPaymentOverlay: true
+    }, 9000);
+
+    pushMonitorCustomerDisplay({
+      bannerText: 'PAYMENT SUMMARY',
+      paymentSummary,
+      paid: paymentSummary.paid,
+      change: paymentSummary.change,
+      showPaymentOverlay: true
+    });
   } catch (error) {
     console.warn('Customer display payment summary error:', error);
   }
@@ -9501,6 +17852,12 @@ async function updateCustomerDisplayThankYou(changeAmount = null) {
   try {
     const currencySymbol = systemSettings?.currency_symbol || '€';
     await window.api.showThankYou(changeAmount, currencySymbol);
+    const c = Number(changeAmount);
+    pushMonitorCustomerDisplay({
+      bannerText: 'THANK YOU',
+      paid: null,
+      change: Number.isFinite(c) ? c : null
+    });
   } catch (error) {
     console.warn('Customer display error:', error);
   }
@@ -9520,6 +17877,7 @@ async function initializeCustomerDisplay() {
 async function showCustomerDisplayWelcome() {
   try {
     await window.api.showWelcomeMessage();
+    pushMonitorCustomerDisplay({ bannerText: 'WELCOME', paid: null, change: null });
   } catch (error) {
     console.warn('Customer display error:', error);
   }
@@ -9540,4 +17898,1403 @@ document.addEventListener('DOMContentLoaded', () => {
   setTimeout(() => {
     initializeCustomerDisplay();
   }, 3000);
+
+  // ============ TRANSLATION SYSTEM ============
+  const translations = {
+    en: {
+      item: 'ITEM', price: 'PRICE', qty: 'QTY', discount: 'DISCOUNT', total: 'TOTAL',
+      subtotal: 'Subtotal', tax: 'Tax', payment: 'PAYMENT',
+      drawer: 'DRAWER', deleteAll: 'DELETE ALL', undo: 'UNDO', note: 'NOTE',
+      clear: 'CLEAR', ticket: 'TICKET',
+      searchProduct: 'Search Product...',
+      products: 'Products', barcodes: 'Barcodes', sales: 'Sales', returns: 'Returns',
+      parking: 'Parking', expenses: 'Expenses', reports: 'Reports', inventory: 'Inventory',
+      categories: 'Categories', users: 'Users', system: 'System', display: 'Display',
+      logout: 'Logout', all: 'ALL'
+    },
+    es: {
+      item: 'ARTÍCULO', price: 'PRECIO', qty: 'CANT.', discount: 'DESCUENTO', total: 'TOTAL',
+      subtotal: 'Subtotal', tax: 'IVA', payment: 'PAGO',
+      drawer: 'CAJÓN', deleteAll: 'BORRAR TODO', undo: 'DESHACER', note: 'NOTA',
+      clear: 'BORRAR', ticket: 'TICKET',
+      searchProduct: 'Buscar Producto...',
+      products: 'Productos', barcodes: 'Códigos', sales: 'Ventas', returns: 'Devoluciones',
+      parking: 'Parking', expenses: 'Gastos', reports: 'Informes', inventory: 'Inventario',
+      categories: 'Categorías', users: 'Usuarios', system: 'Sistema', display: 'Pantalla',
+      logout: 'Salir', all: 'TODOS'
+    }
+  };
+
+  let currentLang = 'es';
+
+  function applyTranslations(lang) {
+    currentLang = lang;
+    const t = translations[lang];
+    // Text elements
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      const key = el.getAttribute('data-i18n');
+      if (t[key]) el.textContent = t[key];
+    });
+    // Placeholder elements
+    document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+      const key = el.getAttribute('data-i18n-placeholder');
+      if (t[key]) el.placeholder = t[key];
+    });
+    // ALL category tab
+    const allTab = document.querySelector('.category-tab[data-category="all"]');
+    if (allTab) allTab.textContent = t.all;
+  }
+
+  // Language toggle
+  const langEN = document.getElementById('langEN');
+  const langES = document.getElementById('langES');
+  if (langEN && langES) {
+    langEN.addEventListener('click', () => {
+      langEN.classList.add('lang-btn--active');
+      langES.classList.remove('lang-btn--active');
+      applyTranslations('en');
+    });
+    langES.addEventListener('click', () => {
+      langES.classList.add('lang-btn--active');
+      langEN.classList.remove('lang-btn--active');
+      applyTranslations('es');
+    });
+  }
+
+  // Apply Spanish by default on load
+  applyTranslations('es');
 });
+
+// ============================================================
+// ARQUEO DE CAJA OVERLAY
+// ============================================================
+
+let _arqueoAllReports = [];       // all saved Z-reports (newest first)
+let _arqueoCurrentIdx = -1;       // index into _arqueoAllReports (-1 = new/pending)
+let _arqueoNewData = null;        // freshly computed data (for new report)
+let _arqueoContarValue = null;    // confirmed cash count from CONTAR panel
+let _skipZReportModalOpen = false; // prevents old modal from flashing
+let _arqueoPeriod = 'today';      // current period selection
+
+// ── Pagination state ────────────────────────────────────────────────────────
+const _ARQUEO_PAGE_SIZE = 10;     // rows per page
+let _arqueoPageData    = [];      // full dataset for current list view
+let _arqueoPageCurrent = 1;       // current page (1-based)
+let _arqueoPageRenderer = null;   // function(rows) that renders one page of rows
+let _arqueoPageSummaryFn = null;  // function() that renders the summary footer
+
+/** Navigate pages: dir = +1 (next) or -1 (prev) */
+function arqueoPageNav(dir) {
+  const totalPages = Math.ceil(_arqueoPageData.length / _ARQUEO_PAGE_SIZE) || 1;
+  _arqueoPageCurrent = Math.min(Math.max(1, _arqueoPageCurrent + dir), totalPages);
+  _arqueoRenderPage();
+}
+
+/** Render the current page of _arqueoPageData using _arqueoPageRenderer */
+function _arqueoRenderPage() {
+  const totalPages = Math.ceil(_arqueoPageData.length / _ARQUEO_PAGE_SIZE) || 1;
+  const start = (_arqueoPageCurrent - 1) * _ARQUEO_PAGE_SIZE;
+  const slice = _arqueoPageData.slice(start, start + _ARQUEO_PAGE_SIZE);
+
+  const bodyEl   = document.getElementById('arqueoListBody');
+  const infoEl   = document.getElementById('arqueoPageInfo');
+  const prevBtn  = document.getElementById('arqueoPagePrev');
+  const nextBtn  = document.getElementById('arqueoPageNext');
+  const pagerEl  = document.getElementById('arqueoListPager');
+
+  if (bodyEl) bodyEl.innerHTML = '';
+  if (_arqueoPageRenderer) _arqueoPageRenderer(slice);
+
+  const from = start + 1;
+  const to   = Math.min(start + _ARQUEO_PAGE_SIZE, _arqueoPageData.length);
+  if (infoEl) infoEl.textContent = _arqueoPageData.length > 0
+    ? `Página ${_arqueoPageCurrent} / ${totalPages}   (${from}–${to} de ${_arqueoPageData.length})`
+    : 'Sin registros';
+
+  if (prevBtn) prevBtn.style.opacity = _arqueoPageCurrent > 1 ? '1' : '0.3';
+  if (nextBtn) nextBtn.style.opacity = _arqueoPageCurrent < totalPages ? '1' : '0.3';
+  // Hide pager if everything fits on one page
+  if (pagerEl) pagerEl.style.display = _arqueoPageData.length > _ARQUEO_PAGE_SIZE ? 'flex' : 'none';
+
+  if (_arqueoPageSummaryFn) _arqueoPageSummaryFn();
+}
+
+/** Open the Arqueo overlay — computes today's data immediately, no old modal */
+async function openArqueoOverlay() {
+  const overlay = document.getElementById('arqueoOverlay');
+  if (!overlay) return;
+
+  // Show overlay immediately (show loading state)
+  overlay.style.display = 'flex';
+  const paper = document.getElementById('arqueoReceiptPaper');
+  if (paper) paper.innerHTML = '<div style="color:#94a3b8;text-align:center;padding:60px;font-family:sans-serif;">⏳ Loading today\'s data...</div>';
+
+  _arqueoContarValue = null;
+  _arqueoCurrentIdx = -1;
+  _arqueoPeriod = 'today';
+
+  // Init year picker
+  try {
+    const yearSel = document.getElementById('arqueoYearInput');
+    if (yearSel && !yearSel.dataset.loaded) {
+      yearSel.dataset.loaded = '1';
+      const cy = new Date().getFullYear();
+      yearSel.innerHTML = '';
+      for (let y = cy; y >= cy - 5; y--) {
+        const o = document.createElement('option');
+        o.value = String(y); o.textContent = String(y);
+        yearSel.appendChild(o);
+      }
+    }
+    // Init month picker default
+    const monthInp = document.getElementById('arqueoMonthInput');
+    if (monthInp && !monthInp.value) {
+      const now = new Date();
+      monthInp.value = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    }
+    // Init custom date defaults
+    const today = new Date().toISOString().split('T')[0];
+    const cs = document.getElementById('arqueoCustomStart');
+    const ce = document.getElementById('arqueoCustomEnd');
+    if (cs && !cs.value) cs.value = today;
+    if (ce && !ce.value) ce.value = today;
+  } catch { /* ignore */ }
+
+  // Load all saved reports for navigation + refresh table in background
+  try {
+    const all = await window.api.getAllZReports();
+    _arqueoAllReports = Array.isArray(all) ? all : [];
+    displayZReports(_arqueoAllReports);
+  } catch {
+    _arqueoAllReports = [];
+  }
+
+  // Highlight default period button
+  _arqueoHighlightPeriod('today');
+
+  // Compute today's Z-report data WITHOUT opening the old modal
+  await _arqueoComputeAndRender();
+}
+
+/** Show receipt panel, hide list panel */
+function _arqueoShowReceiptPanel() {
+  const lv = document.getElementById('arqueoListView');
+  const rv = document.getElementById('arqueoReceiptView');
+  if (lv) lv.style.display = 'none';
+  if (rv) rv.style.display = 'flex';
+}
+
+/** Show list panel, hide receipt panel */
+function _arqueoShowListPanel() {
+  const lv = document.getElementById('arqueoListView');
+  const rv = document.getElementById('arqueoReceiptView');
+  if (lv) lv.style.display = 'flex';
+  if (rv) rv.style.display = 'none';
+}
+
+/** Render quarter-grouped list (one row per quarter) */
+function _arqueoShowQuarterList(rows, titleLabel, cs) {
+  _arqueoShowListPanel();
+  const titleEl   = document.getElementById('arqueoListTitle');
+  const totalEl   = document.getElementById('arqueoListTotal');
+  const summaryEl = document.getElementById('arqueoListSummary');
+  if (titleEl) titleEl.textContent = titleLabel;
+
+  const qColors     = { 1:'#0ea5e9', 2:'#10b981', 3:'#f59e0b', 4:'#ef4444' };
+  const qStartMonth = { 1:'01', 2:'04', 3:'07', 4:'10' };
+  const qEndMonth   = { 1:'03', 2:'06', 3:'09', 4:'12' };
+  const qLastDay    = { 1:31,   2:30,   3:30,   4:31 };
+  const fmtD = (y,m,d) => `${String(d).padStart(2,'0')}/${m}/${y}`;
+
+  const grandTotal = rows.reduce((s,r) => s + r.total, 0);
+  const grandCash  = rows.reduce((s,r) => s + r.cash,  0);
+  const grandCard  = rows.reduce((s,r) => s + r.card,  0);
+
+  if (totalEl) totalEl.textContent = rows.length ? `TOTAL: ${cs}${grandTotal.toFixed(2)}` : '';
+
+  _arqueoPageData     = rows;
+  _arqueoPageCurrent  = 1;
+  _arqueoPageRenderer = (slice) => {
+    const bodyEl = document.getElementById('arqueoListBody');
+    if (!bodyEl) return;
+    if (!slice.length) {
+      bodyEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#64748b;">No hay trimestres</td></tr>`;
+      return;
+    }
+    slice.forEach((row, i) => {
+      const hasData     = row.count > 0;
+      const bg          = i % 2 === 0 ? '#ffffff' : '#f0f6fb';
+      const color       = qColors[row.q] || '#2a4a5e';
+      const desdeStr    = fmtD(row.year, qStartMonth[row.q], '01');
+      const hastaStr    = fmtD(row.year, qEndMonth[row.q], qLastDay[row.q]);
+      const totalColor  = hasData ? '#059669' : '#94a3b8';
+      const totalStr    = hasData ? `${cs}${row.total.toFixed(2)}` : '—';
+      const opacity     = hasData ? '1' : '0.55';
+      const tr = document.createElement('tr');
+      tr.style.cssText  = `background:${bg}; cursor:${hasData?'pointer':'default'}; transition:background .15s; opacity:${opacity};`;
+      if (hasData) {
+        tr.onmouseenter = () => { tr.style.background='#d0f0e0'; tr.style.opacity='1'; };
+        tr.onmouseleave = () => { tr.style.background=bg; tr.style.opacity=opacity; };
+      }
+      tr.innerHTML = `
+        <td style="padding:12px 10px; border-bottom:1px solid #cdd9e5;">
+          <span style="background:${color};color:white;font-weight:900;font-size:11px;padding:3px 8px;border-radius:4px;margin-right:8px;">T${row.q}</span>
+          <span style="color:#0f2130;font-weight:800;font-size:14px;">${row.label}</span>
+        </td>
+        <td style="padding:12px 8px;text-align:center;color:#475569;border-bottom:1px solid #cdd9e5;">${row.count}</td>
+        <td style="padding:12px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">${desdeStr}</td>
+        <td style="padding:12px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">${hastaStr}</td>
+        <td style="padding:12px 8px;text-align:right;color:${totalColor};font-weight:900;border-bottom:1px solid #cdd9e5;">${totalStr}</td>
+      `;
+      if (hasData) tr.onclick = () => _arqueoDrillQuarter(row);
+      bodyEl.appendChild(tr);
+    });
+  };
+  _arqueoPageSummaryFn = () => {
+    if (summaryEl) summaryEl.innerHTML = `
+      <div style="display:flex;justify-content:space-between;padding:2px 0;">
+        <span style="font-weight:700;color:#fff;">TRIMESTRES: ${rows.length}</span>
+        <span style="font-weight:700;color:#fff;">CONTADO: ${cs}${grandCash.toFixed(2)}</span>
+        <span style="font-weight:700;color:#fff;">TARJETA: ${cs}${grandCard.toFixed(2)}</span>
+        <span style="font-weight:900;color:#2ecc71;">TOTAL: ${cs}${grandTotal.toFixed(2)}</span>
+      </div>`;
+  };
+  _arqueoRenderPage();
+}
+
+/** Click a quarter row → show full consolidated receipt for those 3 months */
+async function _arqueoDrillQuarter(row) {
+  const qStartMonth = { 1:'01', 2:'04', 3:'07', 4:'10' };
+  const qEndDay     = { 1:'31', 2:'30', 3:'30', 4:'31' };
+  const qEndMonth   = { 1:'03', 2:'06', 3:'09', 4:'12' };
+  const qNames      = { 1:'1er TRIMESTRE', 2:'2º TRIMESTRE', 3:'3er TRIMESTRE', 4:'4º TRIMESTRE' };
+  const start = `${row.year}-${qStartMonth[row.q]}-01`;
+  const end   = `${row.year}-${qEndMonth[row.q]}-${qEndDay[row.q]}`;
+  await _arqueoLoadRangeReceipt(start, end, `${qNames[row.q]}  ${row.year}`);
+}
+
+/** Render year-grouped list (one row per year) */
+function _arqueoShowYearList(rows, titleLabel, cs) {
+  _arqueoShowListPanel();
+  const titleEl   = document.getElementById('arqueoListTitle');
+  const totalEl   = document.getElementById('arqueoListTotal');
+  const summaryEl = document.getElementById('arqueoListSummary');
+  if (titleEl) titleEl.textContent = titleLabel;
+
+  const grandTotal = rows.reduce((s,r) => s + r.total, 0);
+  const grandCash  = rows.reduce((s,r) => s + r.cash,  0);
+  const grandCard  = rows.reduce((s,r) => s + r.card,  0);
+  if (totalEl) totalEl.textContent = rows.length ? `TOTAL: ${cs}${grandTotal.toFixed(2)}` : '';
+
+  _arqueoPageData     = rows;
+  _arqueoPageCurrent  = 1;
+  _arqueoPageRenderer = (slice) => {
+    const bodyEl = document.getElementById('arqueoListBody');
+    if (!bodyEl) return;
+    if (!slice.length) {
+      bodyEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#64748b;">No hay años</td></tr>`;
+      return;
+    }
+    slice.forEach((row, i) => {
+      const bg = i % 2 === 0 ? '#ffffff' : '#f0f6fb';
+      const tr = document.createElement('tr');
+      tr.style.cssText = `background:${bg}; cursor:pointer; transition:background .15s;`;
+      tr.onmouseenter = () => { tr.style.background = '#d0f0e0'; };
+      tr.onmouseleave = () => { tr.style.background = bg; };
+      tr.innerHTML = `
+        <td style="padding:12px 10px;color:#0f2130;font-weight:900;font-size:15px;border-bottom:1px solid #cdd9e5;">📅 ${row.label}</td>
+        <td style="padding:12px 8px;text-align:center;color:#475569;border-bottom:1px solid #cdd9e5;">${row.count}</td>
+        <td style="padding:12px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">01/01/${row.key}</td>
+        <td style="padding:12px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">31/12/${row.key}</td>
+        <td style="padding:12px 8px;text-align:right;color:#059669;font-weight:900;border-bottom:1px solid #cdd9e5;">${cs}${row.total.toFixed(2)}</td>
+      `;
+      tr.onclick = () => _arqueoDrillYear(row, cs);
+      bodyEl.appendChild(tr);
+    });
+  };
+  _arqueoPageSummaryFn = () => {
+    if (summaryEl) summaryEl.innerHTML = `
+      <div style="display:flex;justify-content:space-between;padding:2px 0;">
+        <span style="font-weight:700;color:#fff;">AÑOS: ${rows.length}</span>
+        <span style="font-weight:700;color:#fff;">CONTADO: ${cs}${grandCash.toFixed(2)}</span>
+        <span style="font-weight:700;color:#fff;">TARJETA: ${cs}${grandCard.toFixed(2)}</span>
+        <span style="font-weight:900;color:#2ecc71;">TOTAL: ${cs}${grandTotal.toFixed(2)}</span>
+      </div>`;
+  };
+  _arqueoRenderPage();
+}
+
+/** Render month-grouped list (one row per month) */
+function _arqueoShowMonthList(rows, titleLabel, cs) {
+  _arqueoShowListPanel();
+  const titleEl   = document.getElementById('arqueoListTitle');
+  const totalEl   = document.getElementById('arqueoListTotal');
+  const summaryEl = document.getElementById('arqueoListSummary');
+  if (titleEl) titleEl.textContent = titleLabel;
+
+  const grandTotal = rows.reduce((s,r) => s + r.total, 0);
+  const grandCash  = rows.reduce((s,r) => s + r.cash,  0);
+  const grandCard  = rows.reduce((s,r) => s + r.card,  0);
+  if (totalEl) totalEl.textContent = rows.length ? `TOTAL: ${cs}${grandTotal.toFixed(2)}` : '';
+
+  _arqueoPageData     = rows;
+  _arqueoPageCurrent  = 1;
+  _arqueoPageRenderer = (slice) => {
+    const bodyEl = document.getElementById('arqueoListBody');
+    if (!bodyEl) return;
+    if (!slice.length) {
+      bodyEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#64748b;">No hay meses</td></tr>`;
+      return;
+    }
+    slice.forEach((row, i) => {
+      const bg = i % 2 === 0 ? '#ffffff' : '#f0f6fb';
+      const [ky, km] = row.key.split('-').map(Number);
+      const lastDay   = new Date(ky, km, 0).getDate();
+      const mm        = String(km).padStart(2,'0');
+      const tr = document.createElement('tr');
+      tr.style.cssText = `background:${bg}; cursor:pointer; transition:background .15s;`;
+      tr.onmouseenter = () => { tr.style.background = '#d0f0e0'; };
+      tr.onmouseleave = () => { tr.style.background = bg; };
+      tr.innerHTML = `
+        <td style="padding:12px 10px;color:#0f2130;font-weight:900;font-size:14px;border-bottom:1px solid #cdd9e5;">📅 ${row.label}</td>
+        <td style="padding:12px 8px;text-align:center;color:#475569;border-bottom:1px solid #cdd9e5;">${row.count}</td>
+        <td style="padding:12px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">01/${mm}/${ky}</td>
+        <td style="padding:12px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">${lastDay}/${mm}/${ky}</td>
+        <td style="padding:12px 8px;text-align:right;color:#059669;font-weight:900;border-bottom:1px solid #cdd9e5;">${cs}${row.total.toFixed(2)}</td>
+      `;
+      tr.onclick = () => _arqueoDrillMonth(row, cs);
+      bodyEl.appendChild(tr);
+    });
+  };
+  _arqueoPageSummaryFn = () => {
+    if (summaryEl) summaryEl.innerHTML = `
+      <div style="display:flex;justify-content:space-between;padding:2px 0;">
+        <span style="font-weight:700;color:#fff;">MESES: ${rows.length}</span>
+        <span style="font-weight:700;color:#fff;">CONTADO: ${cs}${grandCash.toFixed(2)}</span>
+        <span style="font-weight:700;color:#fff;">TARJETA: ${cs}${grandCard.toFixed(2)}</span>
+        <span style="font-weight:900;color:#2ecc71;">TOTAL: ${cs}${grandTotal.toFixed(2)}</span>
+      </div>`;
+  };
+  _arqueoRenderPage();
+}
+
+/** Drill from year row → show all months in that year */
+/** Click a year row → show full consolidated receipt for that year */
+async function _arqueoDrillYear(yearRow, cs) {
+  const year  = yearRow.key;
+  const start = `${year}-01-01`;
+  const end   = `${year}-12-31`;
+  await _arqueoLoadRangeReceipt(start, end, `AÑO ${year}`);
+}
+
+/** Click a month row → show full consolidated receipt for that month */
+async function _arqueoDrillMonth(monthRow, cs) {
+  const [y, m] = monthRow.key.split('-').map(Number);
+  const lastDay = new Date(y, m, 0).getDate();
+  const start  = `${monthRow.key}-01`;
+  const end    = `${monthRow.key}-${String(lastDay).padStart(2,'0')}`;
+  const label  = new Intl.DateTimeFormat('es-ES',{month:'long',year:'numeric'}).format(new Date(y,m-1,1)).toUpperCase();
+  await _arqueoLoadRangeReceipt(start, end, label);
+}
+
+/** Compute and show a Z-report receipt for an arbitrary date range */
+async function _arqueoLoadRangeReceipt(startYmd, endYmd, label) {
+  _arqueoShowReceiptPanel();
+  const paper = document.getElementById('arqueoReceiptPaper');
+  if (paper) paper.innerHTML = `<div style="color:#94a3b8;text-align:center;padding:60px;font-family:sans-serif;">⏳ Cargando ${label}...</div>`;
+
+  _arqueoContarValue = null;
+  _arqueoCurrentIdx = -1;
+
+  // Set the hidden Z-report range inputs and trigger compute
+  const rangeTypeEl = document.getElementById('zReportRangeType');
+  const startEl     = document.getElementById('zReportRangeStart');
+  const endEl       = document.getElementById('zReportRangeEnd');
+  if (rangeTypeEl) rangeTypeEl.value = 'custom';
+  if (startEl)     startEl.value     = startYmd;
+  if (endEl)       endEl.value       = endYmd;
+
+  try {
+    _skipZReportModalOpen = true;
+    await openZReportModal();
+    _arqueoNewData = currentZReportData ? { ...currentZReportData } : null;
+  } catch(e) {
+    console.error('Arqueo range receipt error:', e);
+  } finally {
+    _skipZReportModalOpen = false;
+  }
+
+  // Update nav label to show the period
+  const numEl  = document.getElementById('arqueoNavNumber');
+  const dateEl = document.getElementById('arqueoNavDate');
+  const idxEl  = document.getElementById('arqueoNavIndex');
+
+  // Format dates as dd/mm/yyyy Spanish style
+  const fmtNavDate = (ymd) => {
+    const [y,m,d] = ymd.split('-');
+    return `${d}/${m}/${y}`;
+  };
+
+  if (numEl)  numEl.textContent  = label;
+  if (dateEl) dateEl.textContent = `${fmtNavDate(startYmd)}  →  ${fmtNavDate(endYmd)}`;
+  if (idxEl)  idxEl.textContent  = '';
+
+  // Hide Done/Cerrar for period reports
+  const doneBtn  = document.getElementById('arqueoNewDone');
+  const closeBtn = document.getElementById('arqueoCloseBtn');
+  if (doneBtn)  doneBtn.style.display  = 'none';
+  if (closeBtn) closeBtn.style.display = 'none';
+
+  _arqueoRenderReceipt(_arqueoNewData, false);
+}
+
+/** Render the individual Z-reports list (one row per Z-report) */
+function _arqueoShowList(reports, titleLabel, cs) {
+  _arqueoShowListPanel();
+
+  const titleEl   = document.getElementById('arqueoListTitle');
+  const totalEl   = document.getElementById('arqueoListTotal');
+  const summaryEl = document.getElementById('arqueoListSummary');
+  if (titleEl) titleEl.textContent = titleLabel;
+
+  const tz = getDisplayTimeZone();
+  const fmtD = (iso) => {
+    if (!iso) return '-';
+    try {
+      const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+      return new Intl.DateTimeFormat('es-ES', { timeZone: tz, day:'2-digit', month:'2-digit', year:'numeric' }).format(d);
+    } catch { return iso.slice(0,10); }
+  };
+
+  const grandTotal = (reports||[]).reduce((s,r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
+  const grandCash  = (reports||[]).reduce((s,r) => s + Number(r.cash_sales||0), 0);
+  const grandCard  = (reports||[]).reduce((s,r) => s + Number(r.card_sales||0), 0);
+  if (totalEl) totalEl.textContent = reports?.length ? `TOTAL: ${cs}${grandTotal.toFixed(2)}` : '';
+
+  _arqueoPageData     = reports || [];
+  _arqueoPageCurrent  = 1;
+  _arqueoPageRenderer = (slice) => {
+    const bodyEl = document.getElementById('arqueoListBody');
+    if (!bodyEl) return;
+    if (!slice.length) {
+      bodyEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#64748b;">No hay arqueos para este período</td></tr>`;
+      return;
+    }
+    slice.forEach((r, i) => {
+      const total    = Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0)));
+      const bg       = i % 2 === 0 ? '#ffffff' : '#f0f6fb';
+      const rNum     = String(r.report_number || r.id || '-');
+      const shortNum = rNum.length > 14 ? rNum.slice(-14) : rNum;
+      const tr = document.createElement('tr');
+      tr.style.cssText = `background:${bg}; cursor:pointer; transition:background .15s;`;
+      tr.onmouseenter = () => { tr.style.background = '#d0f0e0'; };
+      tr.onmouseleave = () => { tr.style.background = bg; };
+      tr.innerHTML = `
+        <td style="padding:11px 8px;color:#0f2130;font-weight:800;border-bottom:1px solid #cdd9e5;">${shortNum}</td>
+        <td style="padding:11px 8px;text-align:center;color:#475569;border-bottom:1px solid #cdd9e5;">2</td>
+        <td style="padding:11px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">${fmtD(r.start_datetime || r.report_date)}</td>
+        <td style="padding:11px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">${fmtD(r.end_datetime || r.report_date)}</td>
+        <td style="padding:11px 8px;text-align:right;color:#059669;font-weight:900;border-bottom:1px solid #cdd9e5;">${cs}${total.toFixed(2)}</td>
+      `;
+      tr.onclick = () => _arqueoOpenListReport(r);
+      bodyEl.appendChild(tr);
+    });
+  };
+  _arqueoPageSummaryFn = () => {
+    if (summaryEl) summaryEl.innerHTML = `
+      <div style="display:flex;justify-content:space-between;padding:2px 0;">
+        <span style="font-weight:700;color:#fff;">ARQUEOS: ${(reports||[]).length}</span>
+        <span style="font-weight:700;color:#fff;">CONTADO: ${cs}${grandCash.toFixed(2)}</span>
+        <span style="font-weight:700;color:#fff;">TARJETA: ${cs}${grandCard.toFixed(2)}</span>
+        <span style="font-weight:900;color:#2ecc71;">TOTAL: ${cs}${grandTotal.toFixed(2)}</span>
+      </div>`;
+  };
+  _arqueoRenderPage();
+}
+
+/** Open a single saved report from the list (show its receipt) */
+function _arqueoOpenListReport(report) {
+  const idx = _arqueoAllReports.findIndex(r => r.id === report.id);
+  _arqueoCurrentIdx = idx >= 0 ? idx : 0;
+  _arqueoShowReceiptPanel();
+  _arqueoRenderCurrent();
+}
+
+/** Back button inside list view */
+function arqueoListBack() {
+  // Always re-run the top-level period view
+  _arqueoComputeAndRender();
+}
+
+/** Compute data for the current period and render */
+async function _arqueoComputeAndRender() {
+  const paper = document.getElementById('arqueoReceiptPaper');
+  if (paper) paper.innerHTML = '<div style="color:#94a3b8;text-align:center;padding:60px;font-family:sans-serif;">⏳ Cargando...</div>';
+  _arqueoShowReceiptPanel();
+
+  _arqueoContarValue = null;
+  _arqueoCurrentIdx = -1;
+
+  const cs  = systemSettings?.currency_symbol || '€';
+  const tz  = getDisplayTimeZone();
+  const toYmd = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(d);
+
+  // ── MENSUAL: one row per month that has Z-reports or actual sales ────────
+  if (_arqueoPeriod === 'month') {
+    // Group all reports by YYYY-MM
+    const groups = {}; // key: 'YYYY-MM'
+    _arqueoAllReports.forEach(r => {
+      try {
+        const raw = r.end_datetime || r.report_date || '';
+        const d   = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z');
+        const ymd = toYmd(d); // 'YYYY-MM-DD'
+        const key = ymd.slice(0, 7); // 'YYYY-MM'
+        if (!groups[key]) groups[key] = { reports: [], key };
+        groups[key].reports.push(r);
+      } catch {}
+    });
+
+    // Fetch actual monthly totals from sales table (authoritative source)
+    let actualMonthMap = {};
+    try {
+      const actualRows = await window.api.getMonthlySalesActualTotals();
+      (actualRows || []).forEach(r => { actualMonthMap[r.month] = r; });
+    } catch (e) {
+      console.warn('Could not fetch actual monthly sales totals:', e);
+    }
+
+    // Build rows: include months from Z-reports AND from actual sales
+    const allKeys = new Set([
+      ...Object.keys(groups),
+      ...Object.keys(actualMonthMap)
+    ]);
+    const monthKeys = Array.from(allKeys).sort().reverse();
+
+    const rows = monthKeys.map(key => {
+      const [y, m] = key.split('-').map(Number);
+      const reps   = (groups[key] || { reports: [] }).reports;
+      const actual = actualMonthMap[key];
+      // Prefer actual sales totals over stored Z-report sums
+      const total  = actual ? Number(actual.total) || 0
+                            : reps.reduce((s, r) => s + (Number(r.total_sales_amount) || (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
+      const cash   = actual ? Number(actual.cash) || 0
+                            : reps.reduce((s, r) => s + Number(r.cash_sales||0), 0);
+      const card   = actual ? Number(actual.card) || 0
+                            : reps.reduce((s, r) => s + Number(r.card_sales||0), 0);
+      const label  = new Intl.DateTimeFormat('es-ES',{month:'long',year:'numeric'}).format(new Date(y,m-1,1)).toUpperCase();
+      return { key, label, count: reps.length, total, cash, card, reports: reps };
+    });
+
+    _arqueoShowMonthList(rows, 'CAJA PRINCIPAL  —  TODOS LOS MESES', cs);
+    return;
+  }
+
+  // ── ANUAL: one row per year that has Z-reports ───────────────────────────
+  if (_arqueoPeriod === 'year') {
+    const groups = {}; // key: 'YYYY'
+    _arqueoAllReports.forEach(r => {
+      try {
+        const raw = r.end_datetime || r.report_date || '';
+        const d   = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z');
+        const key = toYmd(d).slice(0, 4); // 'YYYY'
+        if (!groups[key]) groups[key] = { reports: [], key };
+        groups[key].reports.push(r);
+      } catch {}
+    });
+
+    const yearKeys = Object.keys(groups).sort().reverse();
+
+    const rows = yearKeys.map(key => {
+      const reps  = groups[key].reports;
+      const total = reps.reduce((s, r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
+      const cash  = reps.reduce((s, r) => s + Number(r.cash_sales||0), 0);
+      const card  = reps.reduce((s, r) => s + Number(r.card_sales||0), 0);
+      return { key, label: key, count: reps.length, total, cash, card, reports: reps };
+    });
+
+    _arqueoShowYearList(rows, 'CAJA PRINCIPAL  —  TODOS LOS AÑOS', cs);
+    return;
+  }
+
+  // ── TRIMESTRE: every completed quarter from earliest data year to now ────
+  if (_arqueoPeriod === 'quarter') {
+    const quarterOf  = (m) => Math.ceil(m / 3);
+    const qNames     = ['', '1er Trimestre (Ene-Mar)', '2º Trimestre (Abr-Jun)', '3er Trimestre (Jul-Sep)', '4º Trimestre (Oct-Dic)'];
+    const qEndMonth  = { 1:3,  2:6,  3:9,  4:12 }; // last month of quarter (1-based)
+    const qEndDay    = { 1:31, 2:30, 3:30, 4:31 };
+
+    // Find earliest year in saved reports (fallback to current year)
+    const tz = getDisplayTimeZone();
+    const todayYmd  = toYmd(new Date());
+    const todayYear = Number(todayYmd.slice(0,4));
+    const todayMon  = Number(todayYmd.slice(5,7));
+    const todayQ    = quarterOf(todayMon);
+
+    let earliestYear = todayYear;
+    _arqueoAllReports.forEach(r => {
+      try {
+        const raw = r.end_datetime || r.report_date || '';
+        const d   = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z');
+        const yr  = Number(toYmd(d).slice(0,4));
+        if (yr < earliestYear) earliestYear = yr;
+      } catch {}
+    });
+
+    // Index reports by 'YYYY-QN'
+    const groups = {};
+    _arqueoAllReports.forEach(r => {
+      try {
+        const raw = r.end_datetime || r.report_date || '';
+        const d   = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z');
+        const ymd = toYmd(d);
+        const yr  = Number(ymd.slice(0,4));
+        const mo  = Number(ymd.slice(5,7));
+        const q   = quarterOf(mo);
+        const key = `${yr}-Q${q}`;
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(r);
+      } catch {}
+    });
+
+    // Generate ALL completed quarters from earliestYear up to (but not including current quarter)
+    const rows = [];
+    for (let yr = todayYear; yr >= earliestYear; yr--) {
+      // For current year only include quarters that have fully ended
+      const maxQ = (yr === todayYear) ? todayQ - 1 : 4;
+      for (let q = maxQ; q >= 1; q--) {
+        const key   = `${yr}-Q${q}`;
+        const reps  = groups[key] || [];
+        const total = reps.reduce((s,r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
+        const cash  = reps.reduce((s,r) => s + Number(r.cash_sales||0), 0);
+        const card  = reps.reduce((s,r) => s + Number(r.card_sales||0), 0);
+        rows.push({ key, label:`${qNames[q]}  ${yr}`, count:reps.length, total, cash, card, year:yr, q, reports:reps });
+      }
+    }
+
+    _arqueoShowQuarterList(rows, 'CAJA PRINCIPAL  —  TRIMESTRES', cs);
+    return;
+  }
+
+  // ── All other periods: compute live report and show receipt ───────────────
+  try {
+    const rangeTypeEl = document.getElementById('zReportRangeType');
+    if (rangeTypeEl) {
+      rangeTypeEl.value = (_arqueoPeriod === 'yesterday' || _arqueoPeriod === 'custom') ? 'custom' : 'today';
+    }
+
+    if (_arqueoPeriod === 'yesterday') {
+      const yesterday = new Date(Date.now() - 86400000);
+      const yd = toYmd(yesterday);
+      const startEl = document.getElementById('zReportRangeStart');
+      const endEl   = document.getElementById('zReportRangeEnd');
+      if (startEl) startEl.value = yd;
+      if (endEl)   endEl.value   = yd;
+    }
+
+    if (_arqueoPeriod === 'custom') {
+      const cs2 = document.getElementById('arqueoCustomStart');
+      const ce  = document.getElementById('arqueoCustomEnd');
+      const zs  = document.getElementById('zReportRangeStart');
+      const ze  = document.getElementById('zReportRangeEnd');
+      if (cs2 && zs) zs.value = cs2.value;
+      if (ce  && ze) ze.value = ce.value;
+    }
+
+    _skipZReportModalOpen = true;
+    await openZReportModal();
+    _arqueoNewData = currentZReportData ? { ...currentZReportData } : null;
+  } catch (e) {
+    console.error('Arqueo compute error:', e);
+  } finally {
+    _skipZReportModalOpen = false;
+  }
+
+  _arqueoRenderCurrent();
+}
+
+/** Switch period and reload */
+async function arqueoSetPeriod(period) {
+  _arqueoPeriod = period;
+  _arqueoHighlightPeriod(period);
+
+  // Show/hide pickers
+  const customDiv  = document.getElementById('arqueoCustomRange');
+  const monthDiv   = document.getElementById('arqueoMonthPicker');
+  const yearDiv    = document.getElementById('arqueoYearPicker');
+  if (customDiv) customDiv.style.display = period === 'custom'  ? 'flex' : 'none';
+  if (monthDiv)  monthDiv.style.display  = period === 'month'   ? 'block' : 'none';
+  if (yearDiv)   yearDiv.style.display   = period === 'year'    ? 'block' : 'none';
+
+  // For month/year: auto-load immediately with current picker value
+  if (period === 'month') {
+    const monthInp = document.getElementById('arqueoMonthInput');
+    if (!monthInp?.value) {
+      // Default to current month
+      const tz = getDisplayTimeZone();
+      const now = new Date();
+      const yyyy = new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric'}).format(now);
+      const mm   = new Intl.DateTimeFormat('en-CA',{timeZone:tz,month:'2-digit'}).format(now);
+      if (monthInp) monthInp.value = `${yyyy}-${mm}`;
+    }
+    await _arqueoComputeAndRender();
+    return;
+  }
+  if (period === 'year') {
+    const yearInp = document.getElementById('arqueoYearInput');
+    if (!yearInp?.value) {
+      const tz = getDisplayTimeZone();
+      const yyyy = new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric'}).format(new Date());
+      if (yearInp) yearInp.value = yyyy;
+    }
+    await _arqueoComputeAndRender();
+    return;
+  }
+  if (period === 'quarter') {
+    await _arqueoComputeAndRender();
+    return;
+  }
+  if (period === 'custom') return; // wait for user
+
+  await _arqueoComputeAndRender();
+}
+
+function arqueoLoadCustomRange() { _arqueoComputeAndRender(); }
+function arqueoLoadMonthRange()  { _arqueoComputeAndRender(); }
+function arqueoLoadYearRange()   { _arqueoComputeAndRender(); }
+
+function _arqueoHighlightPeriod(period) {
+  const ids = ['arqueoPeriodHoy','arqueoPeriodAyer','arqueoPeriodMensual','arqueoPeriodTrimestre','arqueoPeriodAnual','arqueoPeriodCustom'];
+  const map  = { today:'arqueoPeriodHoy', yesterday:'arqueoPeriodAyer', month:'arqueoPeriodMensual', quarter:'arqueoPeriodTrimestre', year:'arqueoPeriodAnual', custom:'arqueoPeriodCustom' };
+  ids.forEach(id => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    const active = (map[period] === id);
+    btn.style.background = active ? '#2ecc71' : '#2a4a5e';
+    btn.style.color      = active ? 'white'   : '#94a3b8';
+    btn.style.fontWeight = active ? '800'     : '700';
+  });
+}
+
+/** Render whichever report is currently selected */
+function _arqueoRenderCurrent() {
+  _arqueoShowReceiptPanel();
+  const isPending = (_arqueoCurrentIdx === -1);
+  const data = isPending ? _arqueoNewData : _arqueoAllReports[_arqueoCurrentIdx];
+
+  const numEl  = document.getElementById('arqueoNavNumber');
+  const dateEl = document.getElementById('arqueoNavDate');
+  const idxEl  = document.getElementById('arqueoNavIndex');
+  const userEl = document.getElementById('arqueoSideUser');
+  const timeEl = document.getElementById('arqueoSideTime');
+
+  const total = _arqueoAllReports.length;
+
+  if (isPending) {
+    if (numEl)  numEl.textContent  = 'NUEVO';
+    if (dateEl) dateEl.textContent = _arqueoRelativeLabel(new Date());
+    if (idxEl)  idxEl.textContent  = `HOY  /  ${total} guardados`;
+  } else {
+    const r = data;
+    const rDate = r?.report_date ? new Date(r.report_date) : null;
+    const rNum = String(r?.report_number || '-');
+    if (numEl)  numEl.textContent  = rNum.length > 16 ? rNum.slice(-16) : rNum;
+    if (dateEl) dateEl.textContent = rDate ? _arqueoRelativeLabel(rDate) : '-';
+    if (idxEl)  idxEl.textContent  = `${_arqueoCurrentIdx + 1} / ${total} guardados`;
+  }
+
+  if (userEl) userEl.innerHTML = `<span style="color:#94a3b8;">USUARIO:</span> ${data?.cashier_name || (currentUser?.full_name) || '-'}`;
+  if (timeEl) timeEl.innerHTML = `<span style="color:#94a3b8;">HORA X:</span> ${_fmtTime(new Date())}`;
+
+  // Done / Cerrar buttons visible only for new pending report
+  const doneBtn  = document.getElementById('arqueoNewDone');
+  const closeBtn = document.getElementById('arqueoCloseBtn');
+  if (doneBtn)  doneBtn.style.display  = isPending ? '' : 'none';
+  if (closeBtn) closeBtn.style.display = isPending ? '' : 'none';
+
+  // Prev/Next button states
+  const prevBtn = document.getElementById('arqueoNavPrev');
+  const nextBtn = document.getElementById('arqueoNavNext');
+  // ◄ goes to older (higher index); can't go past last saved
+  if (prevBtn) prevBtn.style.opacity = (_arqueoCurrentIdx < total - 1) ? '1' : '0.3';
+  // ► goes to newer (lower index); can't go past pending (-1)
+  if (nextBtn) nextBtn.style.opacity = (_arqueoCurrentIdx > -1) ? '1' : '0.3';
+
+  _arqueoRenderReceipt(data, isPending);
+}
+
+/** Returns "HOY", "AYER", "HACE 2 DÍAS", or a date string */
+function _arqueoRelativeLabel(date) {
+  try {
+    const tz = getDisplayTimeZone();
+    const toYmd = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(d);
+    const today = toYmd(new Date());
+    const target = toYmd(date);
+    const diffMs = new Date(today).getTime() - new Date(target).getTime();
+    const diffDays = Math.round(diffMs / 86400000);
+    if (diffDays === 0) return `HOY  ${_fmtDate(date)}`;
+    if (diffDays === 1) return `AYER  ${_fmtDate(date)}`;
+    if (diffDays > 1)   return `HACE ${diffDays} DÍAS  ${_fmtDate(date)}`;
+    return _fmtDate(date);
+  } catch {
+    return _fmtDate(date);
+  }
+}
+
+/** Navigate +1 (older) / -1 (newer) through saved reports.
+ *  ◄ = older (idx increases),  ► = newer (idx decreases toward -1) */
+function arqueoNavigate(dir) {
+  const newIdx = _arqueoCurrentIdx + dir;
+  if (newIdx < -1) return;
+  if (newIdx >= _arqueoAllReports.length) return;
+  _arqueoCurrentIdx = newIdx;
+  _arqueoRenderCurrent();
+}
+
+/** Render the receipt paper for a given data object */
+function _arqueoRenderReceipt(data, isPending) {
+  const paper = document.getElementById('arqueoReceiptPaper');
+  if (!paper) return;
+  if (!data) {
+    paper.innerHTML = '<div style="color:#94a3b8;text-align:center;padding:40px;font-family:sans-serif;">Sin datos</div>';
+    return;
+  }
+
+  const cs  = systemSettings?.currency_symbol || '€';
+  const tz  = getDisplayTimeZone();
+
+  // ── helpers (same logic as printZReport) ─────────────────────────────────
+  const fmt = (n) => Number(n || 0).toFixed(2).replace('.', ',') + cs;
+
+  const parseDT = (value) => {
+    if (!value) return new Date();
+    const s = String(value).trim();
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) return new Date(s.replace(' ', 'T') + 'Z');
+    return new Date(s);
+  };
+
+  const fmtDateTime = (iso) => {
+    const dt = parseDT(iso);
+    try {
+      const date = new Intl.DateTimeFormat('es-ES', { timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit' }).format(dt);
+      const time = new Intl.DateTimeFormat('es-ES', { timeZone: tz, hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }).format(dt);
+      return { date, time };
+    } catch {
+      return { date: _fmtDate(dt), time: _fmtTime(dt) };
+    }
+  };
+
+  const inferRangeLabel = (startIso, endIso) => {
+    try {
+      const s = parseDT(startIso); const e = parseDT(endIso);
+      const ymd = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(d);
+      const [sy,sm,sd] = ymd(s).split('-').map(Number);
+      const [ey,em,ed] = ymd(e).split('-').map(Number);
+      const lastDay = (y,m) => new Date(Date.UTC(y,m,0)).getUTCDate();
+      if (sy===ey && sm===em && sd===ed) {
+        return { kind:'day', label: new Intl.DateTimeFormat('es-ES',{timeZone:tz,weekday:'long'}).format(s).toUpperCase() };
+      }
+      if (sy===ey && sm===em && sd===1 && ed===lastDay(ey,em)) {
+        return { kind:'month', label: new Intl.DateTimeFormat('es-ES',{timeZone:tz,month:'long'}).format(s).toUpperCase()+' '+sy };
+      }
+      if (sy===ey && sm===1 && sd===1 && em===12 && ed===31) {
+        return { kind:'year', label: String(sy) };
+      }
+      return { kind:'custom', label: `${ymd(s)} - ${ymd(e)}` };
+    } catch { return null; }
+  };
+
+  // ── data ──────────────────────────────────────────────────────────────────
+  const storeName  = (systemSettings?.store_name    || 'SUPERMARKET POS').toUpperCase();
+  const storeAddr  = systemSettings?.store_address || '';
+  const storeCif   = systemSettings?.store_cif     || systemSettings?.tax_id || '';
+  const storeCity  = systemSettings?.store_city    || '';
+  const storePhone = systemSettings?.store_phone   || '';
+
+  const cashSales      = Number(data.cash_sales     || data._net_cash_collected || 0);
+  const cardSales      = Number(data.card_sales     || data._net_card_collected || 0);
+  const grossSales     = Number(data.gross_sales    || 0);
+  const netSales       = Number(data.net_sales      || 0);
+  const returnsAmt     = Number(data.total_returns_amount || 0);
+  const totalSalesAmt  = cashSales + cardSales;
+  const totalExpenses  = Number(data.total_expenses || data._auto_expenses_total || 0);
+  const balance        = netSales - totalExpenses;
+  const totalSales     = Number(data.total_sales    || 0);
+  const totalReturns   = Number(data.total_returns  || 0);
+  const netSalesCount  = Number(data.net_sales_count || Math.max(0, totalSales - totalReturns) || 0);
+  const totalTax       = Number(data.total_tax      || 0);
+  const reportNum      = data.report_number || (isPending ? 'BORRADOR' : '-');
+  const cashierName    = data.cashier_name  || (currentUser?.full_name) || '-';
+
+  const expectedCash = Number(data.expected_cash || data._expected_cash_base || 0);
+  const actualCash   = (_arqueoCurrentIdx === -1 && _arqueoContarValue !== null)
+                       ? _arqueoContarValue
+                       : (data.actual_cash !== null && data.actual_cash !== undefined ? Number(data.actual_cash) : null);
+  const diff         = actualCash !== null ? (actualCash - expectedCash) : null;
+
+  // Expenses list (for cash-movements detail)
+  let expensesList = [];
+  try {
+    if (data.expenses_json) {
+      const parsed = typeof data.expenses_json === 'string' ? JSON.parse(data.expenses_json) : data.expenses_json;
+      const auto   = Array.isArray(parsed?.auto)   ? parsed.auto   : [];
+      const manual = Array.isArray(parsed?.manual) ? parsed.manual : [];
+      expensesList = [...auto, ...manual].filter(e => Number(e?.amount) > 0);
+    } else if (Array.isArray(data._auto_expenses_list)) {
+      expensesList = data._auto_expenses_list.filter(e => Number(e?.amount) > 0);
+    }
+  } catch { expensesList = []; }
+
+  const cashExpensesList  = expensesList.filter(e => String(e?.payment_method||'').toLowerCase() === 'cash');
+  const cashExpensesTotal = cashExpensesList.reduce((s, e) => s + (Number(e?.amount)||0), 0);
+
+  // VAT rows from stored JSON
+  let vatRows = [];
+  try {
+    if (data.tax_breakdown_json) {
+      const parsed = typeof data.tax_breakdown_json === 'string' ? JSON.parse(data.tax_breakdown_json) : data.tax_breakdown_json;
+      if (Array.isArray(parsed)) vatRows = parsed;
+    }
+  } catch { vatRows = []; }
+
+  // Dates
+  const printedAt = data.end_datetime || data.report_date || new Date().toISOString();
+  const { date: reportDate, time: reportTime } = fmtDateTime(printedAt);
+  const startFmt = data.start_datetime ? fmtDateTime(data.start_datetime) : null;
+  const endFmt   = data.end_datetime   ? fmtDateTime(data.end_datetime)   : null;
+  const inferred = (data.start_datetime && data.end_datetime)
+    ? inferRangeLabel(data.start_datetime, data.end_datetime) : null;
+
+  // ── HTML builder helpers ──────────────────────────────────────────────────
+  // Each section is built as a <table> row or block.
+  // We use a single full-width table for alignment.
+
+  const R = []; // array of HTML strings
+
+  const ctr = (html, bold) =>
+    `<tr><td colspan="2" style="text-align:center;padding:2px 0;${bold?'font-weight:900;':''}">${html}</td></tr>`;
+
+  const lv = (label, value, opts = {}) => {
+    const lStyle = `padding:1px 0;white-space:nowrap;${opts.indent?'padding-left:14px;':''}${opts.bold?'font-weight:900;':''}`;
+    const vStyle = `padding:1px 0;text-align:right;white-space:nowrap;${opts.bold?'font-weight:900;':''}${opts.color?'color:'+opts.color+';':''}`;
+    return `<tr><td style="${lStyle}">${label}</td><td style="${vStyle}">${value}</td></tr>`;
+  };
+
+  const sep = (double) => `<tr><td colspan="2"><div style="border-top:${double?'3px double':'1px solid'} #444;margin:5px 0;"></div></td></tr>`;
+  const gap = () => `<tr><td colspan="2" style="height:7px;"></td></tr>`;
+  const hdr = (text) => `<tr><td colspan="2" style="font-weight:700;padding:3px 0 1px 0;letter-spacing:.3px;">${text}</td></tr>`;
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  R.push(ctr(`<b>${storeName}</b>`, true));
+  R.push(ctr('<b>ARQUEO DE CAJA</b>', true));
+  if (storeAddr)  R.push(ctr(storeAddr));
+  if (storeCif)   R.push(ctr(storeCif));
+  if (storeCity)  R.push(ctr(storeCity));
+  if (storePhone) R.push(ctr(storePhone));
+  R.push(sep(true));
+  R.push(lv('CAJA.......:', 'PRINCIPAL'));
+  R.push(lv('ARQUEO.....:', reportNum));
+  R.push(lv('FECHA......:', reportDate));
+  R.push(lv('HORA.......:', reportTime));
+  if (inferred?.kind === 'day')   R.push(lv('DIA........:', inferred.label));
+  if (inferred?.kind === 'month') R.push(lv('MES........:', inferred.label));
+  if (inferred?.kind === 'year')  R.push(lv('ANO........:', inferred.label));
+  if (startFmt?.date && endFmt?.date) {
+    R.push(lv('DESDE ARQ..:', startFmt.date));
+    R.push(lv('HASTA ARQ..:', endFmt.date));
+  }
+  R.push(sep());
+
+  // ── Sales summary ─────────────────────────────────────────────────────────
+  R.push(lv('VENTA BRUTA',   fmt(grossSales)));
+  R.push(lv('DEVOLUCIONES',  fmt(returnsAmt)));
+  R.push(lv('VENTA NETA',    fmt(netSales),  { bold: true }));
+  R.push(gap());
+  R.push(lv('DOCUMENTOS',    String(totalSales)));
+  R.push(lv('NUMERO DE VENTAS', String(totalSales)));
+  R.push(lv('NUMERO DEVOL.', String(totalReturns)));
+  R.push(lv('VENTAS NETAS',  String(netSalesCount)));
+  R.push(sep());
+
+  // ── Payment methods ───────────────────────────────────────────────────────
+  R.push(ctr('FORMAS PAGO', true));
+  R.push(lv('CONTADO',  fmt(cashSales)));
+  R.push(lv('TARJETA',  fmt(cardSales)));
+  R.push(sep());
+  R.push(lv('TOTAL COBRADO', fmt(totalSalesAmt), { bold: true }));
+  R.push(lv('GASTOS',   fmt(totalExpenses), { color: '#dc2626' }));
+  R.push(lv('BALANCE',  fmt(balance), { bold: true, color: balance >= 0 ? '#059669' : '#dc2626' }));
+  R.push(gap());
+
+  // ── Cash movements ────────────────────────────────────────────────────────
+  R.push(ctr('MOVIMIENTOS DE EFECTIVO', true));
+  R.push(lv('ENTREGAS AL CONTADO', fmt(cashSales)));
+  R.push(lv('SALIDAS DE CAJA',     fmt(cashExpensesTotal)));
+  if (cashExpensesList.length) {
+    R.push(sep());
+    R.push(`<tr>
+      <td style="padding:1px 0;font-weight:700;">MOTIVO</td>
+      <td style="padding:1px 0;text-align:right;font-weight:700;">TOTAL</td>
+    </tr>`);
+    for (const e of cashExpensesList) {
+      const amt = Number(e?.amount || 0);
+      if (!amt) continue;
+      R.push(lv(String(e?.description || e?.category || 'Gasto').slice(0, 28), fmt(amt), { indent: true }));
+    }
+  }
+  R.push(sep());
+  R.push(lv('EFECTIVO ESPERADO', fmt(expectedCash)));
+  if (actualCash !== null) {
+    R.push(lv('EFECTIVO REAL', fmt(actualCash)));
+    if (diff !== null) {
+      const dColor = diff >= 0 ? '#059669' : '#dc2626';
+      const dSign  = diff < 0 ? '-' : '';
+      R.push(lv('DIFERENCIA', `<span style="color:${dColor};font-weight:900;">${dSign}${fmt(Math.abs(diff))}</span>`));
+    }
+  } else {
+    R.push(lv('EFECTIVO REAL', '<span style="color:#aaa;font-style:italic;">pulsar CONTAR</span>'));
+  }
+  R.push(gap());
+
+  // ── Card movements ────────────────────────────────────────────────────────
+  R.push(ctr('MOVIMIENTOS DE TARJETA', true));
+  R.push(lv('COBROS CON TARJETA', fmt(cardSales)));
+  R.push(lv('PAGOS EN TARJETA',   fmt(cardSales)));
+  R.push(gap());
+
+  // ── VAT breakdown ─────────────────────────────────────────────────────────
+  R.push(ctr('DESGLOSE DEL IVA', true));
+  if (vatRows.length) {
+    R.push(`<tr>
+      <td style="padding:1px 0;font-weight:700;">IVA%</td>
+      <td style="padding:1px 0;text-align:right;font-weight:700;">BASE &nbsp;&nbsp; CUOTA &nbsp;&nbsp; TOTAL</td>
+    </tr>`);
+    R.push(sep());
+    let sumBase=0, sumCuota=0, sumTotal=0;
+    for (const r of vatRows) {
+      sumBase  += Number(r.base  || 0);
+      sumCuota += Number(r.cuota || 0);
+      sumTotal += Number(r.total || 0);
+      R.push(`<tr>
+        <td style="padding:1px 0;">${r.rate}%</td>
+        <td style="padding:1px 0;text-align:right;">${fmt(r.base)} &nbsp; ${fmt(r.cuota)} &nbsp; ${fmt(r.total)}</td>
+      </tr>`);
+    }
+    R.push(sep());
+    R.push(`<tr>
+      <td style="padding:1px 0;font-weight:900;">TOTAL</td>
+      <td style="padding:1px 0;text-align:right;font-weight:900;">${fmt(sumBase)} &nbsp; ${fmt(sumCuota)} &nbsp; ${fmt(sumTotal)}</td>
+    </tr>`);
+  } else {
+    R.push(lv('TOTAL IVA', fmt(totalTax)));
+  }
+
+  // ── Footer ────────────────────────────────────────────────────────────────
+  R.push(gap());
+  R.push(lv('LE ATENDIO.:', cashierName));
+  R.push(sep(true));
+  R.push(gap());
+  if (isPending) {
+    R.push(ctr('<span style="color:#d97706;font-weight:900;">*** BORRADOR — NO CONFIRMADO ***</span>'));
+    R.push(ctr('<span style="color:#aaa;font-size:11px;">Pulse DONE para cerrar el arqueo</span>'));
+  } else {
+    R.push(ctr('<span style="color:#059669;font-weight:900;">✓ ARQUEO CERRADO</span>'));
+  }
+  R.push(gap());
+
+  paper.innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-family:'Courier New',Courier,monospace;font-size:13px;line-height:1.6;color:#111;">
+      <tbody>${R.join('')}</tbody>
+    </table>`;
+}
+
+  const storeName  = systemSettings?.store_name    || '';
+  const storeAddr  = systemSettings?.store_address || '';
+  const storeCif   = systemSettings?.store_cif     || systemSettings?.tax_id || '';
+  const storeCity  = systemSettings?.store_city    || '';
+  const storePhone = systemSettings?.store_phone   || '';
+
+  const totalSales   = Number(data.total_sales   || 0);
+  const totalReturns = Number(data.total_returns  || 0);
+  const grossSales   = Number(data.gross_sales    || 0);
+  const netSales     = Number(data.net_sales      || 0);
+  const cashSales    = Number(data.cash_sales     || data._net_cash_collected || 0);
+  const cardSales    = Number(data.card_sales     || data._net_card_collected || 0);
+  const totalAmt     = cashSales + cardSales;
+  const totalExp     = Number(data.total_expenses || data._auto_expenses_total || 0);
+  const totalTax     = Number(data.total_tax      || 0);
+  const reportNum    = data.report_number || 'BORRADOR';
+  const cashierName  = data.cashier_name  || (currentUser?.full_name) || '-';
+  const netCount     = Number(data.net_sales_count || Math.max(0, totalSales - totalReturns) || 0);
+  const ticketMedio  = totalSales > 0 ? totalAmt / totalSales : 0;
+
+  const expectedCash = Number(data.expected_cash || data._expected_cash_base || 0);
+  const actualCash   = (_arqueoCurrentIdx === -1 && _arqueoContarValue !== null)
+                       ? _arqueoContarValue
+                       : (data.actual_cash !== null && data.actual_cash !== undefined ? Number(data.actual_cash) : null);
+  const diff         = actualCash !== null ? (actualCash - expectedCash) : null;
+
+  const rDate    = data.report_date ? new Date(data.report_date) : new Date();
+  const rDateStr = _fmtDate(rDate);
+  const rTimeStr = _fmtTime(rDate);
+  const startDate = data.start_datetime ? _fmtDate(new Date(data.start_datetime)) : rDateStr;
+  const endDate   = data.end_datetime   ? _fmtDate(new Date(data.end_datetime))   : rDateStr;
+
+  // Build rows as HTML with proper left-label / right-value layout
+  const row = (label, value, opts = {}) => {
+    const bold   = opts.bold   ? 'font-weight:900;' : '';
+    const sep    = opts.sep    ? `<tr><td colspan="2" style="padding:2px 0;"><div style="border-top:1px solid #ccc;margin:4px 0;"></div></td></tr>` : '';
+    const dsep   = opts.dsep   ? `<tr><td colspan="2" style="padding:2px 0;"><div style="border-top:3px double #333;margin:4px 0;"></div></td></tr>` : '';
+    const color  = opts.color  ? `color:${opts.color};` : '';
+    const indent = opts.indent ? 'padding-left:16px;' : '';
+    return `${sep}${dsep}<tr>
+      <td style="padding:1px 0;${indent}${bold}white-space:nowrap;">${label}</td>
+      <td style="padding:1px 0;text-align:right;${bold}${color}white-space:nowrap;">${value}</td>
+    </tr>`;
+  };
+
+  const blank = () => `<tr><td colspan="2" style="height:8px;"></td></tr>`;
+  const head  = (text) => `<tr><td colspan="2" style="padding:3px 0 1px 0;font-weight:700;letter-spacing:0.5px;">${text}</td></tr>`;
+  const center = (text, opts = {}) => {
+    const bold = opts.bold ? 'font-weight:900;font-size:14px;' : '';
+    return `<tr><td colspan="2" style="text-align:center;padding:2px 0;${bold}">${text}</td></tr>`;
+  };
+  const dline = () => `<tr><td colspan="2"><div style="border-top:2px solid #222;margin:5px 0;"></div></td></tr>`;
+  const sline = () => `<tr><td colspan="2"><div style="border-top:1px solid #aaa;margin:4px 0;"></div></td></tr>`;
+
+  const balance = netSales - totalExp;
+  const balColor = balance >= 0 ? '#059669' : '#dc2626';
+  const diffColor = diff !== null ? (diff >= 0 ? '#059669' : '#dc2626') : '#0f172a';
+
+  let rows = '';
+  rows += center('ARQUEO DE CAJA', { bold: true });
+  if (storeName)  rows += center(`<b>${storeName}</b>`);
+  if (storeAddr)  rows += center(storeAddr);
+  if (storeCif)   rows += center(storeCif);
+  if (storeCity)  rows += center(storeCity);
+  if (storePhone) rows += center(storePhone);
+  rows += blank();
+  rows += row('CAJA',    'CAJA PRINCIPAL');
+  rows += row('ARQUEO',  reportNum);
+  rows += row('FECHA',   rDateStr);
+  rows += row('FECHAS',  `${startDate}  ${endDate}`);
+  rows += row('HORA X',  rTimeStr);
+  rows += row('USUARIO', cashierName);
+  rows += blank();
+  rows += dline();
+  rows += `<tr>
+    <td style="padding:4px 0;font-weight:900;font-size:15px;">&nbsp;&nbsp;${totalSales} CUENTAS</td>
+    <td style="text-align:right;font-weight:900;font-size:15px;">${fmt(totalAmt)}</td>
+  </tr>`;
+  rows += dline();
+  rows += blank();
+  rows += row('VENTA BRUTA',   fmt(grossSales));
+  rows += row('DESCUENTOS',    fmt(0),  { indent: true });
+  rows += sline();
+  rows += row('INVITACIONES',  fmt(0));
+  rows += row('PERSONAL',      fmt(0));
+  rows += blank();
+  rows += row('VENTA NETA',    fmt(netSales),  { bold: true });
+  rows += row(`${totalSales > 0 ? totalSales - (totalSales - Math.round(cashSales / (totalAmt || 1) * totalSales)) : 0} CONTADO`, fmt(cashSales), { indent: true });
+  rows += row(`${Math.round(cardSales / (totalAmt || 1) * totalSales) || 0} TARJETA`,  fmt(cardSales), { indent: true });
+  rows += blank();
+  rows += sline();
+  rows += head('DOCUMENTOS.');
+  rows += row('NUMERO DE VENTAS',  String(totalSales));
+  rows += row('ARTICULOS VENDIDOS', '-');
+  rows += row('TICKET MEDIO',       fmt(ticketMedio));
+  rows += row('ARTICULOS/TICKET',   '-');
+  rows += row('VENTA REAL', `${netCount}  ${fmt(netSales)}`);
+  rows += blank();
+  rows += sline();
+  rows += head('IVA / IMPUESTOS');
+  rows += row('TOTAL IVA', fmt(totalTax));
+  rows += blank();
+  rows += sline();
+  rows += head('GASTOS');
+  rows += row('TOTAL GASTOS', `<span style="color:#dc2626;">${fmt(totalExp)}</span>`);
+function _fmtDate(d) {
+  try {
+    return new Intl.DateTimeFormat('es-ES', { timeZone: getDisplayTimeZone(), day:'2-digit', month:'2-digit', year:'numeric' }).format(d);
+  } catch { return d.toLocaleDateString(); }
+}
+function _fmtTime(d) {
+  try {
+    return new Intl.DateTimeFormat('es-ES', { timeZone: getDisplayTimeZone(), hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }).format(d);
+  } catch { return d.toLocaleTimeString(); }
+}
+
+/** Show the CONTAR panel */
+function arqueoShowContar() {
+  const overlay = document.getElementById('arqueoContarOverlay');
+  if (!overlay) return;
+  const cs = systemSettings?.currency_symbol || '€';
+  const data = _arqueoCurrentIdx === -1 ? _arqueoNewData : _arqueoAllReports[_arqueoCurrentIdx];
+  const expected = Number(data?.expected_cash || data?._expected_cash_base || 0);
+  const expEl = document.getElementById('arqueoContarExpected');
+  if (expEl) expEl.textContent = `${cs}${expected.toFixed(2)}`;
+  // Reset display and hidden input
+  const dispEl = document.getElementById('arqueoContarDisplay');
+  const actEl  = document.getElementById('arqueoContarActual');
+  if (dispEl) dispEl.textContent = '0';
+  if (actEl)  actEl.value = '';
+  const diffEl = document.getElementById('arqueoContarDiff');
+  if (diffEl) { diffEl.textContent = '-'; diffEl.style.color = '#0f172a'; }
+  overlay.style.display = 'flex';
+}
+
+/** Handle numpad key press */
+function arqueoContarKey(key) {
+  const dispEl = document.getElementById('arqueoContarDisplay');
+  const actEl  = document.getElementById('arqueoContarActual');
+  if (!dispEl) return;
+
+  let cur = dispEl.textContent === '0' ? '' : dispEl.textContent;
+
+  if (key === 'back') {
+    cur = cur.slice(0, -1);
+    if (!cur) cur = '';
+  } else if (key === '.') {
+    if (cur.includes('.')) return; // only one decimal
+    cur = (cur || '0') + '.';
+  } else {
+    // Limit to 2 decimal places
+    const parts = cur.split('.');
+    if (parts[1] !== undefined && parts[1].length >= 2) return;
+    cur += key;
+  }
+
+  dispEl.textContent = cur || '0';
+  if (actEl) actEl.value = cur;
+  arqueoContarCalcDiff();
+}
+
+function arqueoContarCalcDiff() {
+  const cs = systemSettings?.currency_symbol || '€';
+  const data = _arqueoCurrentIdx === -1 ? _arqueoNewData : _arqueoAllReports[_arqueoCurrentIdx];
+  const expected = Number(data?.expected_cash || data?._expected_cash_base || 0);
+  const dispEl = document.getElementById('arqueoContarDisplay');
+  const raw = dispEl ? dispEl.textContent : '0';
+  const actual = parseFloat(raw) || 0;
+  const diff   = actual - expected;
+  const diffEl = document.getElementById('arqueoContarDiff');
+  if (diffEl) {
+    const cs2 = systemSettings?.currency_symbol || '€';
+    diffEl.textContent = `${cs2}${diff.toFixed(2)}`;
+    diffEl.style.color = diff < 0 ? '#dc2626' : diff > 0 ? '#059669' : '#0f172a';
+  }
+}
+
+function arqueoContarConfirm() {
+  const dispEl = document.getElementById('arqueoContarDisplay');
+  const raw    = dispEl ? dispEl.textContent : '0';
+  const actual = parseFloat(raw);
+  if (isNaN(actual) || raw === '0' || raw === '') {
+    showAlert('Please enter the actual cash amount.', 'error', 'Error');
+    return;
+  }
+  _arqueoContarValue = actual;
+  document.getElementById('arqueoContarOverlay').style.display = 'none';
+  _arqueoRenderCurrent();
+  const actEl = document.getElementById('zReportActualCash');
+  if (actEl) actEl.value = String(actual);
+}
+
+/** Done — complete/save the Z-report */
+async function arqueoActionDone() {
+  if (_arqueoCurrentIdx !== -1) { showAlert('This report is already saved.', 'info', 'Info'); return; }
+  if (!_arqueoNewData) { showAlert('No pending report data.', 'error', 'Error'); return; }
+
+  if (_arqueoContarValue !== null) {
+    const actEl = document.getElementById('zReportActualCash');
+    if (actEl) actEl.value = String(_arqueoContarValue);
+  }
+
+  currentZReportData = _arqueoNewData;
+  await completeZReport();
+
+  try {
+    const all = await window.api.getAllZReports();
+    _arqueoAllReports = Array.isArray(all) ? all : [];
+  } catch { _arqueoAllReports = []; }
+
+  _arqueoCurrentIdx = 0;
+  _arqueoNewData    = null;
+  _arqueoContarValue = null;
+  _arqueoRenderCurrent();
+}
+
+/** Print the currently displayed report */
+async function arqueoActionPrint() {
+  const isPending = (_arqueoCurrentIdx === -1);
+  if (isPending) {
+    if (_arqueoNewData) {
+      const temp = {
+        ..._arqueoNewData,
+        report_number: _arqueoNewData.report_number || ('DRAFT-' + Date.now()),
+        report_date: new Date().toISOString(),
+        total_sales_amount: (_arqueoNewData.cash_sales || 0) + (_arqueoNewData.card_sales || 0),
+        actual_cash: _arqueoContarValue,
+        cash_difference: _arqueoContarValue !== null
+          ? _arqueoContarValue - (_arqueoNewData.expected_cash || 0)
+          : null,
+      };
+      await printZReport(temp);
+    }
+  } else {
+    const report = _arqueoAllReports[_arqueoCurrentIdx];
+    if (report) await printZReport(report);
+  }
+}
+
+/** Close the overlay */
+function arqueoClose() {
+  try {
+    const overlay = document.getElementById('arqueoOverlay');
+    if (overlay) overlay.style.display = 'none';
+  } catch { /* ignore */ }
+  // Also close the coPanel if it was used to open Z Reports
+  try { closeCoPanel(); } catch { /* ignore */ }
+  _arqueoNewData    = null;
+  _arqueoContarValue = null;
+  currentZReportData = null;
+  // Return to checkout (POS) screen — bypass permission check, always safe
+  try {
+    // Hide all views, show checkout directly
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    const cv = document.getElementById('checkoutView');
+    if (cv) cv.classList.add('active');
+    // Update nav active state
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    const nb = document.querySelector('.tab-btn[data-view="checkout"]');
+    if (nb) nb.classList.add('active');
+    // Hide navbar for checkout
+    const topNavbar = document.getElementById('topNavbar');
+    if (topNavbar) topNavbar.style.display = 'none';
+    const mw = document.querySelector('.main-content-wrapper');
+    if (mw) mw.style.height = '100vh';
+    // Reload checkout data
+    loadCheckoutView();
+  } catch(e) {
+    navigateToView('checkout');
+  }
+}
+
+function arqueoActionCancel() { arqueoClose(); }
+
+/** Open arqueo overlay directly on a saved report (from the table eye button) */
+async function arqueoViewSaved(reportId) {
+  try {
+    const overlay = document.getElementById('arqueoOverlay');
+    if (!overlay) return;
+    const all = await window.api.getAllZReports();
+    _arqueoAllReports = Array.isArray(all) ? all : [];
+    _arqueoNewData    = null;
+    _arqueoContarValue = null;
+    const idx = _arqueoAllReports.findIndex(r => r.id === reportId);
+    _arqueoCurrentIdx = idx >= 0 ? idx : 0;
+    _arqueoRenderCurrent();
+    overlay.style.display = 'flex';
+  } catch (e) {
+    showAlert('Error opening report: ' + e.message, 'error', 'Error');
+  }
+}

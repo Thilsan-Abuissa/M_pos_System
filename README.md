@@ -76,6 +76,21 @@ npm run build:win
 
 This creates an `.exe` installer in the `dist/` folder.
 
+#### Build Windows from macOS (recommended)
+Building Windows installers from macOS can fail without extra tooling (Wine/Mono) and is especially painful on Apple Silicon.
+
+This repo includes a GitHub Actions workflow that builds on a real Windows runner:
+- Workflow: `.github/workflows/build-windows.yml`
+- Run it from GitHub: **Actions → Build Windows → Run workflow**
+- Download output from the workflow artifacts (`dist/`)
+
+#### Build Windows locally on a Windows PC
+On Windows:
+```bash
+npm ci
+npm run build:win
+```
+
 ### Build for both platforms:
 ```bash
 npm run build:all
@@ -199,6 +214,55 @@ If the app doesn't open, you may need to allow it in System Preferences > Securi
 npm run dev
 ```
 This opens the app with Developer Tools enabled.
+
+## 🖥️ Customer Display (Pole vs Modern 15.6" Monitor)
+
+This POS supports two kinds of customer displays:
+
+- **Legacy pole/VFD display (serial/COM/USB-RS232)**: shows 2 lines × 20 chars like the first photo.
+- **Modern customer display (15.6" HDMI/USB monitor)**: opens a full-screen customer window on the external monitor like the second photo.
+
+### Choose mode
+
+Set the environment variable `CUSTOMER_DISPLAY_MODE`:
+
+- `vfd` (default): use only the serial pole display
+- `monitor`: use only the modern monitor window (recommended for 15.6")
+- `both`: use both at the same time
+- `off`: disable customer display output
+
+Examples:
+
+```bash
+# Modern 15.6" monitor display only
+CUSTOMER_DISPLAY_MODE=monitor npm start
+
+# Both monitor + serial pole display
+CUSTOMER_DISPLAY_MODE=both npm start
+```
+
+### Pick which screen (monitor)
+
+By default the customer window opens on the first non-primary display.
+
+- `CUSTOMER_DISPLAY_SCREEN_INDEX`: choose a specific display index (accepts `1` = primary, `2` = second, etc.)
+- `CUSTOMER_DISPLAY_FORCE_PRIMARY=1`: force the customer window onto the primary screen
+
+```bash
+# Open customer display on the 2nd monitor
+CUSTOMER_DISPLAY_MODE=monitor CUSTOMER_DISPLAY_SCREEN_INDEX=2 npm start
+```
+
+### Kiosk/fullscreen options (monitor)
+
+- `CUSTOMER_DISPLAY_KIOSK=1` (default): kiosk mode (best for dedicated customer screen)
+- `CUSTOMER_DISPLAY_KIOSK=0`: normal fullscreen instead of kiosk
+- `CUSTOMER_DISPLAY_FRAME=1`: show window frame (useful for debugging)
+
+### Notes
+
+- On macOS, make sure the 15.6" screen is set to **Extended display** in System Settings → Displays.
+- In `monitor` mode the app will **not** scan serial ports for the pole display.
 
 ### Modify Database Schema
 Edit `database.js` and delete the existing database file to recreate it with the new schema.

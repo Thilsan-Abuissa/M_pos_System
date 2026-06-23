@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Windows (electron-builder)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build:win"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

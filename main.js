@@ -1,7 +1,30 @@
-const { app, BrowserWindow, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, dialog } = require('electron');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 const Database = require('./database');
 const CustomerDisplay = require('./customer-display');
+const { exec, spawn } = require('child_process');
+const { promisify } = require('util');
+const iconv = require('iconv-lite');
+
+const execPromise = promisify(exec);
+
+// Shared printer text encoding helper.
+// Many ESC/POS printers in Spain expect CP858/CP850 variants for the Euro symbol.
+const POS_PRINT_ENCODING = (() => {
+  const enc = String(process.env.POS_PRINT_ENCODING || 'cp858').trim();
+  return enc || 'cp858';
+})();
+
+function safeEncode(text) {
+  try {
+    return iconv.encode(String(text ?? ''), POS_PRINT_ENCODING);
+  } catch {
+    // Fallback to cp858 (Euro) if a custom encoding is invalid.
+    return iconv.encode(String(text ?? ''), 'cp858');
+  }
+}
 
 // Prevent multiple running instances (common cause of COM port "Access denied")
 // If a second instance starts, it will steal focus and exit.
@@ -45,6 +68,10 @@ try {
   console.warn('ReadlineParser not available. Continuing with raw serial reads only.', error.message);
 }
 
+// Barcode-only default: scale is disabled unless explicitly enabled.
+// Set `SCALE_ENABLED=1` to re-enable the legacy scale module.
+const SCALE_ENABLED = process.env.SCALE_ENABLED === '1';
+
 let mainWindow;
 let customerDisplayWindow;
 let db;
@@ -52,12 +79,219 @@ let scalePort = null;
 let scaleParser = null;
 let customerDisplay = null;
 
+// Prevent overlapping drawer kicks (can race on Windows temp files / printer spooler)
+let lastDrawerKickAt = 0;
+const DRAWER_KICK_THROTTLE_MS = 250;
+
+function makeTempName(prefix, ext = '') {
+  const safePrefix = String(prefix || 'tmp').replace(/[^a-z0-9_-]/gi, '_');
+  const safeExt = ext ? (ext.startsWith('.') ? ext : '.' + ext) : '';
+  return `${safePrefix}_${Date.now()}_${Math.random().toString(16).slice(2)}${safeExt}`;
+}
+
+// Printer detection cache (used for drawer kicks and printing when printer_name is not configured)
+let cachedAutoPrinterName = null;
+let cachedAutoPrinterAt = 0;
+const AUTO_PRINTER_TTL_MS = 10 * 60 * 1000;
+
+function pickLikelyThermalPrinter(printers) {
+  const list = (Array.isArray(printers) ? printers : []).map(p => String(p || '').trim()).filter(Boolean);
+  return list.find(p => /TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) || list[0] || null;
+}
+
+async function autoDetectPrinterName() {
+  try {
+    if (process.platform === 'win32') {
+      const { stdout } = await execPromise('powershell -command "Get-Printer | Select-Object Name | ForEach-Object { $_.Name }"');
+      const printers = stdout.trim().split('\n').filter(p => p.trim() && !p.includes('----'));
+      return pickLikelyThermalPrinter(printers);
+    }
+
+    // macOS/Linux
+    const { stdout } = await execPromise('lpstat -p | awk \'{print $2}\'');
+    const printers = stdout.trim().split('\n').filter(p => p.trim());
+    return pickLikelyThermalPrinter(printers);
+  } catch (error) {
+    console.error('Error auto-detecting printer:', error);
+    return null;
+  }
+}
+
+async function getPrinterNameFast() {
+  try {
+    const settings = db?.getSystemSettings?.();
+    const configured = settings?.printer_name;
+    if (configured) return configured;
+
+    const now = Date.now();
+    if (cachedAutoPrinterName && (now - cachedAutoPrinterAt) < AUTO_PRINTER_TTL_MS) {
+      return cachedAutoPrinterName;
+    }
+
+    const detected = await autoDetectPrinterName();
+    if (detected) {
+      cachedAutoPrinterName = detected;
+      cachedAutoPrinterAt = now;
+    }
+    return detected;
+  } catch {
+    return null;
+  }
+}
+
+function cupsSendBufferToPrinter(printerName, buffer, { raw = true } = {}) {
+  return new Promise((resolve, reject) => {
+    const args = raw ? ['-d', String(printerName), '-o', 'raw'] : ['-d', String(printerName)];
+    const child = spawn('lp', args, { stdio: ['pipe', 'ignore', 'pipe'] });
+
+    let stderr = '';
+    child.stderr?.on('data', (d) => { stderr += d.toString(); });
+
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) return resolve();
+      reject(new Error((stderr || `lp exited with code ${code}`).trim()));
+    });
+
+    try {
+      child.stdin.write(buffer);
+      child.stdin.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function isTruthyEnv(value) {
+  const v = String(value || '').trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(v);
+}
+
+function getCustomerDisplayMode() {
+  // Modes:
+  // - vfd: serial VFD/pole display only (default)
+  // - monitor: modern HDMI/USB monitor customer display only
+  // - both: send to both
+  // - off: disable all customer display output
+  const raw = String(process.env.CUSTOMER_DISPLAY_MODE || '').trim().toLowerCase();
+  if (!raw) return 'vfd';
+  if (['vfd', 'serial', 'hardware'].includes(raw)) return 'vfd';
+  if (['monitor', 'screen', 'window'].includes(raw)) return 'monitor';
+  if (['both', 'all'].includes(raw)) return 'both';
+  if (['off', 'none', 'disable', 'disabled'].includes(raw)) return 'off';
+  return 'vfd';
+}
+
+function isVfdCustomerDisplayEnabled() {
+  const mode = getCustomerDisplayMode();
+  return mode === 'vfd' || mode === 'both';
+}
+
+function isMonitorCustomerDisplayEnabled() {
+  const mode = getCustomerDisplayMode();
+  return mode === 'monitor' || mode === 'both';
+}
+
+function pickCustomerDisplayTargetDisplay() {
+  const displays = screen?.getAllDisplays?.() || [];
+  const primary = screen?.getPrimaryDisplay?.() || null;
+
+  if (isTruthyEnv(process.env.CUSTOMER_DISPLAY_FORCE_PRIMARY)) {
+    return primary;
+  }
+
+  const rawIndex = process.env.CUSTOMER_DISPLAY_SCREEN_INDEX;
+  if (rawIndex !== undefined && rawIndex !== null && String(rawIndex).trim() !== '') {
+    const parsed = parseInt(String(rawIndex), 10);
+    if (Number.isFinite(parsed) && displays.length > 0) {
+      // Accept either 0-based or 1-based input.
+      const idx = parsed >= 1 ? parsed - 1 : parsed;
+      if (idx >= 0 && idx < displays.length) return displays[idx];
+    }
+  }
+
+  // Default: pick the first non-primary display if available, else primary.
+  const external = primary ? displays.find(d => d.id !== primary.id) : null;
+  return external || primary || (displays[0] || null);
+}
+
+// ==================== Activation (offline, first-run) ====================
+// NOTE: This is a "master key" approach (same key can activate multiple PCs)
+// because the user requested it. For 1-key-per-PC licensing, bind to a machine id.
+const MASTER_ACTIVATION_KEY = (process.env.POS_ACTIVATION_KEY || 'TS POS').toString();
+
+function normalizeActivationKey(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toUpperCase();
+}
+
+function getActivationFilePath() {
+  return path.join(app.getPath('userData'), 'activation.json');
+}
+
+function readActivationState() {
+  try {
+    const p = getActivationFilePath();
+    if (!fs.existsSync(p)) return { activated: false };
+    const raw = fs.readFileSync(p, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      activated: !!parsed?.activated,
+      activatedAt: parsed?.activatedAt || null
+    };
+  } catch {
+    return { activated: false };
+  }
+}
+
+function writeActivationState(key) {
+  const p = getActivationFilePath();
+  const keyHash = crypto.createHash('sha256').update(String(key)).digest('hex');
+  const payload = {
+    activated: true,
+    activatedAt: new Date().toISOString(),
+    keyHash
+  };
+  fs.writeFileSync(p, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+function getDatabasePath() {
+  // Keep in sync with database.js
+  return path.join(app.getPath('userData'), 'pos_database.db');
+}
+
 // Basic app info
 ipcMain.handle('app:getVersion', async () => {
   try {
     return app.getVersion();
   } catch {
     return null;
+  }
+});
+
+ipcMain.handle('activation:getStatus', async () => {
+  return readActivationState();
+});
+
+ipcMain.handle('activation:activate', async (event, key) => {
+  try {
+    const inputRaw = (key || '').toString();
+    const input = normalizeActivationKey(inputRaw);
+    if (!input) {
+      return { success: false, error: 'Activation key is required' };
+    }
+
+    const master = normalizeActivationKey(MASTER_ACTIVATION_KEY);
+    if (input !== master) {
+      return { success: false, error: 'Invalid activation key' };
+    }
+
+    writeActivationState(inputRaw);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
@@ -674,6 +908,18 @@ function createWindow() {
       customerDisplayWindow.close();
     }
   });
+
+  // Auto-open monitor-based customer display when enabled.
+  // (Hardware VFD is controlled separately via CUSTOMER_DISPLAY_MODE.)
+  try {
+    if (isMonitorCustomerDisplayEnabled()) {
+      setTimeout(() => {
+        try { createCustomerDisplay(); } catch { /* ignore */ }
+      }, 700);
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function createCustomerDisplay() {
@@ -682,9 +928,7 @@ function createCustomerDisplay() {
     return;
   }
 
-  // If there is a second display, open the customer display there and fill it.
-  const displays = screen?.getAllDisplays?.() || [];
-  const targetDisplay = displays.length > 1 ? displays[1] : (screen?.getPrimaryDisplay?.() || null);
+  const targetDisplay = pickCustomerDisplayTargetDisplay();
   const targetBounds = targetDisplay?.bounds;
   const initialWindowOpts = targetBounds
     ? {
@@ -700,12 +944,25 @@ function createCustomerDisplay() {
         minHeight: 400
       };
 
+  const kiosk = String(process.env.CUSTOMER_DISPLAY_KIOSK || '').trim() === ''
+    ? true
+    : isTruthyEnv(process.env.CUSTOMER_DISPLAY_KIOSK);
+
+  const frame = isTruthyEnv(process.env.CUSTOMER_DISPLAY_FRAME);
+  const alwaysOnTop = isTruthyEnv(process.env.CUSTOMER_DISPLAY_ALWAYS_ON_TOP);
+
   customerDisplayWindow = new BrowserWindow({
     ...initialWindowOpts,
     title: 'Customer Display',
+    show: false,
+    frame,
+    focusable: false,
+    skipTaskbar: true,
+    alwaysOnTop,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'customer-display-preload.js')
     },
     backgroundColor: '#667eea'
   });
@@ -718,6 +975,21 @@ function createCustomerDisplay() {
     customerDisplayWindow.setBounds(targetBounds);
     customerDisplayWindow.maximize();
   }
+
+  customerDisplayWindow.once('ready-to-show', () => {
+    try {
+      // Fullscreen/kiosk makes the modern 15.6" display look like a real customer-facing screen.
+      if (kiosk) {
+        customerDisplayWindow.setKiosk(true);
+      } else {
+        customerDisplayWindow.setFullScreen(true);
+      }
+    } catch {
+      // ignore
+    }
+
+    try { customerDisplayWindow.showInactive(); } catch { /* ignore */ }
+  });
 
   customerDisplayWindow.on('closed', () => {
     customerDisplayWindow = null;
@@ -830,6 +1102,10 @@ ipcMain.handle('products:getAll', async () => {
   return db.getAllProducts();
 });
 
+ipcMain.handle('products:getAllLite', async () => {
+  return db.getAllProductsLite();
+});
+
 ipcMain.handle('products:search', async (event, query) => {
   return db.searchProducts(query);
 });
@@ -838,16 +1114,63 @@ ipcMain.handle('products:getByBarcode', async (event, barcode) => {
   return db.getProductByBarcode(barcode);
 });
 
+ipcMain.handle('products:getById', async (event, id) => {
+  return db.getProductById(id);
+});
+
 ipcMain.handle('products:add', async (event, product) => {
   return db.addProduct(product);
+});
+
+ipcMain.handle('products:bulkAdd', async (event, products) => {
+  const results = { created: 0, skipped: 0, errors: [] };
+  for (const p of (products || [])) {
+    try {
+      const bc = String(p.barcode || '').replace(/\s+/g, '').trim();
+      if (!bc) { results.skipped++; continue; }
+      // Skip if barcode already exists
+      const existing = db.getProductByBarcode(bc);
+      if (existing && existing.id) { results.skipped++; continue; }
+      db.addProduct(p);
+      results.created++;
+    } catch (e) {
+      results.errors.push({ barcode: p.barcode, error: String(e?.message || e) });
+    }
+  }
+  return results;
+});
+
+// VAT (IVA) rates
+ipcMain.handle('vatRates:getAll', async (event, activeOnly = true) => {
+  return db.getVatRates(activeOnly !== false);
+});
+
+ipcMain.handle('vatRates:add', async (event, percent, label = null) => {
+  return db.addVatRate(percent, label);
 });
 
 ipcMain.handle('products:update', async (event, id, product) => {
   return db.updateProduct(id, product);
 });
 
+ipcMain.handle('products:setShowInCheckout', async (event, id, showInCheckout) => {
+  return db.setProductShowInCheckout(id, showInCheckout);
+});
+
 ipcMain.handle('products:delete', async (event, id) => {
   return db.deleteProduct(id);
+});
+
+ipcMain.handle('products:getSortOrder', async (event, scopeCategory, scopeSubcategory) => {
+  return db.getProductSortOrder(scopeCategory, scopeSubcategory);
+});
+
+ipcMain.handle('products:setSortOrder', async (event, scopeCategory, scopeSubcategory, productIds) => {
+  return db.setProductSortOrder(scopeCategory, scopeSubcategory, productIds);
+});
+
+ipcMain.handle('products:archive', async (event, id) => {
+  return db.archiveProduct(id);
 });
 
 // Sales
@@ -865,6 +1188,14 @@ ipcMain.handle('sales:getById', async (event, id) => {
 
 ipcMain.handle('sales:getToday', async () => {
   return db.getTodaySales();
+});
+
+ipcMain.handle('sales:getYesterday', async () => {
+  return db.getYesterdaySales();
+});
+
+ipcMain.handle('business:getRange', async (event, which) => {
+  return db.getBusinessDayRange((which || 'today').toString());
 });
 
 // Reports
@@ -898,11 +1229,35 @@ ipcMain.handle('users:getAll', async () => {
 });
 
 ipcMain.handle('users:add', async (event, user) => {
-  return db.addUser(user);
+  try {
+    const result = db.addUser(user);
+    return { success: true, ...result };
+  } catch (error) {
+    const msg = String(error?.message || error || 'Unknown error');
+    const code = String(error?.code || '');
+    const isUsernameUnique = code === 'SQLITE_CONSTRAINT_UNIQUE'
+      || msg.includes('UNIQUE constraint failed: users.username');
+    if (isUsernameUnique) {
+      return { success: false, errorCode: 'USERNAME_EXISTS' };
+    }
+    return { success: false, errorCode: 'UNKNOWN', message: msg };
+  }
 });
 
 ipcMain.handle('users:update', async (event, id, user) => {
-  return db.updateUser(id, user);
+  try {
+    const result = db.updateUser(id, user);
+    return { success: true, ...result };
+  } catch (error) {
+    const msg = String(error?.message || error || 'Unknown error');
+    const code = String(error?.code || '');
+    const isUsernameUnique = code === 'SQLITE_CONSTRAINT_UNIQUE'
+      || msg.includes('UNIQUE constraint failed: users.username');
+    if (isUsernameUnique) {
+      return { success: false, errorCode: 'USERNAME_EXISTS' };
+    }
+    return { success: false, errorCode: 'UNKNOWN', message: msg };
+  }
 });
 
 ipcMain.handle('users:updatePassword', async (event, id, password) => {
@@ -910,7 +1265,13 @@ ipcMain.handle('users:updatePassword', async (event, id, password) => {
 });
 
 ipcMain.handle('users:delete', async (event, id) => {
-  return db.deleteUser(id);
+  try {
+    const result = db.deleteUser(id);
+    if (result && typeof result === 'object' && 'success' in result) return result;
+    return { success: true, ...result };
+  } catch (error) {
+    return { success: false, errorCode: 'UNKNOWN', message: String(error?.message || error || 'Unknown error') };
+  }
 });
 
 ipcMain.handle('users:getById', async (event, id) => {
@@ -931,6 +1292,14 @@ ipcMain.handle('loans:getAll', async (event, status) => {
   return db.getAllLoans(status);
 });
 
+ipcMain.handle('loans:search', async (event, query, status) => {
+  return db.searchLoans(query, status);
+});
+
+ipcMain.handle('loans:listParties', async (event, query, limit) => {
+  return db.listLoanParties(query, limit);
+});
+
 ipcMain.handle('loans:getByReceipt', async (event, receiptNumber) => {
   return db.getLoanByReceiptNumber(receiptNumber);
 });
@@ -947,6 +1316,11 @@ ipcMain.handle('loans:getMonthlyRestaurantReport', async (event, month, year) =>
   return db.getMonthlyRestaurantReport(month, year);
 });
 
+// Edit PARKING (loan) items before settlement
+ipcMain.handle('loans:removeSaleItem', async (event, loanId, saleItemId) => {
+  return db.removeSaleItemFromLoan(Number(loanId), Number(saleItemId));
+});
+
 // Returns handlers
 ipcMain.handle('returns:create', async (event, returnData) => {
   return db.createReturn(returnData);
@@ -956,6 +1330,10 @@ ipcMain.handle('returns:getAll', async () => {
   return db.getAllReturns();
 });
 
+ipcMain.handle('returns:getBySaleId', async (event, originalSaleId) => {
+  return db.getReturnByOriginalSaleId(Number(originalSaleId));
+});
+
 // Expense handlers
 ipcMain.handle('expenses:create', async (event, expenseData) => {
   return db.createExpense(expenseData);
@@ -963,6 +1341,10 @@ ipcMain.handle('expenses:create', async (event, expenseData) => {
 
 ipcMain.handle('expenses:getAll', async (event, startDate, endDate) => {
   return db.getExpenses(startDate, endDate);
+});
+
+ipcMain.handle('expenses:getAllByDateTimeRange', async (event, startDateTime, endDateTime) => {
+  return db.getExpensesByDateTimeRange(startDateTime, endDateTime);
 });
 
 ipcMain.handle('expenses:getById', async (event, id) => {
@@ -979,6 +1361,10 @@ ipcMain.handle('expenses:delete', async (event, id) => {
 
 ipcMain.handle('expenses:getSummary', async (event, startDate, endDate) => {
   return db.getExpenseSummary(startDate, endDate);
+});
+
+ipcMain.handle('expenses:getSummaryByDateTimeRange', async (event, startDateTime, endDateTime) => {
+  return db.getExpenseSummaryByDateTimeRange(startDateTime, endDateTime);
 });
 
 ipcMain.handle('returns:getById', async (event, id) => {
@@ -1011,52 +1397,27 @@ ipcMain.handle('printer:openDrawer', async () => {
   const drawerCommand = Buffer.from([0x1B, 0x70, 0x00, 0x19, 0xFA]);
   
   try {
-    const settings = db.getSystemSettings();
-    let printerName = settings?.printer_name;
-    
-    // Auto-detect printer if not configured
-    if (!printerName) {
-      console.log('No printer configured. Auto-detecting printer...');
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execPromise = promisify(exec);
-      
-      try {
-        if (process.platform === 'win32') {
-          const { stdout } = await execPromise('powershell -command "Get-Printer | Select-Object Name | ForEach-Object { $_.Name }"');
-          const printers = stdout.trim().split('\n').filter(p => p.trim() && !p.includes('----'));
-          // Look for thermal printer names (TM, Epson, iggual, thermal, POS, receipt)
-          printerName = printers.find(p => /TM|Epson|iggual|thermal|POS|receipt/i.test(p)) || printers[0];
-        } else if (process.platform === 'darwin') {
-          const { stdout } = await execPromise('lpstat -p | awk \'{print $2}\'');
-          const printers = stdout.trim().split('\n').filter(p => p.trim());
-          printerName = printers.find(p => /TM|Epson|iggual|thermal|POS|receipt/i.test(p)) || printers[0];
-        }
-        
-        if (printerName) {
-          console.log('Auto-detected printer:', printerName);
-        } else {
-          console.log('No printer found on system');
-          return { success: false, error: 'No printer found. Please connect a printer and try again.' };
-        }
-      } catch (error) {
-        console.error('Error auto-detecting printer:', error);
-        return { success: false, error: 'Could not detect printer. Please check printer connection.' };
-      }
+    const now = Date.now();
+    if (now - lastDrawerKickAt < DRAWER_KICK_THROTTLE_MS) {
+      return { success: true, message: 'Cash drawer kick throttled' };
     }
+    lastDrawerKickAt = now;
 
-    const fs = require('fs');
-    const { exec } = require('child_process');
-    const { promisify } = require('util');
-    const execPromise = promisify(exec);
+    const printerName = await getPrinterNameFast();
+    if (!printerName) {
+      return { success: false, error: 'No printer found. Please configure a printer in Setup.' };
+    }
 
     // For Windows, we'll write directly to the printer port
     if (process.platform === 'win32') {
       try {
-        const tempFile = path.join(app.getPath('temp'), 'drawer_cmd.prn');
+        const tempFile = path.join(app.getPath('temp'), makeTempName('drawer_cmd', 'prn'));
         fs.writeFileSync(tempFile, drawerCommand);
-        await sendRawFileToPrinterWindows(printerName, tempFile);
-        fs.unlinkSync(tempFile);
+        try {
+          await sendRawFileToPrinterWindows(printerName, tempFile);
+        } finally {
+          try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch { /* ignore */ }
+        }
         console.log('Cash drawer opened via printer:', printerName);
         return { success: true, message: 'Cash drawer opened' };
       } catch (error) {
@@ -1064,67 +1425,57 @@ ipcMain.handle('printer:openDrawer', async () => {
         return { success: false, error: 'Failed to communicate with printer: ' + error.message };
       }
     } else {
-      // For macOS/Linux, use CUPS direct device communication
-      const tempFile = path.join(app.getPath('temp'), 'drawer_cmd.prn');
-      
+      // macOS/Linux: send the ESC/POS pulse as a raw CUPS job (stdin) to avoid temp files.
       try {
-        fs.writeFileSync(tempFile, drawerCommand);
-        
-        // Method 1: Try lp with raw option (most common for thermal printers)
         try {
-          await execPromise(`lp -d "${printerName}" -o raw "${tempFile}"`);
-          fs.unlinkSync(tempFile);
+          await cupsSendBufferToPrinter(printerName, drawerCommand, { raw: true });
           console.log('Cash drawer opened via printer:', printerName);
           return { success: true, message: 'Cash drawer opened' };
         } catch (error1) {
-          console.log('Method 1 failed, trying alternative methods...');
-          
-          // Method 2: Try without -o raw option
+          console.log('Method 1 failed, trying without raw option...');
           try {
-            await execPromise(`lp -d "${printerName}" "${tempFile}"`);
-            fs.unlinkSync(tempFile);
+            await cupsSendBufferToPrinter(printerName, drawerCommand, { raw: false });
             console.log('Cash drawer opened via printer (method 2):', printerName);
             return { success: true, message: 'Cash drawer opened' };
           } catch (error2) {
             console.log('Method 2 failed, trying direct device write...');
-            
-            // Method 3: Try to find the device path and write directly
+
+            // Method 3: Try to find the device path and write directly (best-effort)
+            const { stdout } = await execPromise(`lpstat -v "${printerName}"`);
+            const deviceMatch = stdout.match(/device for .+: (.+)/);
+            if (!deviceMatch || !deviceMatch[1]) {
+              throw error2;
+            }
+
+            const devicePathRaw = String(deviceMatch[1]).trim();
+            console.log('Found device path:', devicePathRaw);
+
+            // Only attempt direct write if it looks like a local path.
+            // Common non-file URIs include: usb://..., ipp://..., lpd://...
+            const devicePath = devicePathRaw.startsWith('file:')
+              ? devicePathRaw.replace(/^file:/, '')
+              : devicePathRaw;
+
+            if (!devicePath.startsWith('/')) {
+              throw error2;
+            }
+
+            const tempFile = path.join(app.getPath('temp'), makeTempName('drawer_cmd', 'prn'));
             try {
-              const { stdout } = await execPromise(`lpstat -v "${printerName}"`);
-              const deviceMatch = stdout.match(/device for .+: (.+)/);
-              
-              if (deviceMatch && deviceMatch[1]) {
-                const devicePath = deviceMatch[1];
-                console.log('Found device path:', devicePath);
-                
-                // Write directly to device
-                await execPromise(`cat "${tempFile}" > "${devicePath}"`);
-                fs.unlinkSync(tempFile);
-                console.log('Cash drawer opened via direct device write:', devicePath);
-                return { success: true, message: 'Cash drawer opened' };
-              } else {
-                throw new Error('Could not determine printer device path');
-              }
-            } catch (error3) {
-              fs.unlinkSync(tempFile);
-              throw error3;
+              fs.writeFileSync(tempFile, drawerCommand);
+              await execPromise(`cat "${tempFile}" > "${devicePath}"`);
+              console.log('Cash drawer opened via direct device write:', devicePath);
+              return { success: true, message: 'Cash drawer opened' };
+            } finally {
+              try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch { /* ignore */ }
             }
           }
         }
       } catch (error) {
-        // Clean up temp file if it exists
-        try {
-          if (fs.existsSync(tempFile)) {
-            fs.unlinkSync(tempFile);
-          }
-        } catch (cleanupError) {
-          console.error('Error cleaning up temp file:', cleanupError);
-        }
-        
         console.error('All methods failed to open drawer:', error);
-        return { 
-          success: false, 
-          error: 'Failed to open cash drawer. Please check:\n1. Printer is configured correctly\n2. Cash drawer is connected to printer\n3. Printer driver supports ESC/POS commands\n\nError: ' + error.message 
+        return {
+          success: false,
+          error: 'Failed to open cash drawer. Please check:\n1. Printer is configured correctly\n2. Cash drawer is connected to printer\n3. Printer driver supports ESC/POS commands\n\nError: ' + error.message
         };
       }
     }
@@ -1204,11 +1555,99 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     const execPromise = promisify(exec);
     const iconv = require('iconv-lite');
 
+    const normalizeCurrencySymbol = (value) => {
+      const raw = value === undefined || value === null ? '' : String(value);
+      const trimmed = raw.trim();
+      return trimmed ? trimmed : '€';
+    };
+
+    const receiptEncoding = (() => {
+      const enc = String(process.env.POS_PRINT_ENCODING || 'cp858').trim();
+      return enc || 'cp858';
+    })();
+
+    const escposCodeTable = (() => {
+      const raw = String(process.env.POS_ESCPOS_CODE_TABLE ?? '19').trim();
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) && n >= 0 && n <= 255 ? n : 19;
+    })();
+
+    const escposCountry = (() => {
+      // ESC R n (international character set). 7 is Spain (common on ESC/POS).
+      const raw = String(process.env.POS_ESCPOS_COUNTRY ?? '7').trim();
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) && n >= 0 && n <= 255 ? n : 7;
+    })();
+
+    const safeEncode = (text) => {
+      try {
+        return iconv.encode(text, receiptEncoding);
+      } catch {
+        // Fallback to cp858 (Euro) if a custom encoding is invalid.
+        return iconv.encode(text, 'cp858');
+      }
+    };
+
+    const receiptTimeZone = 'Europe/Madrid';
+
+    const parseDateTimeLoose = (value) => {
+      if (!value) return null;
+      const s = String(value).trim();
+      // SQLite CURRENT_TIMESTAMP often: "YYYY-MM-DD HH:MM:SS" (UTC)
+      if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) {
+        const dt = new Date(s.replace(' ', 'T') + 'Z');
+        return Number.isNaN(dt.getTime()) ? null : dt;
+      }
+      const dt = new Date(s);
+      return Number.isNaN(dt.getTime()) ? null : dt;
+    };
+
+    const formatReceiptDateTime = (payload) => {
+      try {
+        const src = payload?.dateIso ?? payload?.sale_date ?? payload?.saleDateIso ?? payload?.date;
+        const dt = parseDateTimeLoose(src) || new Date();
+        // es-ES default format: dd/mm/yyyy, HH:MM:SS
+        return new Intl.DateTimeFormat('es-ES', {
+          timeZone: receiptTimeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        }).format(dt);
+      } catch {
+        return String(payload?.date || '').trim();
+      }
+    };
+
     // RAW TICKET PRINTING SUPPORT
     if (receiptData.raw && typeof receiptData.text === 'string') {
-      // Write raw text directly to printer
+      // Write raw text directly to printer.
+      // IMPORTANT: Many printers require setting the international charset + code table
+      // for the Euro symbol (and Spanish characters) to render correctly.
+      // Do it here so *all* raw prints (Z-report, sales history thermal, etc.) are consistent.
       const tempFile = path.join(app.getPath('temp'), 'ticket_' + Date.now() + '.txt');
-      const ticketBuffer = iconv.encode(receiptData.text, 'cp1252');
+
+      const ESC = '\x1B';
+      const FS = '\x1C';
+
+      const initSeq = (
+        // Initialize + cancel kanji + set international charset + set code table
+        ESC + '@' +
+        FS + '.' +
+        ESC + 'R' + String.fromCharCode(escposCountry) +
+        ESC + 't' + String.fromCharCode(escposCodeTable)
+      );
+
+      const rawText = String(receiptData.text ?? '');
+      // If caller already starts with ESC @, inject charset selection right after it.
+      const normalizedText = rawText.startsWith(ESC + '@')
+        ? (ESC + '@' + initSeq.slice(2) + rawText.slice(2))
+        : (initSeq + rawText);
+
+      const ticketBuffer = safeEncode(normalizedText);
       fs.writeFileSync(tempFile, ticketBuffer);
 
       if (process.platform === 'win32') {
@@ -1237,6 +1676,7 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     // Format receipt for thermal printer (ESC/POS)
     const ESC = '\x1B';
     const GS = '\x1D';
+    const FS = '\x1C';
 
     const inferLineWidth = (printer, data) => {
       const explicit = Number(data?.lineWidth);
@@ -1292,7 +1732,7 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
         return labelText + fillChar.repeat(gap) + valueText;
       };
 
-      const currency = (receiptData.currency || '€').toString();
+      const currency = normalizeCurrencySymbol(receiptData.currency);
       const formatMoney = (amount) => {
         const num = Number(amount || 0);
         return num.toFixed(2).replace('.', ',') + currency;
@@ -1303,8 +1743,19 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
       let receipt = '';
       receipt += ESC + '@';
-      receipt += ESC + '! ';
+      // Cancel kanji mode + set international charset + code table for proper symbols (€, ü, etc.)
+      receipt += FS + '.';
+      receipt += ESC + 'R' + String.fromCharCode(escposCountry);
+      receipt += ESC + 't' + String.fromCharCode(escposCodeTable);
+      receipt += ESC + '!' + String.fromCharCode(0);
       receipt += ESC + 'a' + String.fromCharCode(1);
+
+      // Kick drawer only when explicitly requested.
+      // (Never auto-kick on print, because the drawer is opened at payment time.)
+      const shouldKickDrawer = !!receiptData?.kickDrawer;
+      if (shouldKickDrawer) {
+        receipt += ESC + 'p' + String.fromCharCode(0) + String.fromCharCode(0x19) + String.fromCharCode(0xFA);
+      }
 
       receipt += ESC + '!' + String.fromCharCode(0x20);
       receipt += (receiptData.storeName || 'SUPERMARKET POS').toString().toUpperCase() + '\n';
@@ -1318,15 +1769,22 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       receipt += 'PAGO PARKING\n';
       receipt += 'NO VALIDO COMO FACTURA\n';
       receipt += ESC + '!' + String.fromCharCode(0);
+
+      const dupNo = Math.floor(Number(receiptData?.duplicateNumber || 0));
+      if (dupNo > 0) {
+        receipt += ESC + '!' + String.fromCharCode(0x10);
+        receipt += `DUPLICATE ${dupNo}\n`;
+        receipt += ESC + '!' + String.fromCharCode(0);
+      }
       receipt += '='.repeat(LINE_WIDTH) + '\n';
 
       receipt += ESC + 'a' + String.fromCharCode(0);
-      receipt += 'FECHA: ' + (receiptData.date || '') + '\n';
+      receipt += 'FECHA: ' + formatReceiptDateTime(receiptData) + '\n';
       if (receiptData.loanReceiptNumber) {
         receipt += 'RECIBO PARKING: ' + String(receiptData.loanReceiptNumber) + '\n';
       }
       if (receiptData.paymentReceiptNumber) {
-        receipt += 'PAGO N' + String.fromCharCode(248) + ': ' + String(receiptData.paymentReceiptNumber) + '\n';
+        receipt += 'PAGO N: ' + String(receiptData.paymentReceiptNumber) + '\n';
       }
       receipt += '-'.repeat(LINE_WIDTH) + '\n';
 
@@ -1367,7 +1825,7 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       receipt += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(2);
 
       const tempFile = path.join(app.getPath('temp'), 'loan_payment_' + Date.now() + '.txt');
-      const receiptBuffer = iconv.encode(receipt, 'cp1252');
+      const receiptBuffer = safeEncode(receipt);
       fs.writeFileSync(tempFile, receiptBuffer);
 
       try {
@@ -1444,6 +1902,7 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       const num = Number(amount || 0);
       return num.toFixed(decimals).replace('.', decimal) + suffix;
     };
+  const currencySymbol = normalizeCurrencySymbol(receiptData?.currency);
 
     const formatQty = (amount, { decimals = 3, decimal = ',' } = {}) => {
       const num = Number(amount || 0);
@@ -1467,9 +1926,20 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     
     // Initialize printer
     receipt += ESC + '@'; // Initialize
+    // Cancel kanji mode + set international charset + code table for proper symbols (€, ü, etc.)
+    receipt += FS + '.';
+    receipt += ESC + 'R' + String.fromCharCode(escposCountry);
+    receipt += ESC + 't' + String.fromCharCode(escposCodeTable);
     // Ensure standard mode + left margin
     receipt += ESC + '!\x00';
     receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+
+    // Kick drawer only when explicitly requested.
+    // (Never auto-kick on print, because the drawer is opened at payment time.)
+    const shouldKickDrawer = !!receiptData?.kickDrawer;
+    if (shouldKickDrawer) {
+      receipt += ESC + 'p' + String.fromCharCode(0) + String.fromCharCode(0x19) + String.fromCharCode(0xFA);
+    }
     
     // Store name (large text)
     receipt += ESC + '!' + String.fromCharCode(0x20); // Bold + large
@@ -1500,19 +1970,42 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     }
     receipt += ESC + '!' + String.fromCharCode(0); // Normal text
 
+    const dupNo = Math.floor(Number(receiptData?.duplicateNumber || 0));
+    if (dupNo > 0) {
+      receipt += ESC + '!' + String.fromCharCode(0x10); // Bold
+      receipt += `DUPLICATE ${dupNo}\n`;
+      receipt += ESC + '!' + String.fromCharCode(0);
+    }
+
+    // Optional customer/restaurant block (used for restaurant PARKING bills)
+    // Match common Spanish receipt style: a dashed box under the header.
+    const restaurantName = (receiptData.restaurantName || '').toString().trim();
+    const restaurantNie = (receiptData.restaurantNie || '').toString().trim();
+    const customerName = (receiptData.customerName || '').toString().trim();
+    const customerPhone = (receiptData.customerPhone || '').toString().trim();
+    if (restaurantName || customerName || customerPhone) {
+      receipt += ESC + 'a' + String.fromCharCode(0); // Left align
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+      if (restaurantName) receipt += restaurantName.toUpperCase().slice(0, LINE_WIDTH) + '\n';
+      if (restaurantNie) receipt += restaurantNie.slice(0, LINE_WIDTH) + '\n';
+      if (!restaurantName && customerName) receipt += customerName.toUpperCase().slice(0, LINE_WIDTH) + '\n';
+      if (customerPhone) receipt += customerPhone.slice(0, LINE_WIDTH) + '\n';
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+    }
+
     // Divider
     receipt += '='.repeat(LINE_WIDTH) + '\n';
 
     receipt += ESC + 'a' + String.fromCharCode(0); // Left align
-    receipt += 'FECHA: ' + (receiptData.date || '') + '\n';
+    receipt += 'FECHA: ' + formatReceiptDateTime(receiptData) + '\n';
     if (!receiptData.isTicket) {
       receipt += 'Factura Simplificada PRINCIPAL\n';
     }
-    receipt += 'Serie/N' + String.fromCharCode(248) + ': ' + (receiptData.receiptId || '') + '\n';
+    receipt += 'Serie/N: ' + (receiptData.receiptId || '') + '\n';
 
     // Columns header
     if (layout.isWide) {
-      receipt += padRight('Ud.Descripción', layout.headerLeftWidth)
+      receipt += padRight('Ud.Descripcion', layout.headerLeftWidth)
         + padLeft('Precio', layout.priceWidth)
         + padLeft('Dt%', layout.discountWidth)
         + padLeft('Importe', layout.totalWidth)
@@ -1600,17 +2093,17 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       totalAll += total;
 
       const ivaStr = padRight((Number.isFinite(rate) ? rate.toFixed(0) : '0') + '%', ivaWidth);
-      const baseStr = padLeft(formatMoney(base, { decimal: ',', suffix: (receiptData.currency || '€') }), baseWidth);
-      const cuotaStr = padLeft(formatMoney(cuota, { decimal: ',', suffix: (receiptData.currency || '€') }), cuotaWidth);
-      const totalStr = padLeft(formatMoney(total, { decimal: ',', suffix: (receiptData.currency || '€') }), taxTotalWidth);
+      const baseStr = padLeft(formatMoney(base, { decimal: ',', suffix: currencySymbol }), baseWidth);
+      const cuotaStr = padLeft(formatMoney(cuota, { decimal: ',', suffix: currencySymbol }), cuotaWidth);
+      const totalStr = padLeft(formatMoney(total, { decimal: ',', suffix: currencySymbol }), taxTotalWidth);
       receipt += ivaStr + baseStr + cuotaStr + totalStr + '\n';
     });
 
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
     receipt += padRight('TOTAL', ivaWidth)
-      + padLeft(formatMoney(totalBase, { decimal: ',', suffix: (receiptData.currency || '€') }), baseWidth)
-      + padLeft(formatMoney(totalCuota, { decimal: ',', suffix: (receiptData.currency || '€') }), cuotaWidth)
-      + padLeft(formatMoney(totalAll, { decimal: ',', suffix: (receiptData.currency || '€') }), taxTotalWidth)
+      + padLeft(formatMoney(totalBase, { decimal: ',', suffix: currencySymbol }), baseWidth)
+      + padLeft(formatMoney(totalCuota, { decimal: ',', suffix: currencySymbol }), cuotaWidth)
+      + padLeft(formatMoney(totalAll, { decimal: ',', suffix: currencySymbol }), taxTotalWidth)
       + '\n';
 
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
@@ -1621,22 +2114,22 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       : paymentMethod === 'CARD' ? 'TARJETA'
       : paymentMethod === 'PARKING' ? 'CREDITO'
       : paymentMethod;
-    receipt += rightLabelValue(paymentLabel, formatMoney(receiptData.total || 0, { decimal: ',', suffix: (receiptData.currency || '€') })) + '\n';
+    receipt += rightLabelValue(paymentLabel, formatMoney(receiptData.total || 0, { decimal: ',', suffix: currencySymbol })) + '\n';
 
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
 
-    // Big total section (comma decimal, no currency)
+    // Big total section (comma decimal, with currency)
     receipt += ESC + 'a' + String.fromCharCode(1); // Center align
     receipt += ESC + '!' + String.fromCharCode(0x30); // Double height + double width
-    receipt += 'TOTAL        ' + formatMoney(receiptData.total || 0, { decimal: ',' }) + '\n';
+    receipt += 'TOTAL        ' + formatMoney(receiptData.total || 0, { decimal: ',', suffix: currencySymbol }) + '\n';
     receipt += ESC + '!' + String.fromCharCode(0); // Normal text
     receipt += '(Impuestos Incluidos)\n';
     receipt += '\n';
 
     // ENTREGA / CAMBIO
     receipt += ESC + 'a' + String.fromCharCode(0); // Left align
-    const entrega = formatMoney((receiptData.paymentAmount || receiptData.total), { decimal: ',' });
-    const cambio = formatMoney((receiptData.changeAmount || 0), { decimal: ',' });
+    const entrega = formatMoney((receiptData.paymentAmount || receiptData.total), { decimal: ',', suffix: currencySymbol });
+    const cambio = formatMoney((receiptData.changeAmount || 0), { decimal: ',', suffix: currencySymbol });
     receipt += rightLabelValue('ENTREGA', entrega) + '\n';
     receipt += rightLabelValue('CAMBIO', cambio) + '\n';
     receipt += '\n';
@@ -1665,7 +2158,7 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     
     // Write to temp file and print
     const tempFile = path.join(app.getPath('temp'), 'receipt_' + Date.now() + '.txt');
-    const receiptBuffer = iconv.encode(receipt, 'cp1252');
+    const receiptBuffer = safeEncode(receipt);
     fs.writeFileSync(tempFile, receiptBuffer);
     
     try {
@@ -1690,9 +2183,570 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
 ipcMain.handle('printer:printBarcode', async (event, barcodeData) => {
   try {
-    console.log('Printing barcode label:', barcodeData);
-    // In production, this would format and send to label printer
-    return { success: true, message: 'Barcode label sent to printer' };
+    const payload = barcodeData || {};
+    const barcode = String(payload.barcode || '').replace(/\s+/g, '').trim();
+    const name = String(payload.name || '').trim();
+    const currencySymbol = String(payload.currencySymbol || '€').trim() || '€';
+    const priceNum = Number(payload.price);
+
+    if (!barcode) return { success: false, message: 'Missing barcode' };
+    if (!name) return { success: false, message: 'Missing product name' };
+
+    // Printer selection:
+    // - LABEL_PRINTER_NAME env var (recommended for dedicated label printer)
+    // - otherwise fall back to configured receipt printer
+    const settings = db?.getSystemSettings?.();
+    const receiptPrinter = settings?.printer_name;
+    const printerName = (process.env.LABEL_PRINTER_NAME || receiptPrinter || '').toString().trim();
+    if (!printerName) {
+      return { success: false, message: 'No printer configured. Set Receipt Printer Name in Settings or LABEL_PRINTER_NAME env var.' };
+    }
+
+    const formatPrice = (amount) => {
+      const n = Number(amount);
+      const p = (Number.isFinite(n) ? n : 0).toFixed(2).replace('.', ',');
+      // Match sample label: 10,00€ (suffix for Euro)
+      if (currencySymbol === '€') return `${p}€`;
+      return `${currencySymbol}${p}`;
+    };
+
+    const escapeHtml = (s) => String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
+    // Try a "graphic" (HTML) label first so we can match the desired layout.
+    // If it fails (driver/printer quirks), fall back to the raw ESC/POS implementation below.
+    const labelPrintMode = String(payload.labelPrintMode || process.env.LABEL_PRINT_MODE || 'auto').toLowerCase();
+    const hasPrice = Number.isFinite(priceNum) && priceNum >= 0;
+    const refValue = (payload.ref ?? payload.productId ?? payload.id ?? payload.sku ?? barcode);
+
+    if (labelPrintMode !== 'raw') {
+      try {
+        const bwipjs = require('bwip-js');
+        const { BrowserWindow } = require('electron');
+
+        const isEAN13 = /^\d{13}$/.test(barcode);
+        const isUPCA = /^\d{12}$/.test(barcode);
+        const isEAN8 = /^\d{8}$/.test(barcode);
+        const bcid = isEAN13 ? 'ean13' : (isUPCA ? 'upca' : (isEAN8 ? 'ean8' : 'code128'));
+
+        // Label size in mm. Adjust via env vars if your sticker roll differs.
+        const mmW = Number(payload.labelMmWidth ?? process.env.LABEL_MM_WIDTH ?? 57);
+        const mmH = Number(payload.labelMmHeight ?? process.env.LABEL_MM_HEIGHT ?? 32);
+
+        const barcodeSvg = bwipjs.toSVG({
+          bcid,
+          text: barcode,
+          // Many shops use "internal" 12/13-digit codes that don't have a valid
+          // EAN check digit. Be tolerant so preview/print doesn't fail.
+          validatecheck: false,
+          scale: 2,
+          height: 9,
+          includetext: true,
+          textxalign: 'center',
+          textsize: 9,
+          paddingwidth: 0,
+          paddingheight: 0,
+        });
+
+        const titleText = escapeHtml(name.toUpperCase());
+        const priceText = escapeHtml(hasPrice ? formatPrice(priceNum) : '');
+        const refText = escapeHtml(String(refValue));
+
+        const layoutModeRaw = String(payload.labelLayout || '').toLowerCase();
+        const layoutMode = layoutModeRaw.replace(/[_\s]/g, '-');
+
+        const html = (layoutMode === 'pvp-right' || layoutMode === 'pvpright')
+          ? `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page { size: ${mmW}mm ${mmH}mm; margin: 0; }
+    html, body { width: ${mmW}mm; height: ${mmH}mm; margin: 0; padding: 0; }
+    body { font-family: Arial, Helvetica, sans-serif; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .wrap {
+      box-sizing: border-box;
+      width: 100%;
+      height: 100%;
+      padding: 2mm;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 0.5mm;
+    }
+    .title { font-weight: 700; font-size: 12px; line-height: 1.1; letter-spacing: 0.3px; margin: 0; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .barcode { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+    svg { width: 88%; height: auto; max-height: 100%; }
+    .priceRow { display: flex; flex-direction: column; align-items: center; justify-content: center; padding-bottom: 1mm; }
+    .pvp { font-weight: 700; font-size: 10px; line-height: 1.0; margin: 0 0 0.3mm 0; }
+    .price { font-weight: 900; font-size: 16px; line-height: 1.0; margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">${titleText}</div>
+    <div class="barcode">${barcodeSvg}</div>
+    <div class="priceRow">
+      <div class="pvp">P.V.P.</div>
+      <div class="price">${priceText}</div>
+    </div>
+  </div>
+</body>
+</html>`
+          : layoutMode === 'centered'
+          ? `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page { size: ${mmW}mm ${mmH}mm; margin: 0; }
+    html, body { width: ${mmW}mm; height: ${mmH}mm; margin: 0; padding: 0; }
+    body { font-family: Arial, Helvetica, sans-serif; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .wrap { box-sizing: border-box; width: 100%; height: 100%; padding: 3mm; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; }
+    .title { font-weight: 900; font-size: 26px; line-height: 1.05; letter-spacing: 0.5px; margin: 0 0 2mm 0; text-align:center; width:100%; }
+    .price { font-weight: 900; font-size: 26px; line-height: 1.0; margin: 0 0 2mm 0; text-align:center; width:100%; }
+    .pvp { font-weight: 900; font-size: 14px; margin-right: 6px; }
+    .barcode { width: 100%; flex: 1 1 auto; display:flex; align-items:flex-end; justify-content:center; }
+    svg { width: 92%; height: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">${titleText}</div>
+    <div class="price"><span class="pvp">P.V.P.</span>${priceText}</div>
+    <div class="barcode">${barcodeSvg}</div>
+  </div>
+</body>
+</html>`
+          : `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page { size: ${mmW}mm ${mmH}mm; margin: 0; }
+    html, body { width: ${mmW}mm; height: ${mmH}mm; margin: 0; padding: 0; }
+    body { font-family: Arial, Helvetica, sans-serif; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    body { display:flex; align-items:flex-start; justify-content:center; overflow:hidden; }
+    .wrap { box-sizing: border-box; width: 90%; height: 84%; margin: 1.5mm auto 0; border: 1px solid #111; padding: 1.4mm 1.6mm; }
+    .title { font-weight: 900; font-size: 10px; letter-spacing: 0.25px; margin: 0 0 0.8mm 0; }
+    .row { display: flex; gap: 1.5mm; align-items: center; height: calc(100% - 6mm); }
+    .left { flex: 1 1 52%; display: flex; align-items: center; justify-content: center; overflow:hidden; }
+    .right { flex: 1 1 48%; display: flex; flex-direction: column; justify-content: center; align-items: flex-end; }
+    .pvp { font-weight: 900; font-size: 8px; margin-bottom: 0.35mm; }
+    .price { font-weight: 900; font-size: 22px; line-height: 0.92; }
+    .ref { font-weight: 800; font-size: 8.5px; margin-top: 0.8mm; }
+    svg { width: 82%; height: auto; max-height: 100%; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">${titleText}</div>
+    <div class="row">
+      <div class="left">${barcodeSvg}</div>
+      <div class="right">
+        <div class="pvp">P.V.P.</div>
+        <div class="price">${priceText}</div>
+        <div class="ref">Ref: ${refText}</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+
+        const win = new BrowserWindow({
+          show: false,
+          webPreferences: {
+            sandbox: true,
+            contextIsolation: true,
+            nodeIntegration: false,
+          },
+        });
+
+        try {
+          const url = 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
+          await win.loadURL(url);
+
+          // Resolve the exact Electron printer name.
+          // On some platforms, webContents.print requires an exact deviceName
+          // (case-sensitive), otherwise it fails and we'd fall back to raw.
+          let resolvedDeviceName = null;
+          try {
+            const printers = await win.webContents.getPrintersAsync();
+            const wanted = String(printerName || '').trim().toLowerCase();
+            const match = (printers || []).find(p => String(p?.name || '').trim().toLowerCase() === wanted)
+              || (printers || []).find(p => String(p?.name || '').trim().toLowerCase().includes(wanted))
+              || null;
+            resolvedDeviceName = match ? String(match.name) : null;
+          } catch {
+            resolvedDeviceName = null;
+          }
+
+          const tryPrint = async ({ deviceName }) => {
+            const printOptions = {
+              silent: true,
+              landscape: false,
+              printBackground: true,
+              marginsType: 1,
+              pageSize: {
+                width: Math.max(1000, Math.round(mmW * 1000)),
+                height: Math.max(1000, Math.round(mmH * 1000))
+              },
+              ...(deviceName ? { deviceName } : {})
+            };
+
+            return await new Promise((resolve) => {
+              win.webContents.print(printOptions, (success, failureReason) => {
+                resolve({ success, failureReason });
+              });
+            });
+          };
+
+          // 1) Try with resolved device name (best)
+          // 2) Try with configured printerName (legacy)
+          // 3) Try without specifying a device (uses OS default)
+          const attempts = [
+            { label: 'resolved', deviceName: resolvedDeviceName },
+            { label: 'configured', deviceName: printerName },
+            { label: 'default', deviceName: null }
+          ];
+
+          let lastFailure = null;
+          for (const a of attempts) {
+            if (a.label !== 'default' && (!a.deviceName || !String(a.deviceName).trim())) continue;
+            const printed = await tryPrint({ deviceName: a.deviceName });
+            if (printed.success) {
+              return {
+                success: true,
+                message: `Barcode label sent to printer (html mode, ${a.label})`,
+                printerName,
+                deviceName: a.deviceName || null
+              };
+            }
+            lastFailure = { where: a.label, reason: String(printed.failureReason || 'Print failed') };
+          }
+
+          console.warn('HTML label print failed:', lastFailure);
+          if (labelPrintMode === 'html') {
+            return {
+              success: false,
+              error: String(lastFailure?.reason || 'Print failed'),
+              printerName,
+              deviceName: resolvedDeviceName || null
+            };
+          }
+          // auto mode: fall through to raw
+        } finally {
+          try { win.close(); } catch { /* ignore */ }
+        }
+      } catch (e) {
+        if (labelPrintMode === 'html') {
+          return { success: false, error: String(e?.message || e), printerName };
+        }
+        // auto mode: fall through to raw
+      }
+    }
+
+    // ESC/POS formatting (works for most 80mm thermal receipt printers and many label-capable ESC/POS devices).
+    // Note: Dedicated label printers may require ZPL/TSPL; this is a best-effort generic implementation.
+    const ESC = '\x1B';
+    const GS = '\x1D';
+
+    const colsEnv = Number(process.env.LABEL_COLS);
+    // 80mm ESC/POS printers are commonly 48 columns (Font A, 576 dots wide).
+    // Keep an env override for other paper widths / font configs.
+    const COLS = Number.isFinite(colsEnv) && colsEnv > 16 ? Math.floor(colsEnv) : 48;
+
+    // ESC t n (select character code table)
+    // Common choices:
+    // - 16 = WPC1252
+    // - 19 = PC858 (often includes €)
+    const cpEnv = Number(process.env.LABEL_CODEPAGE);
+    const CODEPAGE = Number.isFinite(cpEnv) ? Math.max(0, Math.min(255, Math.floor(cpEnv))) : 19;
+
+    const safeLine = (s, max = COLS) => {
+      const t = String(s || '').replace(/[\r\n\t\0]/g, ' ').trim();
+      return t.length > max ? t.slice(0, max) : t;
+    };
+
+    const padCenter = (s, width = COLS) => {
+      const t = String(s ?? '');
+      if (t.length >= width) return t.slice(0, width);
+      const left = Math.floor((width - t.length) / 2);
+      const right = width - t.length - left;
+      return ' '.repeat(left) + t + ' '.repeat(right);
+    };
+
+    const padLeft = (s, width = COLS) => {
+      const t = String(s ?? '');
+      return t.length >= width ? t.slice(0, width) : t + ' '.repeat(width - t.length);
+    };
+
+    const padRight = (s, width = COLS) => {
+      const t = String(s ?? '');
+      return t.length >= width ? t.slice(0, width) : ' '.repeat(width - t.length) + t;
+    };
+
+    // Note: We intentionally avoid absolute positioning for labels.
+    // Many ESC/POS printers behave inconsistently when mixing barcodes + ESC $ positioning.
+
+    // formatPrice defined above (shared with html mode)
+
+    // Choose barcode type
+    const isEAN13 = /^\d{13}$/.test(barcode);
+    const isUPCA = /^\d{12}$/.test(barcode);
+    const isEAN8 = /^\d{8}$/.test(barcode);
+
+    // Many low-cost ESC/POS printers support GS k "Function A" (m=0..6) but
+    // NOT the newer "Function B" (m=65..73). If bars don't print, this is
+    // usually the reason.
+    const forceFunctionB = String(process.env.LABEL_BARCODE_FORCE_FUNCTION_B || '').trim() === '1';
+    const forceFunctionA = String(process.env.LABEL_BARCODE_FORCE_FUNCTION_A || '').trim() === '1';
+
+    const barcodeType = isEAN13 ? 'EAN13' : (isUPCA ? 'UPCA' : (isEAN8 ? 'EAN8' : 'CODE39'));
+
+    // Function A modes:
+    // 0 = UPC-A, 2 = EAN13, 3 = EAN8, 4 = CODE39
+    const modeA = (barcodeType === 'EAN13') ? 2
+      : ((barcodeType === 'UPCA') ? 0
+      : ((barcodeType === 'EAN8') ? 3
+      : ((barcodeType === 'CODE39') ? 4 : null)));
+
+    // Function B modes:
+    // 65 = UPC-A, 67 = EAN13, 68 = EAN8, 73 = CODE128
+    // (We don't rely on CODE128 by default; some printers ignore it.)
+    const modeB = (barcodeType === 'EAN13') ? 67 : ((barcodeType === 'UPCA') ? 65 : ((barcodeType === 'EAN8') ? 68 : 73));
+
+    const getBarcodeDataForModeB = (mode) => {
+      // Compatibility-first: send full digits for EAN/UPC.
+      if (mode === 67 && /^\d{13}$/.test(barcode)) return barcode; // EAN13
+      if (mode === 65 && /^\d{12}$/.test(barcode)) return barcode; // UPC-A
+      if (mode === 68 && /^\d{8}$/.test(barcode)) return barcode;  // EAN8
+      if (mode === 73) return '{B' + barcode; // CODE128 subset B
+      return barcode;
+    };
+
+    const toCode39 = (raw) => {
+      // CODE39 supports: A-Z 0-9 space - . $ / + %
+      // Our internal barcodes are like POS-xxxxx-xxxxx; normalize to uppercase.
+      const upper = String(raw || '').toUpperCase();
+      // Replace unsupported chars with '-' (safe and readable)
+      return upper.replace(/[^A-Z0-9 \-\.\$\/\+%]/g, '-');
+    };
+
+    let label = '';
+    label += ESC + '@';
+    // Try to enable a code table that supports the Euro symbol.
+    label += ESC + 't' + String.fromCharCode(CODEPAGE);
+
+    const rawLayoutRaw = String(payload.labelLayout || process.env.LABEL_LAYOUT || 'compact').toLowerCase();
+    const rawLayout = rawLayoutRaw.replace(/[_\s]/g, '-');
+
+    if (rawLayout === 'centered') {
+      // Centered layout:
+      // 1) Product name (big)
+      // 2) Price (big)
+      // 3) Barcode (big)
+      label += ESC + 'a' + String.fromCharCode(1); // center
+
+      // Product name
+      label += ESC + 'E' + String.fromCharCode(1);
+      label += ESC + '!' + String.fromCharCode(0x10); // double height
+      label += safeLine(name.toUpperCase(), COLS) + '\n';
+      label += ESC + '!' + String.fromCharCode(0x00);
+      label += ESC + 'E' + String.fromCharCode(0);
+
+      // Price
+      if (hasPrice) {
+        label += ESC + 'E' + String.fromCharCode(1);
+        label += ESC + 'G' + String.fromCharCode(1);
+        label += ESC + '!' + String.fromCharCode(0x10); // double height
+        label += safeLine(`P.V.P. ${formatPrice(priceNum)}`, COLS) + '\n';
+        label += ESC + '!' + String.fromCharCode(0x00);
+        label += ESC + 'G' + String.fromCharCode(0);
+        label += ESC + 'E' + String.fromCharCode(0);
+      }
+
+      // Barcode (big)
+      const hEnv = Number(process.env.LABEL_BARCODE_HEIGHT);
+      const wEnv = Number(process.env.LABEL_BARCODE_WIDTH);
+      const barcodeHeight = Number.isFinite(hEnv) && hEnv >= 40 && hEnv <= 120 ? Math.floor(hEnv) : 80;
+      const barcodeWidth = Number.isFinite(wEnv) && wEnv >= 2 && wEnv <= 4 ? Math.floor(wEnv) : 3;
+
+      label += ESC + 'a' + String.fromCharCode(1); // center
+      label += GS + 'H' + String.fromCharCode(2); // HRI below
+      label += GS + 'f' + String.fromCharCode(0); // HRI font A
+      label += GS + 'h' + String.fromCharCode(barcodeHeight);
+      label += GS + 'w' + String.fromCharCode(barcodeWidth);
+      {
+        const shouldUseA = !forceFunctionB && (forceFunctionA || modeA !== null);
+
+        if (shouldUseA && modeA !== null) {
+          const dataA = (modeA === 4) ? toCode39(barcode) : barcode;
+          label += GS + 'k' + String.fromCharCode(modeA) + dataA + '\x00';
+        } else {
+          const data = getBarcodeDataForModeB(modeB);
+          label += GS + 'k' + String.fromCharCode(modeB) + String.fromCharCode(data.length) + data;
+        }
+      }
+
+      label += '\n';
+      label += ESC + 'a' + String.fromCharCode(0);
+    } else if (rawLayout === 'pvp-right' || rawLayout === 'pvpright') {
+      // Layout like sample 2:
+      // - Name centered
+      // - Barcode centered with digits below
+      // - P.V.P. + big price right-aligned at the bottom
+      label += ESC + 'a' + String.fromCharCode(1); // center
+
+      // Name
+      label += ESC + 'E' + String.fromCharCode(1);
+      label += ESC + '!' + String.fromCharCode(0x10); // double height
+      label += safeLine(name.toUpperCase(), COLS) + '\n';
+      label += ESC + '!' + String.fromCharCode(0x00);
+      label += ESC + 'E' + String.fromCharCode(0);
+
+      // Barcode (center + HRI below)
+      const hEnv = Number(process.env.LABEL_BARCODE_HEIGHT);
+      const wEnv = Number(process.env.LABEL_BARCODE_WIDTH);
+      const barcodeHeight = Number.isFinite(hEnv) && hEnv >= 40 && hEnv <= 120 ? Math.floor(hEnv) : 76;
+      const barcodeWidth = Number.isFinite(wEnv) && wEnv >= 2 && wEnv <= 4 ? Math.floor(wEnv) : 2;
+
+      label += ESC + 'a' + String.fromCharCode(1);
+      label += GS + 'H' + String.fromCharCode(2); // HRI below
+      label += GS + 'f' + String.fromCharCode(0); // HRI font A
+      label += GS + 'h' + String.fromCharCode(barcodeHeight);
+      label += GS + 'w' + String.fromCharCode(barcodeWidth);
+      {
+        const shouldUseA = !forceFunctionB && (forceFunctionA || modeA !== null);
+        if (shouldUseA && modeA !== null) {
+          const dataA = (modeA === 4) ? toCode39(barcode) : barcode;
+          label += GS + 'k' + String.fromCharCode(modeA) + dataA + '\x00';
+        } else {
+          const data = getBarcodeDataForModeB(modeB);
+          label += GS + 'k' + String.fromCharCode(modeB) + String.fromCharCode(data.length) + data;
+        }
+      }
+      label += '\n';
+
+      // P.V.P. + price (right, big)
+      if (hasPrice) {
+        label += ESC + 'a' + String.fromCharCode(2); // right
+        label += 'P.V.P.' + '\n';
+        label += ESC + 'E' + String.fromCharCode(1);
+        label += ESC + 'G' + String.fromCharCode(1);
+        label += ESC + '!' + String.fromCharCode(0x30); // double width + height
+        label += formatPrice(priceNum) + '\n';
+        label += ESC + '!' + String.fromCharCode(0x00);
+        label += ESC + 'G' + String.fromCharCode(0);
+        label += ESC + 'E' + String.fromCharCode(0);
+        label += ESC + 'a' + String.fromCharCode(0);
+      }
+    } else {
+      // Layout (compact, like sample 1):
+      // - Name top-left
+      // - Barcode on its own line
+      // - Price defaults to printing BESIDE the barcode (right side gap),
+      //   can be forced BELOW via LABEL_PRICE_LAYOUT=below
+      label += ESC + 'a' + String.fromCharCode(0); // left
+      // Bigger + bold product name
+      label += ESC + 'E' + String.fromCharCode(1); // emphasized
+      label += ESC + '!' + String.fromCharCode(0x10); // double height
+      label += safeLine(name.toUpperCase(), COLS) + '\n';
+      label += ESC + '!' + String.fromCharCode(0x00);
+      label += ESC + 'E' + String.fromCharCode(0);
+
+      const priceLayout = String(process.env.LABEL_PRICE_LAYOUT || 'beside').toLowerCase();
+      // "beside" is implemented in a printer-friendly way:
+      // we print the barcode bars, then on the next line print BARCODE (left) and P.V.P.+PRICE (right).
+      // This avoids unreliable attempts to print text in the same physical line as the barcode graphic.
+      const printPriceBesideBarcode = hasPrice && priceLayout !== 'below';
+
+      // Barcode (own line). Height/width can be overridden via env vars.
+      const hEnv = Number(process.env.LABEL_BARCODE_HEIGHT);
+      const wEnv = Number(process.env.LABEL_BARCODE_WIDTH);
+      const barcodeHeight = Number.isFinite(hEnv) && hEnv >= 40 && hEnv <= 120 ? Math.floor(hEnv) : 72;
+      const barcodeWidth = Number.isFinite(wEnv) && wEnv >= 2 && wEnv <= 4 ? Math.floor(wEnv) : 2;
+
+      label += ESC + 'a' + String.fromCharCode(0); // left
+      // HRI (barcode text) below tends to increase label height.
+      // For the side-price layout, we print our own barcode text on the next line.
+      label += GS + 'H' + String.fromCharCode(printPriceBesideBarcode ? 0 : 2); // HRI off (side) / below (legacy)
+      label += GS + 'f' + String.fromCharCode(0); // HRI font A
+      label += GS + 'h' + String.fromCharCode(barcodeHeight);
+      label += GS + 'w' + String.fromCharCode(barcodeWidth);
+      {
+        const shouldUseA = !forceFunctionB && (forceFunctionA || modeA !== null);
+
+        if (shouldUseA && modeA !== null) {
+          // Function A: GS k m d1..dk NUL
+          // Widely supported across ESC/POS printers.
+          const dataA = (modeA === 4) ? toCode39(barcode) : barcode;
+          label += GS + 'k' + String.fromCharCode(modeA) + dataA + '\x00';
+        } else {
+          // Function B: GS k m n d1..dn
+          const data = getBarcodeDataForModeB(modeB);
+          label += GS + 'k' + String.fromCharCode(modeB) + String.fromCharCode(data.length) + data;
+        }
+      }
+
+      if (printPriceBesideBarcode) {
+        // End the barcode line first.
+        label += '\n';
+
+        // Then print BARCODE (left) + P.V.P. PRICE (right) on the same line.
+        // This is much more consistent across ESC/POS printers than attempting to
+        // print text in the same physical line as the barcode graphic.
+        const humanBarcode = safeLine((modeA === 4) ? toCode39(barcode) : barcode, COLS);
+        const priceText = safeLine(`P.V.P. ${formatPrice(priceNum)}`, COLS);
+        const leftWidth = Math.max(1, COLS - priceText.length);
+        label += padLeft(humanBarcode, leftWidth) + priceText + '\n';
+        label += ESC + 'a' + String.fromCharCode(0);
+      } else {
+        // Legacy layout: end the barcode line first.
+        label += '\n';
+
+        if (hasPrice) {
+          // P.V.P. (right)
+          label += ESC + 'a' + String.fromCharCode(2);
+          label += 'P.V.P.' + '\n';
+
+          // Price (right, BIG + BOLD)
+          label += ESC + 'E' + String.fromCharCode(1); // emphasized (bold)
+          // Double-strike (darker/bolder) – supported by many ESC/POS printers
+          label += ESC + 'G' + String.fromCharCode(1);
+          label += ESC + '!' + String.fromCharCode(0x30); // double width + height
+          label += formatPrice(priceNum) + '\n';
+          label += ESC + '!' + String.fromCharCode(0x00);
+          label += ESC + 'G' + String.fromCharCode(0);
+          label += ESC + 'E' + String.fromCharCode(0);
+          label += ESC + 'a' + String.fromCharCode(0);
+        }
+      }
+    }
+
+    // Feed and cut
+    label += '\n\n';
+    label += GS + 'V' + String.fromCharCode(65) + String.fromCharCode(2);
+
+    const tempFile = path.join(app.getPath('temp'), 'barcode_' + Date.now() + '.txt');
+    const buf = safeEncode(label);
+    fs.writeFileSync(tempFile, buf);
+
+    try {
+      if (process.platform === 'win32') {
+        await sendRawFileToPrinterWindows(printerName, tempFile);
+      } else {
+        await execPromise(`lp -d "${printerName}" -o raw "${tempFile}"`);
+      }
+      try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch { /* ignore */ }
+      return { success: true, message: 'Barcode label sent to printer', printerName };
+    } catch (printError) {
+      try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch { /* ignore */ }
+      return { success: false, error: String(printError?.message || printError), printerName };
+    }
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1719,12 +2773,32 @@ ipcMain.handle('zreport:getSalesByDateRange', async (event, startDate, endDate, 
   return db.getSalesByDateRange(startDate, endDate, cashierId);
 });
 
+ipcMain.handle('zreport:getSalesByDateTimeRange', async (event, startDateTime, endDateTime, cashierId) => {
+  return db.getSalesByDateTimeRange(startDateTime, endDateTime, cashierId);
+});
+
 ipcMain.handle('zreport:getReturnsByDateRange', async (event, startDate, endDate, cashierId) => {
   return db.getReturnsByDateRange(startDate, endDate, cashierId);
 });
 
+ipcMain.handle('zreport:getReturnsByDateTimeRange', async (event, startDateTime, endDateTime, cashierId) => {
+  return db.getReturnsByDateTimeRange(startDateTime, endDateTime, cashierId);
+});
+
 ipcMain.handle('zreport:getLoanPaymentsByDateRange', async (event, startDate, endDate, cashierId) => {
   return db.getLoanPaymentsByDateRange(startDate, endDate, cashierId);
+});
+
+ipcMain.handle('zreport:getLoanPaymentsByDateTimeRange', async (event, startDateTime, endDateTime, cashierId) => {
+  return db.getLoanPaymentsByDateTimeRange(startDateTime, endDateTime, cashierId);
+});
+
+ipcMain.handle('zreport:getLoanPaymentsDetailedByDateTimeRange', async (event, startDateTime, endDateTime, cashierId) => {
+  return db.getLoanPaymentsDetailedByDateTimeRange(startDateTime, endDateTime, cashierId);
+});
+
+ipcMain.handle('zreport:getMonthlySalesActualTotals', async () => {
+  return db.getMonthlySalesActualTotals();
 });
 
 // System Settings handlers
@@ -1743,6 +2817,101 @@ ipcMain.handle('settings:update', async (event, settings) => {
     // ignore
   }
   return updated;
+});
+
+// Database backup/restore (offline safe)
+ipcMain.handle('db:backup', async () => {
+  try {
+    const defaultName = `pos_database_backup_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.db`;
+    const dbPath = getDatabasePath();
+
+    const save = await dialog.showSaveDialog(mainWindow, {
+      title: 'Backup Database',
+      defaultPath: path.join(app.getPath('documents'), defaultName),
+      filters: [
+        { name: 'SQLite Database', extensions: ['db'] },
+        { name: 'All Files', extensions: ['*'] }
+      ]
+    });
+
+    if (save.canceled || !save.filePath) {
+      return { success: false, canceled: true };
+    }
+
+    // Prefer live SQLite backup when available
+    if (db && typeof db.backupTo === 'function') {
+      await db.backupTo(save.filePath);
+    } else {
+      fs.copyFileSync(dbPath, save.filePath);
+    }
+
+    return { success: true, path: save.filePath };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('db:restore', async () => {
+  try {
+    const open = await dialog.showOpenDialog(mainWindow, {
+      title: 'Restore Database Backup',
+      properties: ['openFile'],
+      filters: [
+        { name: 'SQLite Database', extensions: ['db'] },
+        { name: 'All Files', extensions: ['*'] }
+      ]
+    });
+
+    if (open.canceled || !open.filePaths?.length) {
+      return { success: false, canceled: true };
+    }
+
+    const selectedPath = open.filePaths[0];
+    const confirm = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Restore'],
+      defaultId: 1,
+      cancelId: 0,
+      title: 'Restore Database',
+      message: 'Restoring will replace the current database. The app will restart after restore. Continue?'
+    });
+
+    if (confirm.response !== 1) {
+      return { success: false, canceled: true };
+    }
+
+    const dbPath = getDatabasePath();
+
+    // Close DB before replacing
+    try { db?.close?.(); } catch { /* ignore */ }
+
+    // Replace DB file
+    fs.copyFileSync(selectedPath, dbPath);
+
+    // Clean up WAL/SHM if present
+    try { fs.rmSync(dbPath + '-wal', { force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(dbPath + '-shm', { force: true }); } catch { /* ignore */ }
+
+    // Relaunch to re-open with restored DB
+    app.relaunch();
+    app.exit(0);
+
+    return { success: true, restored: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// Clear transactional test data (keeps products/users/settings)
+ipcMain.handle('db:clearTestData', async () => {
+  try {
+    if (!db || typeof db.clearTestData !== 'function') {
+      return { success: false, error: 'Clear test data is not available in this build.' };
+    }
+    return db.clearTestData();
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 });
 
 // Category handlers
@@ -1806,6 +2975,7 @@ ipcMain.handle('subcategories:delete', async (event, id) => {
 // ========== SCALE FUNCTIONS ==========
 // List available serial ports
 ipcMain.handle('scale:listPorts', async () => {
+  if (!SCALE_ENABLED) return [];
   if (!SerialPort) {
     console.warn('Serial port not available');
     return [];
@@ -1829,6 +2999,7 @@ ipcMain.handle('scale:listPorts', async () => {
 // Diagnostic: report whether SerialPort loaded and why not.
 ipcMain.handle('scale:moduleStatus', async () => {
   return {
+    scaleEnabled: SCALE_ENABLED,
     serialportAvailable: !!SerialPort,
     serialportError: serialPortLoadError
       ? {
@@ -1856,6 +3027,9 @@ ipcMain.handle('scale:moduleStatus', async () => {
 
 // Connect to scale
 ipcMain.handle('scale:connect', async (event, portPath) => {
+  if (!SCALE_ENABLED) {
+    return { success: false, message: 'Scale is disabled in this barcode-only build (set SCALE_ENABLED=1 to enable).' };
+  }
   if (!SerialPort) {
     throw new Error('SerialPort module not available. Scale features are disabled.');
   }
@@ -1885,6 +3059,9 @@ let lastScaleAutoScanAt = 0;
 let lastScaleAutoScanResult = null;
 
 ipcMain.handle('scale:readWeight', async () => {
+  if (!SCALE_ENABLED) {
+    return { success: false, message: 'Scale is disabled (barcode-only mode).' };
+  }
   // If we recently received streaming data, return immediately.
   if (scalePort && scalePort.isOpen && typeof scaleState.lastWeightKg === 'number') {
     const ageMs = Date.now() - (scaleState.lastUpdatedAt || 0);
@@ -2143,6 +3320,18 @@ ipcMain.handle('scale:readWeight', async () => {
 // Disconnect scale
 ipcMain.handle('scale:disconnect', async () => {
   try {
+    if (!SCALE_ENABLED) {
+      // No-op cleanup for barcode-only mode.
+      scalePort = null;
+      scaleParser = null;
+      scaleState.portPath = null;
+      scaleState.config = null;
+      scaleState.lastWeightKg = null;
+      scaleState.lastRawText = '';
+      scaleState.lastUpdatedAt = 0;
+      scaleState.lastError = null;
+      return { success: true };
+    }
     if (scalePort && scalePort.isOpen) {
       await new Promise((resolve) => {
         scalePort.close((err) => {
@@ -2173,6 +3362,9 @@ ipcMain.handle('scale:disconnect', async () => {
 
 // Initialize customer display
 async function initializeCustomerDisplay() {
+  if (!isVfdCustomerDisplayEnabled()) {
+    return false;
+  }
   if (!customerDisplay) {
     customerDisplay = new CustomerDisplay();
   }
@@ -2202,6 +3394,9 @@ async function initializeCustomerDisplay() {
 }
 
 async function ensureCustomerDisplayConnected(force = false) {
+  if (!isVfdCustomerDisplayEnabled()) {
+    return false;
+  }
   if (!customerDisplay) {
     customerDisplay = new CustomerDisplay();
     customerDisplay.onPreviewLines = (payload) => {
@@ -2242,6 +3437,9 @@ async function ensureCustomerDisplayConnected(force = false) {
 // Customer display IPC handlers
 ipcMain.handle('customerDisplay:initialize', async () => {
   try {
+    if (!isVfdCustomerDisplayEnabled()) {
+      return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
+    }
     customerDisplayLastInitAttemptAt = Date.now();
     const success = await initializeCustomerDisplay();
     return { success, message: success ? 'Customer display initialized' : 'Failed to initialize customer display' };
@@ -2268,6 +3466,10 @@ ipcMain.handle('customerDisplay:showWelcome', async () => {
     const preview = customerDisplay.formatWelcomeLines();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('customerDisplay:previewLines', { ...preview, maxChars: customerDisplay.displaySize?.chars || 20 });
+    }
+
+    if (!isVfdCustomerDisplayEnabled()) {
+      return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
     }
 
     const connected = await ensureCustomerDisplayConnected();
@@ -2301,6 +3503,10 @@ ipcMain.handle('customerDisplay:showItem', async (event, { itemName, price, curr
     const preview = customerDisplay.formatCurrentItemLines(itemName, price, currencySymbol, quantity, unitPrice, unit);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('customerDisplay:previewLines', { ...preview, maxChars: customerDisplay.displaySize?.chars || 20 });
+    }
+
+    if (!isVfdCustomerDisplayEnabled()) {
+      return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
     }
 
     const connected = await ensureCustomerDisplayConnected();
@@ -2358,6 +3564,10 @@ ipcMain.handle('customerDisplay:showTotal', async (event, { total, currencySymbo
       mainWindow.webContents.send('customerDisplay:previewLines', { ...preview, maxChars: customerDisplay.displaySize?.chars || 20 });
     }
 
+    if (!isVfdCustomerDisplayEnabled()) {
+      return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
+    }
+
     const connected = await ensureCustomerDisplayConnected();
     if (!connected) {
       return { success: false, message: 'Customer display not connected (preview shown)' };
@@ -2371,6 +3581,9 @@ ipcMain.handle('customerDisplay:showTotal', async (event, { total, currencySymbo
 });
 
 ipcMain.handle('customerDisplay:showChange', async (event, { changeAmount, currencySymbol }) => {
+  if (!isVfdCustomerDisplayEnabled()) {
+    return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
+  }
   const connected = await ensureCustomerDisplayConnected();
   if (!connected) {
     return { success: false, message: 'Customer display not connected' };
@@ -2385,6 +3598,9 @@ ipcMain.handle('customerDisplay:showChange', async (event, { changeAmount, curre
 });
 
 ipcMain.handle('customerDisplay:showPaymentSummary', async (event, { total, paid, change, currencySymbol }) => {
+  if (!isVfdCustomerDisplayEnabled()) {
+    return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
+  }
   const connected = await ensureCustomerDisplayConnected();
   if (!connected) {
     return { success: false, message: 'Customer display not connected' };
@@ -2402,6 +3618,9 @@ ipcMain.handle('customerDisplay:showPaymentSummary', async (event, { total, paid
 });
 
 ipcMain.handle('customerDisplay:showPayment', async (event, { paymentMethod }) => {
+  if (!isVfdCustomerDisplayEnabled()) {
+    return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
+  }
   const connected = await ensureCustomerDisplayConnected();
   if (!connected) {
     return { success: false, message: 'Customer display not connected' };
@@ -2416,6 +3635,9 @@ ipcMain.handle('customerDisplay:showPayment', async (event, { paymentMethod }) =
 });
 
 ipcMain.handle('customerDisplay:showThankYou', async (event, { changeAmount, currencySymbol }) => {
+  if (!isVfdCustomerDisplayEnabled()) {
+    return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
+  }
   const connected = await ensureCustomerDisplayConnected();
   if (!connected) {
     return { success: false, message: 'Customer display not connected' };
@@ -2430,6 +3652,9 @@ ipcMain.handle('customerDisplay:showThankYou', async (event, { changeAmount, cur
 });
 
 ipcMain.handle('customerDisplay:clear', async () => {
+  if (!isVfdCustomerDisplayEnabled()) {
+    return { success: true, skipped: true, message: 'Hardware customer display disabled (monitor mode)' };
+  }
   const connected = await ensureCustomerDisplayConnected();
   if (!connected) {
     return { success: false, message: 'Customer display not connected' };
