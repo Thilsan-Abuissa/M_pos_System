@@ -2801,6 +2801,10 @@ ipcMain.handle('zreport:getMonthlySalesActualTotals', async () => {
   return db.getMonthlySalesActualTotals();
 });
 
+ipcMain.handle('zreport:getDailySalesActualTotals', async (event, yearMonth) => {
+  return db.getDailySalesActualTotals(yearMonth);
+});
+
 // System Settings handlers
 ipcMain.handle('settings:get', async () => {
   return db.getSystemSettings();
@@ -2817,6 +2821,10 @@ ipcMain.handle('settings:update', async (event, settings) => {
     // ignore
   }
   return updated;
+});
+
+ipcMain.handle('settings:setDeveloperPin', async (event, pin) => {
+  return db.setDeveloperPin(pin);
 });
 
 // Database backup/restore (offline safe)

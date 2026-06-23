@@ -934,6 +934,15 @@ class POSDatabase {
       }
     }
 
+    // Developer PIN for accessing System Settings
+    try {
+      this.db.prepare("ALTER TABLE system_settings ADD COLUMN developer_pin TEXT DEFAULT '1234'").run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding developer_pin column:', error);
+      }
+    }
+
     // Don't create default users - let setup wizard handle it
     // System will check if any admin exists, if not show setup wizard
 
@@ -2659,6 +2668,26 @@ class POSDatabase {
     }
   }
 
+  getDailySalesActualTotals(yearMonth) {
+    try {
+      return this.db.prepare(`
+        SELECT
+          strftime('%Y-%m-%d', sale_date) AS day,
+          COALESCE(SUM(CASE WHEN payment_method != 'loan' THEN total ELSE 0 END), 0) AS total,
+          COALESCE(SUM(CASE WHEN payment_method = 'cash'  THEN total ELSE 0 END), 0) AS cash,
+          COALESCE(SUM(CASE WHEN payment_method = 'card'  THEN total ELSE 0 END), 0) AS card,
+          COUNT(CASE WHEN payment_method != 'loan' THEN 1 END) AS sale_count
+        FROM sales
+        WHERE strftime('%Y-%m', sale_date) = ?
+        GROUP BY strftime('%Y-%m-%d', sale_date)
+        ORDER BY day ASC
+      `).all(yearMonth);
+    } catch (e) {
+      console.error('getDailySalesActualTotals error:', e);
+      return [];
+    }
+  }
+
   getSalesByDateRange(startDate, endDate, cashierId = null) {
     let query = `
       SELECT s.*,
@@ -2805,6 +2834,11 @@ class POSDatabase {
       settings.customerDisplayPort || null
     );
     return this.getSystemSettings();
+  }
+
+  setDeveloperPin(pin) {
+    this.db.prepare('UPDATE system_settings SET developer_pin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1').run(String(pin));
+    return { success: true };
   }
 
   setCustomerDisplayPort(portPath) {

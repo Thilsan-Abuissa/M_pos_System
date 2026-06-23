@@ -1,4 +1,5 @@
 // Global state
+let _currentView = 'checkout'; // Tracks the last active view
 let currentUser = null;
 let cart = [];
 let allProducts = [];
@@ -2308,6 +2309,94 @@ function logoutToLoginScreen() {
   loadUserRoles();
 }
 
+// ============== DEVELOPER PIN ==============
+let _devPinCallback = null;
+let _devPinValue = '';
+let _devPinPrevView = 'checkout';
+
+function showDeveloperPinPrompt(onSuccess) {
+  _devPinCallback = onSuccess;
+  _devPinPrevView = _currentView;
+  _devPinValue = '';
+  _devPinUpdateDisplay();
+  document.getElementById('devPinError').textContent = '';
+  const overlay = document.getElementById('devPinOverlay');
+  overlay.style.display = 'flex';
+}
+
+function devPinKey(key) {
+  if (key === 'back') {
+    _devPinValue = _devPinValue.slice(0, -1);
+  } else {
+    if (_devPinValue.length >= 8) return;
+    _devPinValue += key;
+  }
+  document.getElementById('devPinError').textContent = '';
+  _devPinUpdateDisplay();
+}
+
+function _devPinUpdateDisplay() {
+  const el = document.getElementById('devPinDisplay');
+  el.textContent = _devPinValue ? '●'.repeat(_devPinValue.length) : '​';
+}
+
+async function devPinConfirm() {
+  if (!_devPinValue) return;
+  try {
+    const settings = await window.api.getSystemSettings();
+    const storedPin = String(settings?.developer_pin || '1234');
+    if (_devPinValue === storedPin) {
+      document.getElementById('devPinOverlay').style.display = 'none';
+      if (typeof _devPinCallback === 'function') _devPinCallback();
+      _devPinCallback = null;
+    } else {
+      document.getElementById('devPinError').textContent = 'Incorrect PIN. Try again.';
+      _devPinValue = '';
+      _devPinUpdateDisplay();
+    }
+  } catch {
+    document.getElementById('devPinError').textContent = 'Error checking PIN.';
+  }
+}
+
+function devPinCancel() {
+  // The view was never switched (PIN is checked before any DOM change),
+  // so cancelling just closes the overlay and stays on the current page.
+  document.getElementById('devPinOverlay').style.display = 'none';
+  _devPinCallback = null;
+  _devPinValue = '';
+}
+
+// Switches the active view DOM + nav button and loads its data.
+function _activateView(view) {
+  const navBtns = document.querySelectorAll('.tab-btn');
+  navBtns.forEach(b => b.classList.remove('active'));
+  const targetBtn = document.querySelector(`[data-view="${view}"]`);
+  if (targetBtn) targetBtn.classList.add('active');
+
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  const el = document.getElementById(`${view}View`);
+  if (el) el.classList.add('active');
+
+  toggleNavbarForView(view);
+  loadViewData(view);
+}
+
+async function saveDeveloperPin() {
+  const input = document.getElementById('developerPinNew');
+  const pin = (input?.value || '').trim();
+  if (!pin) { alert('Please enter a new PIN.'); return; }
+  if (!/^\d+$/.test(pin)) { alert('PIN must contain digits only.'); return; }
+  if (pin.length < 4) { alert('PIN must be at least 4 digits.'); return; }
+  try {
+    await window.api.setDeveloperPin(pin);
+    input.value = '';
+    alert('Developer PIN updated successfully.');
+  } catch (e) {
+    alert('Error saving PIN: ' + e.message);
+  }
+}
+
 // ============== ROLE-BASED UI ==============
 function setupRoleBasedUI() {
   const userRole = currentUser.role;
@@ -2436,18 +2525,14 @@ function navigateToView(view) {
       return;
     }
 
-    // Update active nav button if it exists.
-    const navBtns = document.querySelectorAll('.tab-btn');
-    navBtns.forEach(b => b.classList.remove('active'));
-    const navBtn = document.querySelector(`.tab-btn[data-view="${view}"]`);
-    if (navBtn) navBtn.classList.add('active');
+    // Always require PIN for system view — never touch DOM until confirmed
+    if (view === 'system') {
+      showDeveloperPinPrompt(() => _activateView('system'));
+      return;
+    }
 
-    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-    const el = document.getElementById(`${view}View`);
-    if (el) el.classList.add('active');
-
-    toggleNavbarForView(view);
-    loadViewData(view);
+    _currentView = view;
+    _activateView(view);
   } catch {
     // ignore
   }
@@ -2787,20 +2872,15 @@ function setupNavigationHandlers() {
         showAlert('You do not have permission to access this section.', 'warning', 'Access Denied');
         return;
       }
-      
-      // Update active nav button
-      navBtns.forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      
-      // Show corresponding view
-      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-      document.getElementById(`${view}View`).classList.add('active');
-      
-      // Toggle navbar visibility based on view
-      toggleNavbarForView(view);
-      
-      // Load view data
-      loadViewData(view);
+
+      // System: require developer PIN every time before showing the page
+      if (view === 'system') {
+        showDeveloperPinPrompt(() => _activateView('system'));
+        return;
+      }
+
+      _currentView = view;
+      _activateView(view);
     });
   });
   
@@ -2864,24 +2944,14 @@ function setupNavigationHandlers() {
           openArqueoOverlay();
           return;
         }
-        
-        // Update active nav button
-        const navBtns = document.querySelectorAll('.tab-btn');
-        navBtns.forEach(b => b.classList.remove('active'));
-        const targetBtn = document.querySelector(`[data-view="${view}"]`);
-        if (targetBtn) {
-          targetBtn.classList.add('active');
+
+        // System: require developer PIN every time before showing the page
+        if (view === 'system') {
+          showDeveloperPinPrompt(() => _activateView('system'));
+          return;
         }
-        
-        // Show corresponding view
-        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-        document.getElementById(`${view}View`).classList.add('active');
-        
-        // Toggle navbar visibility based on view
-        toggleNavbarForView(view);
-        
-        // Load view data
-        loadViewData(view);
+
+        _activateView(view);
       });
     });
   }
@@ -2916,26 +2986,24 @@ function setupNavigationHandlers() {
     settingsMenuItems.forEach(item => {
       item.addEventListener('click', () => {
         const view = item.dataset.view;
-        
+
         // Check permission
         if (!hasPermission(view)) {
           alert('You do not have permission to access this section.');
           settingsMenu.classList.remove('active');
           return;
         }
-        
-        // Show corresponding view
-        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-        document.getElementById(`${view}View`).classList.add('active');
-        
-        // Toggle navbar visibility based on view
-        toggleNavbarForView(view);
-        
-        // Load view data
-        loadViewData(view);
-        
+
         // Close menu
         settingsMenu.classList.remove('active');
+
+        // System: require developer PIN every time before showing the page
+        if (view === 'system') {
+          showDeveloperPinPrompt(() => _activateView('system'));
+          return;
+        }
+
+        _activateView(view);
       });
     });
   }
@@ -2959,11 +3027,18 @@ const CO_PANEL_TITLES = {
 let _coPanelViewEl = null;
 let _coPanelViewParent = null;
 
-function openCoPanel(view) {
+function openCoPanel(view, pinConfirmed = false) {
   if (!hasPermission(view)) {
     showAlert('You do not have permission to access this section.', 'warning', 'Access Denied');
     return;
   }
+
+  // System: require developer PIN every time before opening the panel
+  if (view === 'system' && !pinConfirmed) {
+    showDeveloperPinPrompt(() => openCoPanel('system', true));
+    return;
+  }
+
   const panel   = document.getElementById('coPanel');
   const content = document.getElementById('coPanelContent');
   const titleEl = document.getElementById('coPanelTitle');
@@ -3250,6 +3325,16 @@ function setupCheckoutHandlers() {
   if (noteBtn) {
     noteBtn.addEventListener('click', () => {
       openNoteModal();
+    });
+  }
+
+  // Add VARIOS button handler: take the amount typed on the numpad and add a
+  // generic "Varios" line to the cart at that price.
+  const variosBtn = document.getElementById('variosBtn');
+  if (variosBtn && !variosBtn.dataset.listenerAttached) {
+    variosBtn.dataset.listenerAttached = '1';
+    variosBtn.addEventListener('click', () => {
+      addVariosToCart();
     });
   }
 
@@ -5895,6 +5980,185 @@ function openProductWeightFlow(productId, options = {}) {
       // ignore
     }
   }, 0);
+}
+
+// Prompt the cashier for the Varios price. Returns a positive number or null.
+function promptForVariosPrice() {
+  return new Promise((res) => {
+    const existingPrompt = document.getElementById('variosPromptOverlay');
+    if (existingPrompt) existingPrompt.remove();
+
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+
+    const o = document.createElement('div');
+    o.id = 'variosPromptOverlay';
+    o.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'background:rgba(15, 23, 42, 0.55)',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'padding:24px',
+      'z-index:10070'
+    ].join(';');
+
+    const c = document.createElement('div');
+    c.style.cssText = [
+      'width:min(460px, 94vw)',
+      'background:#fff',
+      'border-radius:20px',
+      'box-shadow:0 22px 70px rgba(0,0,0,0.35)',
+      'border:1px solid rgba(148,163,184,0.55)',
+      'padding:18px 18px 16px 18px',
+      'font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial'
+    ].join(';');
+
+    c.innerHTML = `
+      <div style="font-size:18px; font-weight:950; color:#0f172a;">Varios</div>
+      <div style="font-size:14px; color:#64748b; margin-top:4px;">Introduzca el importe</div>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:12px;">
+        <div style="font-weight:950; color:#334155; font-size:20px;">${currencySymbol}</div>
+        <input id="variosPromptInput" type="text" inputmode="decimal" readonly placeholder="0.00" style="flex:1; padding:14px 14px; border-radius:14px; border:2px solid #cbd5e1; font-size:24px; font-weight:900; color:#0f172a; text-align:right; background:#f8fafc;" />
+      </div>
+      <div class="modal-numpad-grid" id="variosNumpad" style="margin-top:12px;">
+        <button type="button" class="modal-numpad-btn" data-value="1">1</button>
+        <button type="button" class="modal-numpad-btn" data-value="2">2</button>
+        <button type="button" class="modal-numpad-btn" data-value="3">3</button>
+        <button type="button" class="modal-numpad-btn modal-numpad-back" data-value="back">⌫</button>
+        <button type="button" class="modal-numpad-btn" data-value="4">4</button>
+        <button type="button" class="modal-numpad-btn" data-value="5">5</button>
+        <button type="button" class="modal-numpad-btn" data-value="6">6</button>
+        <button type="button" class="modal-numpad-btn modal-numpad-clear" data-value="clear">CLEAR</button>
+        <button type="button" class="modal-numpad-btn" data-value="7">7</button>
+        <button type="button" class="modal-numpad-btn" data-value="8">8</button>
+        <button type="button" class="modal-numpad-btn" data-value="9">9</button>
+        <button type="button" class="modal-numpad-btn modal-numpad-dot" data-value=".">.</button>
+        <button type="button" class="modal-numpad-btn" data-value="00">00</button>
+        <button type="button" class="modal-numpad-btn" data-value="0">0</button>
+        <button type="button" class="modal-numpad-btn" data-value="000">000</button>
+      </div>
+      <div style="display:flex; gap:12px; margin-top:14px;">
+        <button id="variosPromptCancel" style="flex:1; border:none; border-radius:16px; padding:12px 10px; font-size:16px; font-weight:900; background:#e2e8f0; color:#0f172a;">Cancelar</button>
+        <button id="variosPromptOk" style="flex:1; border:none; border-radius:16px; padding:12px 10px; font-size:16px; font-weight:900; background:linear-gradient(135deg,#0891b2,#06b6d4); color:#fff;">Añadir</button>
+      </div>
+    `;
+
+    o.appendChild(c);
+    document.body.appendChild(o);
+
+    const inp = document.getElementById('variosPromptInput');
+
+    const closePrompt = (val = null) => {
+      try { o.remove(); } catch { /* ignore */ }
+      res(val);
+    };
+
+    const parsePrice = (value) => {
+      const v = String(value || '').trim().replace(',', '.');
+      const n = parseFloat(v);
+      if (!Number.isFinite(n) || n <= 0) return null;
+      return n;
+    };
+
+    const submit = () => closePrompt(parsePrice(inp?.value));
+
+    // On-screen keypad input.
+    const applyKey = (val) => {
+      let cur = String(inp?.value || '');
+      if (val === 'clear') {
+        cur = '';
+      } else if (val === 'back') {
+        cur = cur.slice(0, -1);
+      } else if (val === '.') {
+        if (!cur.includes('.')) cur = cur === '' ? '0.' : cur + '.';
+      } else {
+        // digit groups: 0-9, 00, 000
+        cur += val;
+      }
+      if (inp) inp.value = cur;
+    };
+
+    document.getElementById('variosNumpad')?.addEventListener('click', (e) => {
+      const btn = e.target?.closest?.('.modal-numpad-btn');
+      if (!btn) return;
+      applyKey(btn.dataset.value);
+    });
+
+    o.addEventListener('click', (e) => {
+      if (e.target === o) closePrompt(null);
+    });
+    document.getElementById('variosPromptCancel')?.addEventListener('click', () => closePrompt(null), { once: true });
+    document.getElementById('variosPromptOk')?.addEventListener('click', submit, { once: true });
+
+    // Allow a physical keyboard / numeric keypad too.
+    document.addEventListener('keydown', function variosKeyHandler(e) {
+      if (!document.getElementById('variosPromptOverlay')) {
+        document.removeEventListener('keydown', variosKeyHandler);
+        return;
+      }
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); closePrompt(null); }
+      else if (e.key === 'Backspace') { e.preventDefault(); applyKey('back'); }
+      else if (e.key === '.' || e.key === ',') { e.preventDefault(); applyKey('.'); }
+      else if (/^[0-9]$/.test(e.key)) { e.preventDefault(); applyKey(e.key); }
+    });
+  });
+}
+
+// Add a generic "Varios" (miscellaneous) line to the cart at the given price.
+// There is no real product behind it: productId 0 is a sentinel (FK is not
+// enforced at runtime and the stock-decrement on a non-existent id is a
+// harmless no-op), and the receipt / sale records show the name "Varios".
+function addVariosLine(price) {
+  const unitPriceCents = moneyToCents(price);
+  const cartItem = {
+    productId: 0,
+    productName: 'Varios',
+    unitPriceCents,
+    unitPrice: centsToMoney(unitPriceCents),
+    taxRate: 0,
+    quantity: 1,
+    quantityGrams: null,
+    subtotalCents: unitPriceCents,
+    subtotal: centsToMoney(unitPriceCents),
+    isWeightBased: false,
+    cartItemId: Date.now(),
+    discountPercent: 0
+  };
+  cart.unshift(cartItem); // Add to beginning (most recent first)
+
+  // Track undo action so DESHACER removes the Varios line just added.
+  setLastScanUndoAction({ type: 'add', cartItemId: cartItem.cartItemId });
+
+  updateCartDisplay();
+  updateCustomerDisplayData();
+}
+
+// VARIOS button: use the amount already typed on the numpad if there is one,
+// otherwise ask for the price. Either way a "Varios" line is added to the cart.
+async function addVariosToCart() {
+  hideCashierPaymentSummaryOverlay();
+
+  const paymentInput = document.getElementById('paymentInput');
+  const raw = paymentInput ? String(paymentInput.value || '').trim() : '';
+  const typed = parseFloat(raw);
+
+  if (raw && Number.isFinite(typed) && typed > 0) {
+    // Clear the numpad amount (and pending buffer) now that it's been consumed.
+    if (typeof setupCheckoutHandlers._clearNumpadPending === 'function') {
+      setupCheckoutHandlers._clearNumpadPending();
+    } else if (paymentInput) {
+      paymentInput.value = '';
+    }
+    addVariosLine(typed);
+    return;
+  }
+
+  // Nothing usable typed: prompt for the price.
+  const price = await promptForVariosPrice();
+  if (price === null) return; // cancelled
+  addVariosLine(price);
 }
 
 function addToCart(productId, weight = null, customPrice = null, isWeightBased = false) {
@@ -17904,7 +18168,7 @@ document.addEventListener('DOMContentLoaded', () => {
     en: {
       item: 'ITEM', price: 'PRICE', qty: 'QTY', discount: 'DISCOUNT', total: 'TOTAL',
       subtotal: 'Subtotal', tax: 'Tax', payment: 'PAYMENT',
-      drawer: 'DRAWER', deleteAll: 'DELETE ALL', undo: 'UNDO', note: 'NOTE',
+      drawer: 'DRAWER', deleteAll: 'DELETE ALL', undo: 'UNDO', note: 'NOTE', varios: 'VARIOS',
       clear: 'CLEAR', ticket: 'TICKET',
       searchProduct: 'Search Product...',
       products: 'Products', barcodes: 'Barcodes', sales: 'Sales', returns: 'Returns',
@@ -17915,7 +18179,7 @@ document.addEventListener('DOMContentLoaded', () => {
     es: {
       item: 'ARTÍCULO', price: 'PRECIO', qty: 'CANT.', discount: 'DESCUENTO', total: 'TOTAL',
       subtotal: 'Subtotal', tax: 'IVA', payment: 'PAGO',
-      drawer: 'CAJÓN', deleteAll: 'BORRAR TODO', undo: 'DESHACER', note: 'NOTA',
+      drawer: 'CAJÓN', deleteAll: 'BORRAR TODO', undo: 'DESHACER', note: 'NOTA', varios: 'VARIOS',
       clear: 'BORRAR', ticket: 'TICKET',
       searchProduct: 'Buscar Producto...',
       products: 'Productos', barcodes: 'Códigos', sales: 'Ventas', returns: 'Devoluciones',
@@ -17977,7 +18241,7 @@ let _skipZReportModalOpen = false; // prevents old modal from flashing
 let _arqueoPeriod = 'today';      // current period selection
 
 // ── Pagination state ────────────────────────────────────────────────────────
-const _ARQUEO_PAGE_SIZE = 10;     // rows per page
+const _ARQUEO_PAGE_SIZE = 20;     // rows per page
 let _arqueoPageData    = [];      // full dataset for current list view
 let _arqueoPageCurrent = 1;       // current page (1-based)
 let _arqueoPageRenderer = null;   // function(rows) that renders one page of rows
@@ -18278,6 +18542,69 @@ function _arqueoShowMonthList(rows, titleLabel, cs) {
   _arqueoRenderPage();
 }
 
+/** Render day list (one row per day of selected month) */
+function _arqueoShowDayList(rows, titleLabel, cs) {
+  _arqueoShowListPanel();
+  const titleEl   = document.getElementById('arqueoListTitle');
+  const totalEl   = document.getElementById('arqueoListTotal');
+  const summaryEl = document.getElementById('arqueoListSummary');
+  if (titleEl) titleEl.textContent = titleLabel;
+
+  const grandTotal = rows.reduce((s,r) => s + r.total, 0);
+  const grandCash  = rows.reduce((s,r) => s + r.cash,  0);
+  const grandCard  = rows.reduce((s,r) => s + r.card,  0);
+  if (totalEl) totalEl.textContent = `TOTAL: ${cs}${grandTotal.toFixed(2)}`;
+
+  _arqueoPageData     = rows;
+  _arqueoPageCurrent  = 1;
+  _arqueoPageRenderer = (slice) => {
+    const bodyEl = document.getElementById('arqueoListBody');
+    if (!bodyEl) return;
+    if (!slice.length) {
+      bodyEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#64748b;">No hay días</td></tr>`;
+      return;
+    }
+    slice.forEach((row, i) => {
+      const hasSales = row.total > 0;
+      const bg = i % 2 === 0 ? '#ffffff' : '#f0f6fb';
+      const totalColor = hasSales ? '#059669' : '#94a3b8';
+      const tr = document.createElement('tr');
+      tr.style.cssText = `background:${bg}; cursor:pointer; transition:background .15s;`;
+      tr.onmouseenter = () => { tr.style.background = '#d0f0e0'; };
+      tr.onmouseleave = () => { tr.style.background = bg; };
+      tr.innerHTML = `
+        <td style="padding:10px 10px;color:#0f2130;font-weight:${hasSales?'800':'400'};font-size:13px;border-bottom:1px solid #cdd9e5;">📅 ${row.label}</td>
+        <td style="padding:10px 8px;text-align:center;color:#475569;border-bottom:1px solid #cdd9e5;">${row.count}</td>
+        <td style="padding:10px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">${row.label.substring(0,10)}</td>
+        <td style="padding:10px 8px;color:#334155;border-bottom:1px solid #cdd9e5;">${row.label.substring(0,10)}</td>
+        <td style="padding:10px 8px;text-align:right;color:${totalColor};font-weight:${hasSales?'900':'400'};border-bottom:1px solid #cdd9e5;">${cs}${row.total.toFixed(2)}</td>
+      `;
+      tr.onclick = () => _arqueoDrillDay(row, cs);
+      bodyEl.appendChild(tr);
+    });
+  };
+  _arqueoPageSummaryFn = () => {
+    if (summaryEl) summaryEl.innerHTML = `
+      <div style="display:flex;justify-content:space-between;padding:2px 0;">
+        <span style="font-weight:700;color:#fff;">DÍAS CON VENTAS: ${rows.filter(r=>r.total>0).length}</span>
+        <span style="font-weight:700;color:#fff;">CONTADO: ${cs}${grandCash.toFixed(2)}</span>
+        <span style="font-weight:700;color:#fff;">TARJETA: ${cs}${grandCard.toFixed(2)}</span>
+        <span style="font-weight:900;color:#2ecc71;">TOTAL: ${cs}${grandTotal.toFixed(2)}</span>
+      </div>`;
+  };
+  _arqueoRenderPage();
+}
+
+function arqueoLoadDayRange() { _arqueoComputeAndRender(); }
+
+/** Click a day row → show full consolidated receipt for that day */
+async function _arqueoDrillDay(dayRow, cs) {
+  const start = dayRow.key;
+  const end   = dayRow.key;
+  const label = dayRow.label;
+  await _arqueoLoadRangeReceipt(start, end, label);
+}
+
 /** Drill from year row → show all months in that year */
 /** Click a year row → show full consolidated receipt for that year */
 async function _arqueoDrillYear(yearRow, cs) {
@@ -18438,6 +18765,61 @@ async function _arqueoComputeAndRender() {
   const cs  = systemSettings?.currency_symbol || '€';
   const tz  = getDisplayTimeZone();
   const toYmd = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(d);
+
+  // ── DÍA: one row per day for the selected month ──────────────────────────
+  if (_arqueoPeriod === 'day') {
+    const dayMonthInp = document.getElementById('arqueoDayMonthInput');
+    const ym = dayMonthInp?.value || (() => {
+      const tz = getDisplayTimeZone();
+      const now = new Date();
+      const yyyy = new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric'}).format(now);
+      const mm   = new Intl.DateTimeFormat('en-CA',{timeZone:tz,month:'2-digit'}).format(now);
+      return `${yyyy}-${mm}`;
+    })();
+
+    const [y, m] = ym.split('-').map(Number);
+    const daysInMonth = new Date(y, m, 0).getDate();
+
+    // Fetch actual daily sales totals
+    let actualDayMap = {};
+    try {
+      const actualRows = await window.api.getDailySalesActualTotals(ym);
+      (actualRows || []).forEach(r => { actualDayMap[r.day] = r; });
+    } catch (e) {
+      console.warn('Could not fetch daily sales totals:', e);
+    }
+
+    // Group saved Z-reports by day
+    const zGroups = {};
+    _arqueoAllReports.forEach(r => {
+      try {
+        const raw = r.end_datetime || r.report_date || '';
+        const d   = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z');
+        const ymd = toYmd(d);
+        if (ymd.slice(0,7) !== ym) return;
+        if (!zGroups[ymd]) zGroups[ymd] = [];
+        zGroups[ymd].push(r);
+      } catch {}
+    });
+
+    // Build one row per day of the month
+    const rows = [];
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dd  = String(d).padStart(2,'0');
+      const mm  = String(m).padStart(2,'0');
+      const key = `${y}-${mm}-${dd}`;
+      const actual = actualDayMap[key];
+      const reps   = zGroups[key] || [];
+      const total  = actual ? Number(actual.total) || 0 : reps.reduce((s,r) => s + (Number(r.total_sales_amount)||0), 0);
+      const cash   = actual ? Number(actual.cash)  || 0 : reps.reduce((s,r) => s + (Number(r.cash_sales)||0), 0);
+      const card   = actual ? Number(actual.card)  || 0 : reps.reduce((s,r) => s + (Number(r.card_sales)||0), 0);
+      rows.push({ key, label: `${dd}/${mm}/${y}`, count: reps.length, total, cash, card, reports: reps });
+    }
+
+    const monthLabel = new Intl.DateTimeFormat('es-ES',{month:'long',year:'numeric'}).format(new Date(y,m-1,1)).toUpperCase();
+    _arqueoShowDayList(rows, `CAJA PRINCIPAL  —  ${monthLabel}`, cs);
+    return;
+  }
 
   // ── MENSUAL: one row per month that has Z-reports or actual sales ────────
   if (_arqueoPeriod === 'month') {
@@ -18618,12 +19000,14 @@ async function arqueoSetPeriod(period) {
   _arqueoHighlightPeriod(period);
 
   // Show/hide pickers
-  const customDiv  = document.getElementById('arqueoCustomRange');
-  const monthDiv   = document.getElementById('arqueoMonthPicker');
-  const yearDiv    = document.getElementById('arqueoYearPicker');
-  if (customDiv) customDiv.style.display = period === 'custom'  ? 'flex' : 'none';
-  if (monthDiv)  monthDiv.style.display  = period === 'month'   ? 'block' : 'none';
-  if (yearDiv)   yearDiv.style.display   = period === 'year'    ? 'block' : 'none';
+  const customDiv    = document.getElementById('arqueoCustomRange');
+  const monthDiv     = document.getElementById('arqueoMonthPicker');
+  const yearDiv      = document.getElementById('arqueoYearPicker');
+  const dayMonthDiv  = document.getElementById('arqueoDayMonthPicker');
+  if (customDiv)   customDiv.style.display   = period === 'custom' ? 'flex'  : 'none';
+  if (monthDiv)    monthDiv.style.display    = period === 'month'  ? 'block' : 'none';
+  if (yearDiv)     yearDiv.style.display     = period === 'year'   ? 'block' : 'none';
+  if (dayMonthDiv) dayMonthDiv.style.display = period === 'day'    ? 'block' : 'none';
 
   // For month/year: auto-load immediately with current picker value
   if (period === 'month') {
@@ -18653,6 +19037,18 @@ async function arqueoSetPeriod(period) {
     await _arqueoComputeAndRender();
     return;
   }
+  if (period === 'day') {
+    const dayMonthInp = document.getElementById('arqueoDayMonthInput');
+    if (!dayMonthInp?.value) {
+      const tz = getDisplayTimeZone();
+      const now = new Date();
+      const yyyy = new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric'}).format(now);
+      const mm   = new Intl.DateTimeFormat('en-CA',{timeZone:tz,month:'2-digit'}).format(now);
+      if (dayMonthInp) dayMonthInp.value = `${yyyy}-${mm}`;
+    }
+    await _arqueoComputeAndRender();
+    return;
+  }
   if (period === 'custom') return; // wait for user
 
   await _arqueoComputeAndRender();
@@ -18663,8 +19059,8 @@ function arqueoLoadMonthRange()  { _arqueoComputeAndRender(); }
 function arqueoLoadYearRange()   { _arqueoComputeAndRender(); }
 
 function _arqueoHighlightPeriod(period) {
-  const ids = ['arqueoPeriodHoy','arqueoPeriodAyer','arqueoPeriodMensual','arqueoPeriodTrimestre','arqueoPeriodAnual','arqueoPeriodCustom'];
-  const map  = { today:'arqueoPeriodHoy', yesterday:'arqueoPeriodAyer', month:'arqueoPeriodMensual', quarter:'arqueoPeriodTrimestre', year:'arqueoPeriodAnual', custom:'arqueoPeriodCustom' };
+  const ids = ['arqueoPeriodHoy','arqueoPeriodAyer','arqueoPeriodDia','arqueoPeriodMensual','arqueoPeriodTrimestre','arqueoPeriodAnual','arqueoPeriodCustom'];
+  const map  = { today:'arqueoPeriodHoy', yesterday:'arqueoPeriodAyer', day:'arqueoPeriodDia', month:'arqueoPeriodMensual', quarter:'arqueoPeriodTrimestre', year:'arqueoPeriodAnual', custom:'arqueoPeriodCustom' };
   ids.forEach(id => {
     const btn = document.getElementById(id);
     if (!btn) return;

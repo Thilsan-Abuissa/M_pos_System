@@ -948,7 +948,7 @@ body {
 
 .checkout-container {
   display: grid;
-  grid-template-columns: 40% 60%;
+  grid-template-columns: 47% 53%;
   gap: 0;
   height: 100vh;
   background: #dce6f0;
@@ -1288,7 +1288,7 @@ body {
 /* Action Buttons Row (Drawer, Delete All, Undo, Note) */
 .action-btns-row {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 6px;
 }
 
@@ -1336,11 +1336,13 @@ body {
 .action-btn--delete  { background: #f97316 !important; border-bottom: 3px solid #c2560e !important; }
 .action-btn--undo    { background: #ef4444 !important; border-bottom: 3px solid #b91c1c !important; }
 .action-btn--note    { background: #7c3aed !important; border-bottom: 3px solid #5b21b6 !important; }
+.action-btn--varios  { background: #0891b2 !important; border-bottom: 3px solid #0e7490 !important; }
 
 .action-btn--drawer:disabled  { background: #e8960a !important; border-bottom: 3px solid #c47c08 !important; opacity: 0.35 !important; }
 .action-btn--delete:disabled  { background: #f97316 !important; border-bottom: 3px solid #c2560e !important; opacity: 0.35 !important; }
 .action-btn--undo:disabled    { background: #ef4444 !important; border-bottom: 3px solid #b91c1c !important; opacity: 0.35 !important; }
 .action-btn--note:disabled    { background: #7c3aed !important; border-bottom: 3px solid #5b21b6 !important; opacity: 0.35 !important; }
+.action-btn--varios:disabled  { background: #0891b2 !important; border-bottom: 3px solid #0e7490 !important; opacity: 0.35 !important; }
 
 /* Numpad button overrides for CLEAR, TICKET, PAYMENT */
 .numpad-clear {
@@ -3750,7 +3752,7 @@ button {
 /* ============== RESPONSIVE ============== */
 @media (max-width: 1600px) {
   .checkout-container {
-    grid-template-columns: 40% 60%;
+    grid-template-columns: 47% 53%;
   }
 }
 

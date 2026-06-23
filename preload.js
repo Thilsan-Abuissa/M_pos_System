@@ -84,10 +84,12 @@ contextBridge.exposeInMainWorld('api', {
   getLoanPaymentsByDateTimeRange: (startDateTime, endDateTime, cashierId) => ipcRenderer.invoke('zreport:getLoanPaymentsByDateTimeRange', startDateTime, endDateTime, cashierId),
   getLoanPaymentsDetailedByDateTimeRange: (startDateTime, endDateTime, cashierId) => ipcRenderer.invoke('zreport:getLoanPaymentsDetailedByDateTimeRange', startDateTime, endDateTime, cashierId),
   getMonthlySalesActualTotals: () => ipcRenderer.invoke('zreport:getMonthlySalesActualTotals'),
+  getDailySalesActualTotals: (yearMonth) => ipcRenderer.invoke('zreport:getDailySalesActualTotals', yearMonth),
 
   // System Settings
   getSystemSettings: () => ipcRenderer.invoke('settings:get'),
   updateSystemSettings: (settings) => ipcRenderer.invoke('settings:update', settings),
+  setDeveloperPin: (pin) => ipcRenderer.invoke('settings:setDeveloperPin', pin),
 
   // Printing
   printBarcodeLabel: (barcodeData) => ipcRenderer.invoke('printer:printBarcode', barcodeData),
