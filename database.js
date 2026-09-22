@@ -972,6 +972,40 @@ class POSDatabase {
     } catch (error) {
       console.error('Error seeding vat_rates:', error);
     }
+
+    // Ensure a real "Varios" (miscellaneous) placeholder product exists.
+    // sale_items.product_id is NOT NULL with a FOREIGN KEY to products(id),
+    // so the "Varios" cart line (a manually-priced, no-real-product line item)
+    // needs an actual products row to point to instead of a fake sentinel id.
+    try {
+      this.ensureVariosProduct();
+    } catch (error) {
+      console.error('Error ensuring Varios placeholder product:', error);
+    }
+  }
+
+  // Internal reserved barcode used to find/create the "Varios" placeholder product.
+  static get VARIOS_BARCODE() {
+    return '__INTERNAL_VARIOS__';
+  }
+
+  ensureVariosProduct() {
+    const existing = this.db.prepare('SELECT id FROM products WHERE barcode = ?').get(POSDatabase.VARIOS_BARCODE);
+    if (existing?.id) return existing.id;
+
+    // is_archived = 1 keeps this internal row out of the admin Products list,
+    // exports, and reports (all of which filter on is_archived = 0) while
+    // still being a valid, queryable products.id for the FK constraint.
+    const stmt = this.db.prepare(`
+      INSERT INTO products (barcode, name, category, show_in_checkout, is_archived, price, stock, tax_rate, purchase_tax_rate)
+      VALUES (?, 'Varios', '', 0, 1, 0, 0, 0, 0)
+    `);
+    const result = stmt.run(POSDatabase.VARIOS_BARCODE);
+    return result.lastInsertRowid;
+  }
+
+  getVariosProductId() {
+    return this.ensureVariosProduct();
   }
 
   // VAT rates operations
@@ -2895,8 +2929,17 @@ class POSDatabase {
   }
 
   deleteCategory(id) {
-    const stmt = this.db.prepare('DELETE FROM categories WHERE id = ?');
-    stmt.run(id);
+    const run = this.db.transaction(() => {
+      const category = this.db.prepare('SELECT name FROM categories WHERE id = ?').get(id);
+      if (category?.name) {
+        // Products keep a free-text category name (not a foreign key), so a deleted
+        // category would otherwise keep showing up as a checkout tab via leftover
+        // product.category text. Clear it back to uncategorized.
+        this.db.prepare('UPDATE products SET category = ? WHERE category = ?').run('', category.name);
+      }
+      this.db.prepare('DELETE FROM categories WHERE id = ?').run(id);
+    });
+    run();
     return { success: true };
   }
 

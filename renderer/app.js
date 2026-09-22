@@ -127,9 +127,9 @@ function setupGlobalBarcodeScannerCapture() {
   }, true);
 }
 
-// This workspace is now configured for barcode-only POS (no scale/weight flow).
-// Keep the legacy weight code paths for backward compatibility, but do not invoke them.
-const POS_DISABLE_SCALE_AND_WEIGHT = true;
+// Set to true for barcode-only POS (no scale/weight flow).
+// When false, products with unit_type 'weight' open the weight/scale modal at checkout.
+const POS_DISABLE_SCALE_AND_WEIGHT = false;
 
 // Checkout: Undo last scan (either remove last added line, or revert a quantity-increase).
 let lastScanUndoAction = null;
@@ -774,10 +774,11 @@ function fillVatSelect(selectEl, options, selectedPct) {
     .map(v => Math.round(Number(v)))
     .filter(v => Number.isFinite(v) && v >= 0 && v <= 100);
 
+  // "Add VAT" is a separate + button (see attachVatAddHandler), not a dropdown option:
+  // as the last option it sat right over the Save button and was easy to hit by accident.
   selectEl.innerHTML = safeOptions
     .map(pct => `<option value="${pct}" ${pct === selected ? 'selected' : ''}>${pct}%</option>`)
-    .join('')
-    + '<option value="__add__">+ Add VAT…</option>';
+    .join('');
 
   // Ensure a valid value is selected
   if (!safeOptions.includes(selected)) {
@@ -791,14 +792,24 @@ function attachVatAddHandler(selectEl, { onAdded } = {}) {
   if (selectEl.dataset.vatAddAttached === '1') return;
   selectEl.dataset.vatAddAttached = '1';
 
-  selectEl.addEventListener('change', async () => {
-    const v = String(selectEl.value || '');
-    if (v !== '__add__') return;
+  // Put the select and a small "+" button side by side.
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex; gap:8px; align-items:stretch;';
+  selectEl.parentNode.insertBefore(row, selectEl);
+  row.appendChild(selectEl);
+  selectEl.style.flex = '1';
+  selectEl.style.minWidth = '0';
 
-    // Reset to first valid option while prompting
-    const firstOpt = Array.from(selectEl.options || []).find(o => o && o.value !== '__add__');
-    if (firstOpt) selectEl.value = String(firstOpt.value);
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'btn-secondary';
+  addBtn.textContent = '+';
+  addBtn.title = 'Add VAT';
+  addBtn.setAttribute('aria-label', 'Add VAT');
+  addBtn.style.cssText = 'flex:0 0 auto; min-width:48px; padding:0 14px; font-size:22px; font-weight:800; line-height:1;';
+  row.appendChild(addBtn);
 
+  addBtn.addEventListener('click', async () => {
     const pct = await promptForVatPercent();
     if (pct === null) return;
     if (!Number.isFinite(pct)) {
@@ -3376,6 +3387,7 @@ function setupCheckoutHandlers() {
 
   // Quick products reorder toggle
   setupQuickProductsReorderToggle();
+  setupCheckoutScanEditToggle();
 }
 
 function setupPaymentModal() {
@@ -3565,11 +3577,11 @@ function setupPaymentModal() {
       const paidAmount = Number.isFinite(paid) ? paid : 0;
       const remaining = Math.max(0, total - paidAmount);
       if (paidAmount > 0 && remaining > 0.009) {
-        paymentRemainingAmount.style.display = 'block';
+        paymentRemainingAmount.style.visibility = 'visible';
         remainingValue.textContent = (systemSettings?.currency_symbol || '€') + remaining.toFixed(2);
         remainingValue.style.color = '#dc2626';
       } else {
-        paymentRemainingAmount.style.display = 'none';
+        paymentRemainingAmount.style.visibility = 'hidden';
       }
     }
 
@@ -3646,7 +3658,7 @@ function updatePaymentModalValidation() {
     // Single payment mode
     if (!selectedPaymentMethod) {
       checkoutBtnModal.disabled = true;
-      if (paymentRemainingAmount) paymentRemainingAmount.style.display = 'none';
+      if (paymentRemainingAmount) paymentRemainingAmount.style.visibility = 'hidden';
       return;
     }
 
@@ -3662,17 +3674,17 @@ function updatePaymentModalValidation() {
 
       if (paymentRemainingAmount && remainingValue) {
         if (hasPaidValue && paid > 0 && remaining > 0.009) {
-          paymentRemainingAmount.style.display = 'block';
+          paymentRemainingAmount.style.visibility = 'visible';
           remainingValue.textContent = currencySymbol + remaining.toFixed(2);
           remainingValue.style.color = '#dc2626';
         } else {
-          paymentRemainingAmount.style.display = 'none';
+          paymentRemainingAmount.style.visibility = 'hidden';
         }
       }
     } else {
       // CARD / PARKING: always exact, no remaining
       checkoutBtnModal.disabled = false;
-      if (paymentRemainingAmount) paymentRemainingAmount.style.display = 'none';
+      if (paymentRemainingAmount) paymentRemainingAmount.style.visibility = 'hidden';
     }
   } else {
     // Split payment mode - validate amounts
@@ -3691,9 +3703,9 @@ function updatePaymentModalValidation() {
     // Show remaining amount
     if (paymentRemainingAmount && remainingValue) {
       if (totalPaid > 0) {
-        paymentRemainingAmount.style.display = 'block';
+        paymentRemainingAmount.style.visibility = 'visible';
         remainingValue.textContent = currencySymbol + remaining.toFixed(2);
-        
+
         if (remaining > 0.01) {
           remainingValue.style.color = '#dc2626'; // Red for remaining
         } else if (remaining < -0.01) {
@@ -3702,7 +3714,7 @@ function updatePaymentModalValidation() {
           remainingValue.style.color = '#059669'; // Green for exact
         }
       } else {
-        paymentRemainingAmount.style.display = 'none';
+        paymentRemainingAmount.style.visibility = 'hidden';
       }
     }
     
@@ -4208,6 +4220,9 @@ async function hydrateQuickProductImages(productIds) {
 let selectedCategory = 'all';
 let selectedSubcategory = '';
 let quickProductsReorderMode = false;
+// When ON, scanning a known product's barcode at checkout opens its Edit modal
+// instead of adding it to the cart. Stays ON until the cashier turns it off.
+let checkoutScanEditMode = false;
 
 function isProductEnabledForCheckout(product) {
   // Backward compatible: older DBs may not have the column yet.
@@ -4408,10 +4423,8 @@ async function displayQuickProducts(searchQuery = '', category = null, subcatego
       }
     }
     
-    const outOfStock = !(Number(product.stock) > 0);
-
     return `
-      <div class="quick-product-card${outOfStock ? ' out-of-stock' : ''}" data-product-id="${product.id}" aria-disabled="${outOfStock ? 'true' : 'false'}">
+      <div class="quick-product-card" data-product-id="${product.id}">
         <div class="product-image" data-product-id="${product.id}" data-hydrate="${shouldHydrate ? '1' : '0'}">${imageHtml}</div>
         <div class="name">${product.name}</div>
         ${amountInfo}
@@ -4820,6 +4833,37 @@ function ensureQuickProductsReorderHandlers() {
   container.addEventListener('pointercancel', onPointerUpOrCancel);
 }
 
+function setupCheckoutScanEditToggle() {
+  const btn = document.getElementById('toggleEditScanBtn');
+  if (!btn || btn.dataset.listenerAttached === '1') return;
+  btn.dataset.listenerAttached = '1';
+
+  const searchInput = document.querySelector('#checkoutView #productSearch');
+
+  const render = () => {
+    if (checkoutScanEditMode) {
+      btn.classList.add('active');
+      btn.textContent = 'EDIT: ON';
+      if (searchInput) searchInput.placeholder = 'Scan barcode to EDIT product...';
+    } else {
+      btn.classList.remove('active');
+      btn.textContent = 'EDIT';
+      if (searchInput) searchInput.placeholder = 'Search Product...';
+    }
+  };
+
+  btn.addEventListener('click', () => {
+    if (!hasPermission('products')) {
+      showAlert('Access Denied: You do not have permission to edit products', 'error', 'Access Denied');
+      return;
+    }
+    checkoutScanEditMode = !checkoutScanEditMode;
+    render();
+  });
+
+  render();
+}
+
 function setupQuickProductsReorderToggle() {
   const btn = document.getElementById('toggleReorderBtn');
   if (!btn || btn.dataset.listenerAttached === '1') return;
@@ -4966,8 +5010,8 @@ function handleDoubleClick(productId) {
     return;
   }
   
-  // Open edit modal
-  editProduct(productId);
+  // Checkout: only the price can be edited here
+  editProduct(productId, { priceOnly: true });
 }
 
 // ============== WEIGHT PROMPT ==============
@@ -5039,6 +5083,59 @@ function promptForWeight(productId) {
   // Unit price used to derive totals when weight/qty changes.
   // When the user edits the total price field, we update this.
   let lockedUnitPrice = product.price;
+
+  // Zero-price products (e.g. "Varios peso"): the cashier types the unit price
+  // on a dial keypad while the item is on the scale. Total = unit price x weight.
+  const isZeroPriceProduct = !(Number(product.price) > 0);
+  const unitPriceGroup = document.getElementById('weightUnitPriceGroup');
+  const unitPriceInput = document.getElementById('weightUnitPriceInput');
+  const unitPriceLabel = document.getElementById('weightUnitPriceLabel');
+  const unitPriceBackspace = document.getElementById('weightUnitPriceBackspace');
+  const unitPriceDialpad = document.getElementById('weightUnitPriceDialpad');
+
+  function getTypedUnitPrice() {
+    const n = parseFloat(String(unitPriceInput?.value || '').replace(',', '.'));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  // Unit price to use when (re)entering a mode: the typed one for zero-price products.
+  function getBaseUnitPrice() {
+    return isZeroPriceProduct ? getTypedUnitPrice() : product.price;
+  }
+
+  function applyUnitPriceKey(key) {
+    if (!unitPriceInput) return;
+    let v = String(unitPriceInput.value || '');
+    if (key === 'clear') v = '';
+    else if (key === 'backspace') v = v.slice(0, -1);
+    else if (key === 'dot') {
+      if (v.includes('.')) return;
+      v = v ? v + '.' : '0.';
+    } else if (/^\d$/.test(key)) {
+      const dot = v.indexOf('.');
+      if (dot >= 0 && v.length - dot > 2) return; // max 2 decimals
+      v = (v === '0') ? key : v + key;
+    } else {
+      return;
+    }
+    unitPriceInput.value = v;
+    lockedUnitPrice = getTypedUnitPrice();
+    // Let the total follow the new unit price even if the total field had focus.
+    try { if (document.activeElement === priceInput) priceInput.blur(); } catch { /* ignore */ }
+    updateDisplayedTotal();
+  }
+
+  if (unitPriceGroup) unitPriceGroup.style.display = isZeroPriceProduct ? 'block' : 'none';
+  modal.classList.toggle('zero-price', isZeroPriceProduct);
+  if (unitPriceInput) unitPriceInput.value = '';
+  // Assign (not addEventListener): these elements are static and this function runs on every open.
+  if (unitPriceDialpad) {
+    unitPriceDialpad.onclick = (e) => {
+      const btn = e.target?.closest?.('.dial-btn');
+      if (btn) applyUnitPriceKey(String(btn.dataset.key || ''));
+    };
+  }
+  if (unitPriceBackspace) unitPriceBackspace.onclick = () => applyUnitPriceKey('backspace');
 
   function getEnteredUnitPrice() {
     const rawText = (priceInput.value || '').toString().trim();
@@ -5121,7 +5218,8 @@ function promptForWeight(productId) {
   // Function to update UI based on mode
   function updateModeUI() {
     if (isWeightBased) {
-      lockedUnitPrice = product.price;
+      lockedUnitPrice = getBaseUnitPrice();
+      if (unitPriceLabel) unitPriceLabel.textContent = `Price per kg (${currencySymbol})`;
       modalTitle.textContent = 'Enter Weight';
       weightUnit = 'kg';
       weightInputLabel.textContent = 'Weight (kg)';
@@ -5131,20 +5229,21 @@ function promptForWeight(productId) {
       if (document.activeElement !== priceInput) {
         priceInput.value = '0.00';
       }
-      productPriceEl.innerHTML = `${currencySymbol}${product.price.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}0.00</strong>`;
+      productPriceEl.innerHTML = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/kg<br><strong style="color: #10b981; font-size: 18px;">Total: ${currencySymbol}0.00</strong>`;
       // Live scale reading: hide the manual re-read button.
       scaleButtonContainer.style.display = 'none';
       weightModeBtn.style.background = '#6E8FAF';
       quantityModeBtn.style.background = '#94a3b8';
       weightInput.value = '0.000 kg';
     } else {
-      lockedUnitPrice = product.price;
+      lockedUnitPrice = getBaseUnitPrice();
+      if (unitPriceLabel) unitPriceLabel.textContent = `Price per piece (${currencySymbol})`;
       modalTitle.textContent = 'Enter Quantity';
       weightInputLabel.textContent = 'Quantity (pieces)';
       weightInput.placeholder = 'Enter quantity';
       priceInputLabel.textContent = `Total Price (${currencySymbol})`;
       priceInput.placeholder = 'Total price';
-      productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/piece`;
+      productPriceEl.textContent = `${currencySymbol}${lockedUnitPrice.toFixed(2)}/piece`;
       scaleButtonContainer.style.display = 'none';
       weightModeBtn.style.background = '#94a3b8';
       quantityModeBtn.style.background = '#6E8FAF';
@@ -5470,14 +5569,6 @@ function promptForWeight(productId) {
 
 
     
-    if (amountNum > product.stock) {
-      console.log('Not enough stock');
-      const unit = isWeightBased ? 'kg' : 'pieces';
-      showAlert(`Only ${product.stock} ${unit} available in stock`, 'warning', 'Stock Limit');
-      isSubmitting = false;
-      return;
-    }
-    
     // Validate total price and derive unit price
     const totalPriceNum = parseFloat(customPrice.replace(',', '.'));
     if (isNaN(totalPriceNum) || totalPriceNum <= 0) {
@@ -5604,11 +5695,6 @@ function editCartWeight(productId) {
       return;
     }
     
-    if (weightNum > product.stock + cartItem.quantity) {
-      showAlert(`Only ${(product.stock + cartItem.quantity).toFixed(2)} kg available in stock`, 'warning', 'Stock Limit');
-      return;
-    }
-    
     // Update the cart item weight
     cartItem.quantity = weightNum;
     cartItem.subtotal = weightNum * cartItem.unitPrice;
@@ -5722,6 +5808,16 @@ async function searchAndAddProduct(query) {
       if (product && product.id) {
         // Ensure cache has this product (scan can happen before loadAllProducts finishes)
         cacheProductRecord(product);
+
+        if (checkoutScanEditMode) {
+          if (!hasPermission('products')) {
+            showAlert('Access Denied: You do not have permission to edit products', 'error', 'Access Denied');
+            return;
+          }
+          await editProduct(product.id, { priceOnly: true });
+          return;
+        }
+
         openProductWeightFlow(product.id);
         return;
       }
@@ -5775,6 +5871,12 @@ function openProductWeightFlow(productId, options = {}) {
       // ignore
     }
   };
+
+  // Weight products: open the weight/scale modal (live scale reading, editable total price).
+  if (!POS_DISABLE_SCALE_AND_WEIGHT && product.unit_type === 'weight') {
+    promptForWeight(productId);
+    return;
+  }
 
   // Normal products: each scan/click adds 1 piece.
   if (!(Number(product.price) <= 0)) {
@@ -6106,14 +6208,35 @@ function promptForVariosPrice() {
   });
 }
 
+// Cached id of the hidden internal "Varios" placeholder product row (see
+// database.js ensureVariosProduct). sale_items.product_id is NOT NULL with a
+// FOREIGN KEY to products(id), so Varios lines must point at a real row.
+let variosProductId = null;
+async function getVariosProductId() {
+  if (Number.isFinite(variosProductId) && variosProductId > 0) return variosProductId;
+  try {
+    const id = Number(await window.api.getVariosProductId());
+    if (Number.isFinite(id) && id > 0) variosProductId = id;
+  } catch {
+    // ignore
+  }
+  return variosProductId;
+}
+
 // Add a generic "Varios" (miscellaneous) line to the cart at the given price.
-// There is no real product behind it: productId 0 is a sentinel (FK is not
-// enforced at runtime and the stock-decrement on a non-existent id is a
-// harmless no-op), and the receipt / sale records show the name "Varios".
-function addVariosLine(price) {
+// There is no real product behind it beyond the hidden internal placeholder
+// row (see getVariosProductId above); the receipt / sale records show the
+// name "Varios" regardless of the underlying product row's own name.
+async function addVariosLine(price) {
+  const variosId = await getVariosProductId();
+  if (!variosId) {
+    showAlert('Could not add Varios line (internal product missing)', 'error', 'Error');
+    return;
+  }
+
   const unitPriceCents = moneyToCents(price);
   const cartItem = {
-    productId: 0,
+    productId: variosId,
     productName: 'Varios',
     unitPriceCents,
     unitPrice: centsToMoney(unitPriceCents),
@@ -6151,14 +6274,14 @@ async function addVariosToCart() {
     } else if (paymentInput) {
       paymentInput.value = '';
     }
-    addVariosLine(typed);
+    await addVariosLine(typed);
     return;
   }
 
   // Nothing usable typed: prompt for the price.
   const price = await promptForVariosPrice();
   if (price === null) return; // cancelled
-  addVariosLine(price);
+  await addVariosLine(price);
 }
 
 function addToCart(productId, weight = null, customPrice = null, isWeightBased = false) {
@@ -6176,23 +6299,12 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
     return;
   }
   
-  if (product.stock <= 0) {
-    showAlert('Product out of stock', 'warning', 'Out of Stock');
-    return;
-  }
-  
   // Default quantity is 1 (kg or pc) if not provided
   const finalQuantity = weight !== null ? weight : 1.0;
   // Use custom price if provided, otherwise use product price
   const finalPrice = customPrice !== null ? customPrice : product.price;
   debugLog('>>> CALCULATED: Final quantity:', finalQuantity, 'Final price:', finalPrice);
-  
-  if (finalQuantity > product.stock) {
-    const unitLabel = isWeightBased ? 'kg' : (product.quantity_unit || 'pieces');
-    showAlert(`Only ${product.stock} ${unitLabel} available in stock`, 'warning', 'Stock Limit');
-    return;
-  }
-  
+
   // Calculate exact line subtotal in cents (avoid float drift)
   const unitPriceCents = moneyToCents(finalPrice);
   const quantityGrams = isWeightBased ? kgToGrams(finalQuantity) : null;
@@ -6207,7 +6319,6 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
   const parkingCtx = getParkingPaymentContext();
   const canMerge = !parkingCtx
     && !isWeightBased
-    && POS_DISABLE_SCALE_AND_WEIGHT
     && Number.isFinite(normalizedQty)
     && normalizedQty > 0;
 
@@ -6232,12 +6343,6 @@ function addToCart(productId, weight = null, customPrice = null, isWeightBased =
         showAlert('Invalid quantity', 'error', 'Error');
         return;
       }
-      if (nextQty > product.stock) {
-        const unitLabel = product.quantity_unit || 'pieces';
-        showAlert(`Only ${product.stock} ${unitLabel} available in stock`, 'warning', 'Stock Limit');
-        return;
-      }
-
       target.quantity = nextQty;
       target.quantityGrams = null;
       try { recalcCartItemMoney(target); } catch { /* ignore */ }
@@ -6306,7 +6411,7 @@ function updateCartQuantity(productId, change) {
   
   if (newQuantity <= 0) {
     removeFromCart(item.cartItemId);
-  } else if (newQuantity <= product.stock) {
+  } else {
     item.quantity = newQuantity;
     if (item.isWeightBased) {
       item.quantityGrams = kgToGrams(item.quantity);
@@ -6314,8 +6419,6 @@ function updateCartQuantity(productId, change) {
     }
     recalcCartItemMoney(item);
     updateCartDisplay();
-  } else {
-    alert('Not enough stock available');
   }
 }
 
@@ -6504,23 +6607,11 @@ function setupInlineCartEditing() {
       let valueStr = input.value.trim().replace(',', '.');
       if (valueStr.startsWith('.')) valueStr = '0' + valueStr;
 
-      const product = getCachedProductById(cartItem.productId);
-      const stock = Number(product?.stock);
-      const prevQty = Number(cartItem.quantity);
-
       if (isCountBased) {
         // Pieces must be whole numbers
         const digits = valueStr.replace(/[^0-9]/g, '');
         const newQty = parseInt(digits, 10);
         if (Number.isFinite(newQty) && newQty > 0) {
-          if (Number.isFinite(stock) && stock >= 0 && Number.isFinite(prevQty)) {
-            const maxAllowed = stock + prevQty;
-            if (newQty > maxAllowed) {
-              alert(`Only ${Math.floor(maxAllowed)} ${unit} available in stock`);
-              updateCartDisplay();
-              return;
-            }
-          }
           cartItem.quantityGrams = null;
           cartItem.quantity = newQty;
           recalcCartItemMoney(cartItem);
@@ -6528,14 +6619,6 @@ function setupInlineCartEditing() {
       } else {
         const newValue = parseFloat(valueStr);
         if (!isNaN(newValue) && newValue > 0 && /^\d*\.?\d*$/.test(valueStr)) {
-          if (Number.isFinite(stock) && stock >= 0 && Number.isFinite(prevQty)) {
-            const maxAllowed = stock + prevQty;
-            if (newValue > maxAllowed) {
-              alert(`Only ${maxAllowed.toFixed(3)} ${unit} available in stock`);
-              updateCartDisplay();
-              return;
-            }
-          }
           cartItem.quantityGrams = kgToGrams(newValue);
           cartItem.quantity = gramsToKg(cartItem.quantityGrams);
           recalcCartItemMoney(cartItem);
@@ -10303,16 +10386,22 @@ const categoriesPager = { page: 1, perPage: 50 };
 let categoriesManagementList = [];
 const selectedCategoryIds = new Set();
 
-async function openProductModal(product = null, categoryId = null, categoryName = null) {
+async function openProductModal(product = null, categoryId = null, categoryName = null, options = {}) {
   const modal = document.getElementById('productModal');
   const form = document.getElementById('productForm');
   const title = document.getElementById('productModalTitle');
+
+  // Price-only mode (used from Checkout): hide every field except the prices.
+  // Hidden fields keep the product's current values, so saving leaves them unchanged.
+  const priceOnly = !!(options && options.priceOnly && product);
+  modal.classList.toggle('price-only-mode', priceOnly);
+  form.noValidate = priceOnly;
   
   // Load categories first
   await loadCategoriesForProductForm();
   
   if (product) {
-    title.textContent = 'Edit Product';
+    title.textContent = priceOnly ? `Edit Price - ${product.name}` : 'Edit Product';
     document.getElementById('productId').value = product.id;
     {
       const bc = String(product.barcode || '').trim();
@@ -10495,7 +10584,7 @@ function toggleUnitFields(unitType) {
   }
 }
 
-async function editProduct(id) {
+async function editProduct(id, options = {}) {
   let product = allProducts.find(p => p.id === id);
   if (!product) return;
 
@@ -10509,7 +10598,12 @@ async function editProduct(id) {
     }
   }
 
-  openProductModal(product);
+  await openProductModal(product, null, null, options);
+
+  if (options && options.priceOnly) {
+    const priceInput = document.getElementById('productRegularPrice');
+    try { priceInput?.focus(); priceInput?.select?.(); } catch { /* ignore */ }
+  }
 }
 
 async function deleteProduct(id) {
@@ -14381,7 +14475,6 @@ function setupVirtualKeyboard() {
     currentKeyboardInput = null;
     isShiftActive = false;
     isCapsLocked = false;
-    lastShiftTapAt = 0;
     updateKeyboardCase();
     syncVirtualKeyboardInset();
   };
@@ -14447,8 +14540,6 @@ function setupVirtualKeyboard() {
   const keyButtons = keyboard.querySelectorAll('.key-btn');
   let isShiftActive = false;
   let isCapsLocked = false;
-  let lastShiftTapAt = 0;
-  const SHIFT_DOUBLE_TAP_MS = 350;
   let keyboardMode = 'text'; // 'text' | 'numeric'
   
   // Initialize keyboard in lowercase mode
@@ -14501,7 +14592,6 @@ function setupVirtualKeyboard() {
     if (keyboardMode === 'numeric' && (isShiftActive || isCapsLocked)) {
       isShiftActive = false;
       isCapsLocked = false;
-      lastShiftTapAt = 0;
       updateKeyboardCase();
     }
 
@@ -14647,24 +14737,9 @@ function setupVirtualKeyboard() {
     }
       
     if (key === 'Shift') {
-      const now = Date.now();
-      const isDoubleTap = (now - lastShiftTapAt) < SHIFT_DOUBLE_TAP_MS;
-      lastShiftTapAt = now;
-
-      if (isDoubleTap) {
-        // Double-tap toggles caps-lock (sticky uppercase)
-        isCapsLocked = !isCapsLocked;
-        isShiftActive = isCapsLocked;
-      } else {
-        // Single tap: shift for next key; if caps-lock was on, turn it off
-        if (isCapsLocked) {
-          isCapsLocked = false;
-          isShiftActive = false;
-        } else {
-          isShiftActive = !isShiftActive;
-        }
-      }
-
+      // Sticky caps lock: stays on until Shift is tapped again.
+      isShiftActive = !isShiftActive;
+      isCapsLocked = isShiftActive;
       updateKeyboardCase();
       return;
     }
@@ -14708,7 +14783,6 @@ function setupVirtualKeyboard() {
             if (moved) {
               isShiftActive = false;
               isCapsLocked = false;
-              lastShiftTapAt = 0;
               updateKeyboardCase();
               return;
             }
@@ -14742,7 +14816,6 @@ function setupVirtualKeyboard() {
       currentKeyboardInput = null;
       isShiftActive = false;
       isCapsLocked = false;
-      lastShiftTapAt = 0;
       updateKeyboardCase();
       syncVirtualKeyboardInset();
       return;
@@ -14781,12 +14854,6 @@ function setupVirtualKeyboard() {
       }
 
       currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-
-    // Auto-turn off shift after typing one character
-    if (isShiftActive && !isCapsLocked) {
-      isShiftActive = false;
-      updateKeyboardCase();
     }
   };
 
@@ -18386,7 +18453,7 @@ function _arqueoShowQuarterList(rows, titleLabel, cs) {
       return;
     }
     slice.forEach((row, i) => {
-      const hasData     = row.count > 0;
+      const hasData     = row.count > 0 || row.total > 0;
       const bg          = i % 2 === 0 ? '#ffffff' : '#f0f6fb';
       const color       = qColors[row.q] || '#2a4a5e';
       const desdeStr    = fmtD(row.year, qStartMonth[row.q], '01');
@@ -18753,6 +18820,31 @@ function arqueoListBack() {
   _arqueoComputeAndRender();
 }
 
+/**
+ * Roll up the actual monthly sales totals (authoritative `sales` table) into
+ * arbitrary buckets. `keyFn` maps a 'YYYY-MM' month to a bucket key (or null to skip).
+ * Returns { [bucketKey]: { total, cash, card } }.
+ */
+async function _arqueoActualTotalsBy(keyFn) {
+  const map = {};
+  try {
+    const actualRows = await window.api.getMonthlySalesActualTotals();
+    (actualRows || []).forEach(r => {
+      const month = String(r.month || '');
+      if (month.length < 7) return;
+      const key = keyFn(month);
+      if (!key) return;
+      if (!map[key]) map[key] = { total: 0, cash: 0, card: 0 };
+      map[key].total += Number(r.total) || 0;
+      map[key].cash  += Number(r.cash)  || 0;
+      map[key].card  += Number(r.card)  || 0;
+    });
+  } catch (e) {
+    console.warn('Could not fetch actual monthly sales totals:', e);
+  }
+  return map;
+}
+
 /** Compute data for the current period and render */
 async function _arqueoComputeAndRender() {
   const paper = document.getElementById('arqueoReceiptPaper');
@@ -18871,7 +18963,7 @@ async function _arqueoComputeAndRender() {
     return;
   }
 
-  // ── ANUAL: one row per year that has Z-reports ───────────────────────────
+  // ── ANUAL: one row per year that has Z-reports or actual sales ───────────
   if (_arqueoPeriod === 'year') {
     const groups = {}; // key: 'YYYY'
     _arqueoAllReports.forEach(r => {
@@ -18884,13 +18976,24 @@ async function _arqueoComputeAndRender() {
       } catch {}
     });
 
-    const yearKeys = Object.keys(groups).sort().reverse();
+    // Roll up actual monthly sales totals per year (same authoritative source as MENSUAL)
+    const actualYearMap = await _arqueoActualTotalsBy(m => m.slice(0, 4));
+
+    const yearKeys = Array.from(new Set([
+      ...Object.keys(groups),
+      ...Object.keys(actualYearMap)
+    ])).sort().reverse();
 
     const rows = yearKeys.map(key => {
-      const reps  = groups[key].reports;
-      const total = reps.reduce((s, r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
-      const cash  = reps.reduce((s, r) => s + Number(r.cash_sales||0), 0);
-      const card  = reps.reduce((s, r) => s + Number(r.card_sales||0), 0);
+      const reps   = (groups[key] || { reports: [] }).reports;
+      const actual = actualYearMap[key];
+      // Prefer actual sales totals over stored Z-report sums
+      const total = actual ? actual.total
+                           : reps.reduce((s, r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
+      const cash  = actual ? actual.cash
+                           : reps.reduce((s, r) => s + Number(r.cash_sales||0), 0);
+      const card  = actual ? actual.card
+                           : reps.reduce((s, r) => s + Number(r.card_sales||0), 0);
       return { key, label: key, count: reps.length, total, cash, card, reports: reps };
     });
 
@@ -18938,17 +19041,35 @@ async function _arqueoComputeAndRender() {
       } catch {}
     });
 
+    // Roll up actual monthly sales totals per quarter (same authoritative source as MENSUAL)
+    const actualQuarterMap = await _arqueoActualTotalsBy(m => {
+      const yr = Number(m.slice(0,4));
+      const mo = Number(m.slice(5,7));
+      if (!yr || !mo) return null;
+      return `${yr}-Q${quarterOf(mo)}`;
+    });
+    // Quarters with real sales may predate the oldest saved Z-report
+    Object.keys(actualQuarterMap).forEach(key => {
+      const yr = Number(key.slice(0,4));
+      if (yr && yr < earliestYear) earliestYear = yr;
+    });
+
     // Generate ALL completed quarters from earliestYear up to (but not including current quarter)
     const rows = [];
     for (let yr = todayYear; yr >= earliestYear; yr--) {
       // For current year only include quarters that have fully ended
       const maxQ = (yr === todayYear) ? todayQ - 1 : 4;
       for (let q = maxQ; q >= 1; q--) {
-        const key   = `${yr}-Q${q}`;
-        const reps  = groups[key] || [];
-        const total = reps.reduce((s,r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
-        const cash  = reps.reduce((s,r) => s + Number(r.cash_sales||0), 0);
-        const card  = reps.reduce((s,r) => s + Number(r.card_sales||0), 0);
+        const key    = `${yr}-Q${q}`;
+        const reps   = groups[key] || [];
+        const actual = actualQuarterMap[key];
+        // Prefer actual sales totals over stored Z-report sums
+        const total = actual ? actual.total
+                             : reps.reduce((s,r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
+        const cash  = actual ? actual.cash
+                             : reps.reduce((s,r) => s + Number(r.cash_sales||0), 0);
+        const card  = actual ? actual.card
+                             : reps.reduce((s,r) => s + Number(r.card_sales||0), 0);
         rows.push({ key, label:`${qNames[q]}  ${yr}`, count:reps.length, total, cash, card, year:yr, q, reports:reps });
       }
     }

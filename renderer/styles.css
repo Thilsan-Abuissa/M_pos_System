@@ -3424,6 +3424,11 @@ input.product-checkout-toggle {
   background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
 }
 
+.edit-scan-toggle-btn.active {
+  color: white;
+  background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%);
+}
+
 /* ============== UTILITIES ============== */
 .empty-state {
   text-align: center;
@@ -5217,4 +5222,113 @@ button {
   min-height: 0;
   display: flex !important;
   flex-direction: column;
+}
+
+/* Checkout "Edit Price": show only the price fields in the product modal */
+#productModal.price-only-mode #productForm > .form-group,
+#productModal.price-only-mode #productForm > .form-row:not(:has(#productRegularPrice)),
+#productModal.price-only-mode #productPrintLabelBtn {
+  display: none !important;
+}
+
+/* Weight modal: dial keypad for zero-price products (compact version of the unit-price keypad) */
+#weightModal .custom-alert-modal {
+  max-height: 96vh;
+  overflow-y: auto;
+}
+
+#weightModal .unit-price-dialpad {
+  width: min(260px, 80vw);
+  margin: 4px auto 6px auto;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+#weightModal .dial-btn,
+#weightModal .unit-price-input-backspace {
+  border: none;
+  border-radius: 999px;
+  background: radial-gradient(circle at 30% 25%, #1f2937 0%, #0b1220 70%);
+  color: #ffffff;
+  font-weight: 900;
+  cursor: pointer;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.25);
+  transition: transform 0.08s ease, filter 0.12s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#weightModal .dial-btn {
+  height: 56px;
+  font-size: 24px;
+}
+
+#weightModal .unit-price-input-backspace {
+  width: 44px;
+  height: 44px;
+  font-size: 20px;
+}
+
+#weightModal .dial-btn-secondary,
+#weightModal .unit-price-input-backspace {
+  background: radial-gradient(circle at 30% 25%, #334155 0%, #0f172a 70%);
+}
+
+#weightModal .dial-btn:active,
+#weightModal .unit-price-input-backspace:active {
+  transform: scale(0.97);
+  filter: brightness(1.08);
+}
+
+/* Weight modal layout. Zero-price products get a 2-column layout
+   (fields left, keypad right) so everything fits on a 15" screen without scrolling. */
+#weightModal .weight-field {
+  margin: 20px 0;
+}
+
+#weightModal .weight-keypad {
+  display: none;
+}
+
+#weightModal.zero-price .custom-alert-modal {
+  width: min(820px, 96vw);
+  max-width: 820px;
+  padding: 22px 28px;
+}
+
+#weightModal.zero-price .custom-alert-icon {
+  display: none;
+}
+
+#weightModal.zero-price h2 {
+  margin: 0 0 4px;
+}
+
+#weightModal.zero-price #weightModalMessage {
+  margin: 0 0 6px;
+}
+
+#weightModal.zero-price .weight-body {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  gap: 24px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+#weightModal.zero-price .weight-field {
+  margin: 10px 0;
+}
+
+#weightModal.zero-price .weight-keypad {
+  display: block;
+}
+
+#weightModal.zero-price .unit-price-dialpad {
+  width: 250px;
+  margin: 0;
+}
+
+#weightModal.zero-price .dial-btn {
+  height: 60px;
 }

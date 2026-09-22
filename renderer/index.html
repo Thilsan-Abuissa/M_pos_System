@@ -312,7 +312,7 @@
                   <div style="background: #f8fafc; padding: 3px; border-radius: 8px; margin-bottom: 5px; text-align: center;">
                     <div style="font-size: 14px; color: #64748b; margin-bottom: 5px;">Total Amount</div>
                     <div id="paymentTotalAmount" style="font-size: 32px; font-weight: 700; color: #0f172a;">€0.00</div>
-                    <div id="paymentRemainingAmount" style="font-size: 10px; font-weight: 600; color: #dc2626; margin-top: 10px; display: none;">
+                    <div id="paymentRemainingAmount" style="font-size: 10px; font-weight: 600; color: #dc2626; margin-top: 10px; visibility: hidden;">
                       Remaining: <span id="remainingValue">€0.00</span>
                     </div>
                   </div>
@@ -427,6 +427,9 @@
                   <!-- Search Bar -->
                   <div class="search-section" style="display:flex; gap:8px; align-items:center;">
                     <input type="text" id="productSearch" data-i18n-placeholder="searchProduct" placeholder="Search Product..." autocomplete="off" style="flex: 1; min-width: 0;">
+                    <button id="toggleEditScanBtn" type="button" class="reorder-toggle-btn edit-scan-toggle-btn" title="When ON, scanning a product opens it for editing instead of adding it to the cart">
+                      EDIT
+                    </button>
                     <button id="toggleReorderBtn" type="button" class="reorder-toggle-btn" title="Reorder quick products">
                       REORDER
                     </button>
@@ -1274,7 +1277,7 @@
         <div class="form-group">
           <label>Unit Type *</label>
           <select id="productUnitType" required>
-            <option value="weight" disabled>⚖️ Weight - Disabled (scale not used)</option>
+            <option value="weight">⚖️ Weight - For items sold by weight</option>
             <option value="quantity">🔢 Quantity - For items sold by count</option>
           </select>
           <small style="color: #718096; display: block; margin-top: 5px;">Choose how this product will be measured</small>
@@ -1337,8 +1340,8 @@
           </div>
         </div>
         <div class="form-group">
-          <label>Current Stock *</label>
-          <input type="text" id="productStock" inputmode="numeric" pattern="[0-9]*" enterkeyhint="done" autocomplete="off" required>
+          <label>Current Stock (optional)</label>
+          <input type="text" id="productStock" inputmode="numeric" pattern="[0-9]*" enterkeyhint="done" autocomplete="off">
         </div>
         <div class="modal-footer">
           <button type="button" class="btn-secondary cancel-btn">Cancel</button>
@@ -1899,20 +1902,49 @@
         </button>
       </div>
       
-      <div style="margin: 20px 0;">
-        <label id="weightInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Quantity (pieces)</label>
-        <input type="text" id="weightInput" inputmode="decimal" autocomplete="off"
-               style="width: 100%; padding: 15px; font-size: 24px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;" 
-               placeholder="Enter quantity" 
-               autofocus>
-      </div>
-      <div style="margin: 20px 0;">
-        <label id="priceInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Price per piece (€)</label>
-         <input type="text" id="weightPriceInput" inputmode="decimal" autocomplete="off"
-               style="width: 100%; padding: 15px; font-size: 20px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;" 
-               placeholder="Price per piece" 
-           >
-        <small style="display: block; color: #64748b; margin-top: 5px; text-align: center;">Modify price only for this sale</small>
+      <!-- Fields on the left; for zero-price products a dial keypad appears on the right -->
+      <div class="weight-body">
+        <div class="weight-fields">
+          <div class="weight-field">
+            <label id="weightInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Quantity (pieces)</label>
+            <input type="text" id="weightInput" inputmode="decimal" autocomplete="off"
+                   style="width: 100%; padding: 15px; font-size: 24px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;"
+                   placeholder="Enter quantity"
+                   autofocus>
+          </div>
+          <!-- Zero-price products: unit price typed on the keypad -->
+          <div id="weightUnitPriceGroup" class="weight-field" style="display: none;">
+            <label id="weightUnitPriceLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Price per kg (€)</label>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <input type="text" id="weightUnitPriceInput" inputmode="none" autocomplete="off" readonly placeholder="0.00"
+                     style="flex: 1; min-width: 0; padding: 12px; font-size: 24px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;">
+              <button type="button" id="weightUnitPriceBackspace" class="unit-price-input-backspace" aria-label="Backspace">⌫</button>
+            </div>
+          </div>
+          <div class="weight-field">
+            <label id="priceInputLabel" style="display: block; margin-bottom: 8px; font-weight: bold; color: #334155;">Price per piece (€)</label>
+            <input type="text" id="weightPriceInput" inputmode="decimal" autocomplete="off"
+                   style="width: 100%; padding: 15px; font-size: 20px; text-align: center; border: 2px solid #6E8FAF; border-radius: 12px;"
+                   placeholder="Price per piece">
+            <small style="display: block; color: #64748b; margin-top: 5px; text-align: center;">Modify price only for this sale</small>
+          </div>
+        </div>
+        <div class="weight-keypad">
+          <div class="unit-price-dialpad" id="weightUnitPriceDialpad" role="group" aria-label="Number keypad">
+            <button type="button" class="dial-btn" data-key="1">1</button>
+            <button type="button" class="dial-btn" data-key="2">2</button>
+            <button type="button" class="dial-btn" data-key="3">3</button>
+            <button type="button" class="dial-btn" data-key="4">4</button>
+            <button type="button" class="dial-btn" data-key="5">5</button>
+            <button type="button" class="dial-btn" data-key="6">6</button>
+            <button type="button" class="dial-btn" data-key="7">7</button>
+            <button type="button" class="dial-btn" data-key="8">8</button>
+            <button type="button" class="dial-btn" data-key="9">9</button>
+            <button type="button" class="dial-btn dial-btn-secondary" data-key="clear">C</button>
+            <button type="button" class="dial-btn" data-key="0">0</button>
+            <button type="button" class="dial-btn dial-btn-secondary" data-key="dot">.</button>
+          </div>
+        </div>
       </div>
       <div id="scaleButtonContainer" style="display: none; gap: 12px; margin-bottom: 12px;">
         <button id="readScaleBtn" class="custom-alert-btn" style="background: #10b981; flex: 1;">

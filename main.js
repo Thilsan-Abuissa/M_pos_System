@@ -68,9 +68,9 @@ try {
   console.warn('ReadlineParser not available. Continuing with raw serial reads only.', error.message);
 }
 
-// Barcode-only default: scale is disabled unless explicitly enabled.
-// Set `SCALE_ENABLED=1` to re-enable the legacy scale module.
-const SCALE_ENABLED = process.env.SCALE_ENABLED === '1';
+// Scale is enabled by default.
+// Set `SCALE_ENABLED=0` to disable the scale module (barcode-only mode).
+const SCALE_ENABLED = process.env.SCALE_ENABLED !== '0';
 
 let mainWindow;
 let customerDisplayWindow;
@@ -1116,6 +1116,10 @@ ipcMain.handle('products:getByBarcode', async (event, barcode) => {
 
 ipcMain.handle('products:getById', async (event, id) => {
   return db.getProductById(id);
+});
+
+ipcMain.handle('products:getVariosId', async () => {
+  return db.getVariosProductId();
 });
 
 ipcMain.handle('products:add', async (event, product) => {
@@ -3036,7 +3040,7 @@ ipcMain.handle('scale:moduleStatus', async () => {
 // Connect to scale
 ipcMain.handle('scale:connect', async (event, portPath) => {
   if (!SCALE_ENABLED) {
-    return { success: false, message: 'Scale is disabled in this barcode-only build (set SCALE_ENABLED=1 to enable).' };
+    return { success: false, message: 'Scale is disabled in this barcode-only build (unset SCALE_ENABLED=0 to enable).' };
   }
   if (!SerialPort) {
     throw new Error('SerialPort module not available. Scale features are disabled.');

@@ -1,6 +1,6 @@
 {
   "name": "supermarket-pos",
-  "version": "80.6.8",
+  "version": "80.6.16",
   "description": "Cross-platform Supermarket POS System",
   "main": "main.js",
   "scripts": {

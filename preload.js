@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('api', {
   getAllProductsLite: () => ipcRenderer.invoke('products:getAllLite'),
   searchProducts: (query) => ipcRenderer.invoke('products:search', query),
   getProductByBarcode: (barcode) => ipcRenderer.invoke('products:getByBarcode', barcode),
+  getVariosProductId: () => ipcRenderer.invoke('products:getVariosId'),
   addProduct: (product) => ipcRenderer.invoke('products:add', product),
   bulkAddProducts: (products) => ipcRenderer.invoke('products:bulkAdd', products),
   updateProduct: (id, product) => ipcRenderer.invoke('products:update', id, product),
