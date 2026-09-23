@@ -8387,11 +8387,13 @@ async function payParkingInCheckout(receiptNumber, remainingAmount) {
     // Toggle navbar visibility for checkout
     toggleNavbarForView('checkout');
     
-    // Load checkout view data
-    loadViewData('checkout');
+    // Load checkout view data (kept as a promise so we can wait for it below;
+    // otherwise its late cart refresh can reset the auto-selected payment).
+    const checkoutReady = loadCheckoutView().catch(() => {});
     
     // Automatically select card payment and set amount
     setTimeout(async () => {
+      await checkoutReady;
       try {
         // Get the original parking/loan details to show individual items
         const loan = loanForCtx || await window.api.getLoanByReceipt(receiptNumber);
@@ -8440,7 +8442,9 @@ async function payParkingInCheckout(receiptNumber, remainingAmount) {
         }];
       }
       
-      updateCartDisplay();
+      // Render synchronously: updateCartDisplay() defers to the next frame, which
+      // left the PAYMENT button disabled (empty cart) when we click it below.
+      updateCartDisplayNow();
       
       // Auto-open payment modal and select card
       document.getElementById('paymentBtn')?.click();
@@ -8836,7 +8840,7 @@ function renderLoansTable(loans) {
   const currencySymbol = systemSettings?.currency_symbol || '€';
 
   if (!Array.isArray(loans) || loans.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="empty-state"><div class="icon">💳</div><p>No Parking orders found</p></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-state"><div class="icon">💳</div><p>No Parking orders found</p></td></tr>';
     return;
   }
 
@@ -8853,16 +8857,19 @@ function renderLoansTable(loans) {
       ? `${loan.restaurant_name}<br><small>${loan.customer_name}</small>`
       : loan.customer_name;
 
+    // Show only the last 6 digits; full number stays in the tooltip and search matches partials.
+    const fullReceipt = String(loan.receipt_number || '');
+    const shortReceipt = fullReceipt.length > 6 ? fullReceipt.slice(-6) : fullReceipt;
+
     const loanAmount = Number(loan.loan_amount || 0);
     const paidAmount = Number(loan.paid_amount || 0);
     const remainingAmount = Number(loan.remaining_amount || 0);
 
     return `
       <tr>
-        <td>${loan.receipt_number}</td>
+        <td title="${fullReceipt}">#${shortReceipt}</td>
         <td>${customerType}</td>
         <td>${displayName}</td>
-        <td>${loan.customer_phone || '-'}</td>
         <td>${currencySymbol}${loanAmount.toFixed(2)}</td>
         <td>${currencySymbol}${paidAmount.toFixed(2)}</td>
         <td>${currencySymbol}${remainingAmount.toFixed(2)}</td>
@@ -13874,6 +13881,8 @@ function setupLoanHandlers() {
         const isRestaurant = type === 'restaurant';
 
         if (typeFilter && type !== typeFilter) continue;
+        // Regular customers park by numbered slot, not by name.
+        if (type === 'regular') continue;
 
         const restName = (p.restaurant_name || '').toString().trim();
         const restNie = (p.restaurant_nie || '').toString().trim();
@@ -13982,16 +13991,131 @@ function setupLoanHandlers() {
   const syncLoanQuickSelectVisibility = () => {
     const field = document.getElementById('loanQuickSelectField');
     if (!field) return;
-    // Always show: user can pick a party first, which will auto-set the customer type.
-    field.style.display = 'block';
+    // Regular customers use numbered slots instead of names.
+    const type = (document.getElementById('loanCustomerType')?.value || '').toString().toLowerCase();
+    field.style.display = type === 'regular' ? 'none' : 'block';
+  };
+
+  // ---- Regular customer parking slots (Slot 1, Slot 2, ...) ----
+  const PARKING_SLOT_PAGE = 20;
+  let parkingSlotBusy = false;
+
+  const parseSlotNumber = (name) => {
+    const m = /^slot\s+(\d+)$/i.exec((name || '').toString().trim());
+    return m ? parseInt(m[1], 10) : null;
+  };
+
+  const loadParkingSlots = async () => {
+    const grid = document.getElementById('parkingSlotGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    const used = new Map();
+    try {
+      const loans = await window.api.getAllLoans('active');
+      for (const l of (Array.isArray(loans) ? loans : [])) {
+        if ((l.customer_type || 'regular').toString().toLowerCase() !== 'regular') continue;
+        if ((l.status || '').toString().toLowerCase() === 'paid') continue;
+        const n = parseSlotNumber(l.customer_name);
+        if (n && !used.has(n)) used.set(n, l);
+      }
+    } catch (e) {
+      showAlert('Failed to load parking slots: ' + (e?.message || e), 'error');
+    }
+
+    // Show slots in blocks of 20; add another 20 once every visible slot is taken.
+    const maxUsed = used.size ? Math.max(...used.keys()) : 0;
+    let count = Math.max(PARKING_SLOT_PAGE, Math.ceil(maxUsed / PARKING_SLOT_PAGE) * PARKING_SLOT_PAGE);
+    while (Array.from({ length: count }, (_, i) => i + 1).every(n => used.has(n))) {
+      count += PARKING_SLOT_PAGE;
+    }
+
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    for (let n = 1; n <= count; n++) {
+      const loan = used.get(n);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'parking-slot' + (loan ? ' used' : '');
+      btn.dataset.slot = String(n);
+      if (loan) btn.dataset.loanId = String(loan.id);
+      const sub = loan
+        ? `${currencySymbol}${Number(loan.remaining_amount || 0).toFixed(2)}`
+        : 'Free';
+      btn.innerHTML = `<span class="ps-num">${n}</span><span class="ps-sub">${sub}</span>`;
+      grid.appendChild(btn);
+    }
+  };
+
+  document.getElementById('parkingSlotGrid')?.addEventListener('click', async (e) => {
+    const btn = e.target.closest('.parking-slot');
+    if (!btn || parkingSlotBusy) return;
+    const slot = parseInt(btn.dataset.slot, 10);
+    const loanId = parseInt(btn.dataset.loanId || '', 10);
+    const hasLoan = Number.isFinite(loanId) && loanId > 0;
+    const notesInput = document.getElementById('loanNotes');
+
+    parkingSlotBusy = true;
+    document.querySelectorAll('#parkingSlotGrid .parking-slot').forEach(b => { b.disabled = true; });
+    try {
+      await completeLoanSale(
+        'regular',
+        `Slot ${slot}`,
+        '',
+        '',
+        '',
+        '',
+        hasLoan ? 'append' : 'new',
+        hasLoan ? loanId : null
+      );
+      if (notesInput) notesInput.value = '';
+    } finally {
+      parkingSlotBusy = false;
+      // Refresh occupancy (also re-enables buttons if the save failed).
+      await loadParkingSlots();
+    }
+  });
+
+  const syncRegularSlotsUi = () => {
+    const type = (document.getElementById('loanCustomerType')?.value || '').toString().toLowerCase();
+    const isRegular = type === 'regular';
+    const slotsField = document.getElementById('regularSlotsField');
+    const nameField = document.getElementById('loanCustomerNameField');
+    const phoneField = document.getElementById('loanCustomerPhoneField');
+    const nameInput = document.getElementById('loanCustomerName');
+    const submitBtn = document.getElementById('loanSubmitBtn');
+
+    if (slotsField) slotsField.style.display = isRegular ? 'block' : 'none';
+    if (nameField) nameField.style.display = isRegular ? 'none' : 'block';
+    if (phoneField) phoneField.style.display = isRegular ? 'none' : 'block';
+    const notesField = document.getElementById('loanNotesField');
+    if (notesField) notesField.style.display = isRegular ? 'none' : 'block';
+    if (nameInput) nameInput.required = !isRegular;
+    if (submitBtn) submitBtn.style.display = isRegular ? 'none' : '';
+
+    if (isRegular) loadParkingSlots();
   };
 
   // Show Quick Select by default
   syncLoanQuickSelectVisibility();
 
+  // Customer type cards -> drive the hidden select
+  document.querySelectorAll('.customer-type-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      const typeSelect = document.getElementById('loanCustomerType');
+      if (!typeSelect) return;
+      typeSelect.value = card.dataset.type || '';
+      typeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  });
+
   // Customer type change handler
   document.getElementById('loanCustomerType')?.addEventListener('change', (e) => {
     const type = e.target.value;
+    document.querySelectorAll('.customer-type-card').forEach((card) => {
+      const on = card.dataset.type === type;
+      card.classList.toggle('active', on);
+      card.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
     const restaurantFields = document.getElementById('restaurantFields');
     const restaurantNieField = document.getElementById('restaurantNieField');
     const restaurantParkingModeField = document.getElementById('restaurantParkingModeField');
@@ -14023,6 +14147,8 @@ function setupLoanHandlers() {
 
       syncLoanQuickSelectVisibility();
     }
+
+    syncRegularSlotsUi();
 
     // Refresh quick select list to match the selected type filter
     const q = (document.getElementById('loanPartySearch')?.value || '').toString();
@@ -14158,6 +14284,15 @@ function setupLoanHandlers() {
     const restaurantName = document.getElementById('loanRestaurantName').value;
     const restaurantNie = document.getElementById('loanRestaurantNie').value;
     const notes = document.getElementById('loanNotes').value;
+
+    if (!customerType) {
+      showAlert('Please choose Regular Customer or Restaurant', 'warning');
+      return;
+    }
+    if (customerType === 'regular') {
+      showAlert('Tap a parking slot number to save', 'warning');
+      return;
+    }
 
     const parkingMode = document.querySelector('input[name="loanParkingMode"]:checked')?.value || 'append';
 

@@ -1024,8 +1024,7 @@
                     <tr>
                       <th>Receipt #</th>
                       <th>Type</th>
-                      <th>Customer/Restaurant</th>
-                      <th>Phone</th>
+                      <th>Name</th>
                       <th>Parking Amount</th>
                       <th>Paid Amount</th>
                       <th>Remaining</th>
@@ -1533,7 +1532,20 @@
       <form id="loanForm">
         <div class="form-group">
           <label>Customer Type *</label>
-          <select id="loanCustomerType" required>
+          <div class="customer-type-cards" role="radiogroup" aria-label="Customer Type">
+            <button type="button" class="customer-type-card" data-type="regular" role="radio" aria-checked="false">
+              <span class="ct-icon">👤</span>
+              <span class="ct-title">Regular Customer</span>
+              <span class="ct-sub">Park by slot number</span>
+            </button>
+            <button type="button" class="customer-type-card" data-type="restaurant" role="radio" aria-checked="false">
+              <span class="ct-icon">🍽️</span>
+              <span class="ct-title">Restaurant</span>
+              <span class="ct-sub">Park by restaurant name</span>
+            </button>
+          </div>
+          <!-- Hidden: the cards above drive this select so existing logic keeps working -->
+          <select id="loanCustomerType" hidden>
             <option value="">Select Customer Type</option>
             <option value="regular">Regular Customer</option>
             <option value="restaurant">Restaurant</option>
@@ -1591,21 +1603,26 @@
             <div id="existingRestaurantHelp" class="existing-restaurant-help"></div>
           </div>
         </div>
-        <div class="form-group">
+        <div class="form-group" id="regularSlotsField" style="display:none;">
+          <label>Select Parking Slot</label>
+          <div id="parkingSlotGrid" class="parking-slot-grid"></div>
+          <div id="parkingSlotHelp" class="existing-restaurant-help">Tap a free slot to park this sale. Tap a used slot to add to it.</div>
+        </div>
+        <div class="form-group" id="loanCustomerNameField">
           <label>Customer Name *</label>
           <input type="text" id="loanCustomerName" required placeholder="Enter customer name">
         </div>
-        <div class="form-group">
+        <div class="form-group" id="loanCustomerPhoneField">
           <label>Customer Phone (Optional)</label>
           <input type="tel" id="loanCustomerPhone" placeholder="Enter phone number">
         </div>
-        <div class="form-group">
+        <div class="form-group" id="loanNotesField">
           <label>Notes (Optional)</label>
           <textarea id="loanNotes" rows="3" placeholder="Additional notes"></textarea>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn-secondary cancel-btn">Cancel</button>
-          <button type="submit" class="btn-primary">Save to Parking</button>
+          <button type="submit" class="btn-primary" id="loanSubmitBtn">Save to Parking</button>
         </div>
       </form>
     </div>
