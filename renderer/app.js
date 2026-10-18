@@ -3851,7 +3851,11 @@ async function loadCategoryTabs() {
   }
 
   const knownByName = new Map((categories || []).map(c => [String(c?.name || ''), c]));
-  const knownVisible = (categories || []).filter(c => visibleCategoryNames.has(String(c?.name || '')));
+  // Starred (favorite) categories always get a tab, even before they have products;
+  // other categories appear once they have at least one checkout-enabled product.
+  const knownVisible = (categories || []).filter(c =>
+    visibleCategoryNames.has(String(c?.name || '')) || Number(c?.is_favorite || 0) === 1
+  );
   knownVisible.sort((a, b) => {
     const af = Number(a?.is_favorite || 0);
     const bf = Number(b?.is_favorite || 0);
@@ -8391,7 +8395,7 @@ async function payParkingInCheckout(receiptNumber, remainingAmount) {
     // otherwise its late cart refresh can reset the auto-selected payment).
     const checkoutReady = loadCheckoutView().catch(() => {});
     
-    // Automatically select card payment and set amount
+    // Load the parking items into the cart once Checkout is ready
     setTimeout(async () => {
       await checkoutReady;
       try {
@@ -8442,17 +8446,10 @@ async function payParkingInCheckout(receiptNumber, remainingAmount) {
         }];
       }
       
-      // Render synchronously: updateCartDisplay() defers to the next frame, which
-      // left the PAYMENT button disabled (empty cart) when we click it below.
+      // Stay on Checkout with the parking items in the cart so more items can be
+      // added; the cashier opens PAYMENT when ready (new items are appended to the
+      // parking before it is settled).
       updateCartDisplayNow();
-      
-      // Auto-open payment modal and select card
-      document.getElementById('paymentBtn')?.click();
-      
-      setTimeout(() => {
-        // Auto-select card payment
-        document.querySelector('[data-value="card"]')?.click();
-      }, 100);
     }, 200);
     
   } catch (error) {
@@ -8877,7 +8874,8 @@ function renderLoansTable(loans) {
         <td>${formatDateWithDisplayTimeZone(loanDate, 'en-GB')}</td>
         <td>
           ${String(loan.status || '').toLowerCase() !== 'paid'
-            ? `<button class="btn-action" onclick="payParkingInCheckout('${loan.receipt_number}', ${remainingAmount})">Pay</button>`
+            ? `<button type="button" class="btn-action" data-loan-action="pay" data-receipt="${loan.receipt_number}" data-remaining="${remainingAmount}">Pay</button>
+               ${paidAmount > 0.009 ? '' : `<button type="button" class="btn-action btn-action-danger" data-loan-action="delete" data-loan-id="${loan.id}" title="Delete">🗑️</button>`}`
             : (loan.sale_id
               ? `
                 <button class="btn-action" onclick="viewParkingBillForLoan(${loan.sale_id})" title="View">👁️</button>
@@ -8920,6 +8918,36 @@ function normalizePaidParkingSaleForReceipt(sale) {
   }
 
   return normalized;
+}
+
+async function deleteParking(loanId) {
+  try {
+    const loan = await window.api.getLoanById(loanId);
+    if (!loan) {
+      showAlert('PARKING not found', 'error');
+      return;
+    }
+    const currencySymbol = systemSettings?.currency_symbol || '€';
+    const name = loan.customer_type === 'restaurant' && loan.restaurant_name
+      ? loan.restaurant_name
+      : (loan.customer_name || '');
+    const ok = await showConfirmDialog({
+      title: 'Delete PARKING?',
+      message: `${name} — ${currencySymbol}${Number(loan.remaining_amount || 0).toFixed(2)}\nThe items will be returned to stock. This cannot be undone.`,
+      confirmText: 'Delete',
+      cancelText: 'Cancel',
+      tone: 'danger'
+    });
+    if (!ok) return;
+
+    await window.api.deleteLoan(loanId);
+    showAlert('PARKING deleted', 'success');
+    await loadLoansView(currentLoansStatus || 'active');
+    try { await loadAllProducts(); } catch { /* ignore */ }
+  } catch (error) {
+    const msg = String(error?.message || error).replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+    showAlert('Error deleting PARKING: ' + msg, 'error');
+  }
 }
 
 async function viewParkingBillForLoan(saleId) {
@@ -13782,6 +13810,40 @@ async function updateSystemUI() {
 
 // ============== LOAN HANDLERS ==============
 function setupLoanHandlers() {
+  // PARKING table Pay/Delete. Act on pointerdown (not just click): on touch screens
+  // the first tap closes the virtual keyboard and shifts the layout, so the tap
+  // never became a click and Pay seemed to do nothing. Click stays as a fallback
+  // (keyboard/mouse), deduped so one tap never fires twice.
+  let lastLoanActionAt = 0;
+  const runLoanAction = (e) => {
+    const btn = e.target?.closest?.('[data-loan-action]');
+    if (!btn) return;
+    if (e.type === 'pointerdown' && e.button !== 0) return;
+    e.preventDefault();
+    const now = Date.now();
+    if (now - lastLoanActionAt < 700) return;
+    lastLoanActionAt = now;
+    if (e.type === 'pointerdown') {
+      // Swallow the click that follows this tap: otherwise it lands on whatever
+      // just opened (e.g. the Delete confirm backdrop) and cancels it.
+      const swallowNextClick = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        ev.stopImmediatePropagation();
+      };
+      document.addEventListener('click', swallowNextClick, { capture: true, once: true });
+      setTimeout(() => document.removeEventListener('click', swallowNextClick, true), 700);
+    }
+    if (btn.dataset.loanAction === 'pay') {
+      payParkingInCheckout(btn.dataset.receipt, Number(btn.dataset.remaining || 0));
+    } else if (btn.dataset.loanAction === 'delete') {
+      deleteParking(Number(btn.dataset.loanId));
+    }
+  };
+  const loansTbody = document.querySelector('#loansTable tbody');
+  loansTbody?.addEventListener('pointerdown', runLoanAction);
+  loansTbody?.addEventListener('click', runLoanAction);
+
   // Remember the currently chosen Quick Select party, so list reloads don't reset selection.
   let selectedLoanPartyKey = '';
 
@@ -14391,7 +14453,16 @@ function setupModalHandlers() {
   
   // Close on outside click
   document.querySelectorAll('.modal').forEach(modal => {
+    // Only a press that *starts* on the backdrop may close the modal. Tapping an
+    // input opens the virtual keyboard, which moves the dialog up; the release then
+    // lands on the backdrop and the resulting click used to close the modal.
+    let pressStartedOnBackdrop = false;
+    modal.addEventListener('pointerdown', (e) => {
+      pressStartedOnBackdrop = e.target === modal;
+    }, true);
     modal.addEventListener('click', (e) => {
+      if (!pressStartedOnBackdrop) return;
+      pressStartedOnBackdrop = false;
       // Guard against touch devices generating a delayed click after pressing
       // the on-screen keyboard buttons ("click-through" onto the backdrop).
       const vkLast = Number(window.__virtualKeyboardLastPressAt || 0);
@@ -15124,7 +15195,7 @@ function displayReturns(returns) {
   }
   
   tbody.innerHTML = returns.map(ret => {
-    const date = new Date(ret.return_date);
+    const date = parseAppDateTimeLoose(ret.return_date);
     const items = ret.items ? JSON.parse(ret.items) : [];
     const itemCount = items.length;
     const computedTotal = Array.isArray(items)
@@ -15215,11 +15286,19 @@ async function lookupSaleForReturn() {
       return;
     }
 
+    // An unpaid/partly paid PARKING was never (fully) collected, so refunding it
+    // would pay out money that was not received. It is removed from PARKING instead.
+    const loanStatus = String(sale.loan_status || '').toLowerCase();
+    if (loanStatus && loanStatus !== 'paid') {
+      showAlert(`Receipt #${sale.id} is a PARKING that is not paid yet.\nIt cannot be refunded. Delete or edit it in PARKING instead.`, 'warning', 'Unpaid PARKING');
+      return;
+    }
+
     // Only allow one return per receipt
     const existingReturn = await getExistingReturnForSaleId(sale.id);
     if (existingReturn) {
       const when = existingReturn.return_date
-        ? formatDateTimeWithDisplayTimeZone(new Date(existingReturn.return_date), 'en-GB', {
+        ? formatDateTimeWithDisplayTimeZone(parseAppDateTimeLoose(existingReturn.return_date), 'en-GB', {
           year: 'numeric',
           month: '2-digit',
           day: '2-digit',
@@ -15365,7 +15444,7 @@ async function viewReturnDetails(returnId) {
       ? returnRecord.items.reduce((sum, it) => sum + (Number(it?.subtotal) || 0), 0)
       : (Number(returnRecord.total) || 0);
     // Could show a detailed modal here
-    showAlert(`Return Details:\nDate: ${formatDateTimeWithDisplayTimeZone(new Date(returnRecord.return_date), 'en-GB', {
+    showAlert(`Return Details:\nDate: ${formatDateTimeWithDisplayTimeZone(parseAppDateTimeLoose(returnRecord.return_date), 'en-GB', {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
@@ -17306,11 +17385,22 @@ async function handleExpenseSubmit(e) {
     ? (expenseEditCachedDescription || category || 'Expense')
     : (category || 'Expense');
 
+  // Accept "12,50", "€ 12.50" etc.; parseFloat alone gave NaN, which SQLite
+  // stores as NULL -> "NOT NULL constraint failed: expenses.amount".
+  const amountRaw = String(document.getElementById('expenseAmount')?.value || '')
+    .replace(/[€\s]/g, '')
+    .replace(',', '.');
+  const amount = parseFloat(amountRaw);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    showAlert('Please enter a valid amount (e.g. 12.50)', 'warning');
+    return;
+  }
+
   const expenseData = {
     expenseDate: document.getElementById('expenseDate').value,
     category,
     description,
-    amount: parseFloat(document.getElementById('expenseAmount').value),
+    amount,
     paymentMethod: document.getElementById('expensePaymentMethod').value,
     userId: currentUser?.id,
     cashierName: cashierName

@@ -65,6 +65,7 @@ contextBridge.exposeInMainWorld('api', {
   getLoanById: (id) => ipcRenderer.invoke('loans:getById', id),
   getMonthlyRestaurantReport: (month, year) => ipcRenderer.invoke('loans:getMonthlyRestaurantReport', month, year),
   removeLoanSaleItem: (loanId, saleItemId) => ipcRenderer.invoke('loans:removeSaleItem', loanId, saleItemId),
+  deleteLoan: (loanId) => ipcRenderer.invoke('loans:delete', loanId),
   
   // Returns
   createReturn: (returnData) => ipcRenderer.invoke('returns:create', returnData),

@@ -1320,6 +1320,10 @@ ipcMain.handle('loans:getMonthlyRestaurantReport', async (event, month, year) =>
   return db.getMonthlyRestaurantReport(month, year);
 });
 
+ipcMain.handle('loans:delete', async (event, loanId) => {
+  return db.deleteLoan(Number(loanId));
+});
+
 // Edit PARKING (loan) items before settlement
 ipcMain.handle('loans:removeSaleItem', async (event, loanId, saleItemId) => {
   return db.removeSaleItemFromLoan(Number(loanId), Number(saleItemId));

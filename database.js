@@ -23,6 +23,8 @@ class POSDatabase {
   }
 
   _getZonedParts(date, timeZone) {
+    // hourCycle 'h23': with hour12:false, midnight can format as "24", which made
+    // the start of the day come out one full day early (yesterday's sales counted).
     const dtf = new Intl.DateTimeFormat('en-US', {
       timeZone,
       year: 'numeric',
@@ -31,7 +33,7 @@ class POSDatabase {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
-      hour12: false
+      hourCycle: 'h23'
     });
     const parts = dtf.formatToParts(date);
     const get = (type) => parts.find(p => p.type === type)?.value;
@@ -39,7 +41,7 @@ class POSDatabase {
       year: Number(get('year')),
       month: Number(get('month')),
       day: Number(get('day')),
-      hour: Number(get('hour')),
+      hour: Number(get('hour')) % 24,
       minute: Number(get('minute')),
       second: Number(get('second'))
     };
@@ -837,12 +839,14 @@ class POSDatabase {
       }
     }
 
-    // Barcode-only default: normalize legacy/missing unit types to quantity.
+    // Normalize missing unit types to quantity. Weight products are kept as-is
+    // (weight/scale is enabled again; resetting them here undid the user's choice
+    // on every app start).
     try {
       this.db.prepare(`
         UPDATE products
         SET unit_type = 'quantity'
-        WHERE unit_type IS NULL OR TRIM(unit_type) = '' OR unit_type = 'weight'
+        WHERE unit_type IS NULL OR TRIM(unit_type) = ''
       `).run();
     } catch (error) {
       console.error('Error normalizing unit_type:', error);
@@ -2299,6 +2303,40 @@ class POSDatabase {
 
   getLoanById(id) {
     return this.db.prepare('SELECT * FROM loans WHERE id = ?').get(id);
+  }
+
+  // Delete an unpaid PARKING: restores stock and removes its sale + items.
+  // Refuses once any payment was taken, so recorded money is never lost.
+  deleteLoan(loanId) {
+    const transaction = this.db.transaction(() => {
+      const loan = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId);
+      if (!loan) throw new Error('PARKING not found');
+      if ((loan.status || '').toString().toLowerCase() === 'paid') {
+        throw new Error('Cannot delete a paid PARKING');
+      }
+      const paymentCount = this.db.prepare('SELECT COUNT(*) AS n FROM loan_payments WHERE loan_id = ?').get(loanId)?.n || 0;
+      if (Number(loan.paid_amount || 0) > 0.009 || paymentCount > 0) {
+        throw new Error('This PARKING already has payments and cannot be deleted');
+      }
+
+      const saleId = loan.sale_id;
+      if (saleId) {
+        const items = this.db.prepare('SELECT product_id, quantity FROM sale_items WHERE sale_id = ?').all(saleId);
+        const restoreStmt = this.db.prepare('UPDATE products SET stock = stock + ? WHERE id = ?');
+        for (const item of items) {
+          if (item.product_id === null || item.product_id === undefined) continue;
+          restoreStmt.run(item.quantity, item.product_id);
+        }
+      }
+
+      this.db.prepare('DELETE FROM loans WHERE id = ?').run(loanId);
+      if (saleId) {
+        this.db.prepare('DELETE FROM sale_items WHERE sale_id = ?').run(saleId);
+        this.db.prepare('DELETE FROM sales WHERE id = ?').run(saleId);
+      }
+      return { success: true };
+    });
+    return transaction();
   }
 
   // Remove a single item line from a loan's underlying sale and recalculate totals.

@@ -4022,6 +4022,16 @@ button {
   transform: translateY(-1px);
 }
 
+.btn-action-danger {
+  background: #fee2e2;
+  color: #b91c1c;
+  margin-left: 6px;
+}
+
+.btn-action-danger:hover {
+  background: #fecaca;
+}
+
 /* ============== SYSTEM SETTINGS ============== */
 .settings-section {
   margin-bottom: 30px;
