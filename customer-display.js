@@ -365,7 +365,11 @@ class CustomerDisplay {
 
       // If user provided an explicit port, try it first.
       const preferredPort = this.getPreferredPortFromEnv();
-      if (preferredPort) {
+      const excludedNorm = new Set(this.getExcludedPortsFromEnv().map((p) => String(p).toLowerCase()));
+      if (preferredPort && excludedNorm.has(String(preferredPort).toLowerCase())) {
+        // The scale (or printer) uses this port: never take it, even if it was saved in settings.
+        console.warn(`[CustomerDisplay] ${preferredPort} is in use by the scale/printer - not using it for the display`);
+      } else if (preferredPort) {
         console.log(`[CustomerDisplay] CUSTOMER_DISPLAY_PORT is set, trying ${preferredPort} first...`);
         try {
           await this.connect(preferredPort);
@@ -394,7 +398,8 @@ class CustomerDisplay {
           const pathLower = String(p?.path || '').toLowerCase();
           if (!pathLower) return false;
           // Never try excluded ports
-          if (excluded.size > 0 && excluded.has(pathLower)) return false;
+          // Compare normalized forms: exclusions are stored as \\.\COMx on Windows.
+          if (excluded.size > 0 && (excluded.has(pathLower) || excluded.has(String(this.normalizePortPath(p.path)).toLowerCase()))) return false;
           // Never try COM1/COM2 (commonly motherboard ports)
           if (process.platform === 'win32' && (/^com1$/i.test(p.path) || /^com2$/i.test(p.path))) return false;
           return true;
@@ -416,17 +421,15 @@ class CustomerDisplay {
         return m.includes('prolific') || pid === '2303';
       });
 
-      const filteredCandidates = hasProlific
-        ? scoredCandidates.filter((x) => {
-            const m = (x?.port?.manufacturer || '').toString().toLowerCase();
-            const pid = (x?.port?.productId || '').toString().toLowerCase();
-            // keep prolific + common alternatives, drop ch340 (usually the scale)
-            if (m.includes('prolific') || pid === '2303') return true;
-            if (m.includes('ftdi') || m.includes('cp210') || m.includes('silicon')) return true;
-            if (m.includes('ch340') || pid === '7523') return false;
-            return true;
-          })
-        : scoredCandidates;
+      // Never auto-pick CH340 for the display: it is the scale's USB-RS232 adapter.
+      // Grabbing it (e.g. on a reconnect after a few sales) locks the scale out.
+      // A display that really is on CH340 must be set via CUSTOMER_DISPLAY_PORT / settings.
+      void hasProlific;
+      const filteredCandidates = scoredCandidates.filter((x) => {
+        const m = (x?.port?.manufacturer || '').toString().toLowerCase();
+        const pid = (x?.port?.productId || '').toString().toLowerCase();
+        return !(m.includes('ch340') || m.includes('wch') || pid === '7523');
+      });
 
       const likely = filteredCandidates.filter((x) => x.score > 0);
       const toTry = likely.length > 0 ? likely : (this.tryAllPortsIfNoMatch ? filteredCandidates : []);

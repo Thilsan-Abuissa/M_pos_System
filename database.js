@@ -3,6 +3,34 @@ const path = require('path');
 const { app } = require('electron');
 const crypto = require('crypto');
 
+// Returns that count in reports: every return in [?, ?] (dates). Several partial returns per
+// receipt all count. Only accidental duplicates made by old versions (no sale line recorded;
+// same receipt and amount within 60 s) are dropped.
+// completes_refund = 1 on the return that brings its receipt's refunds up to the sale total.
+const EFFECTIVE_RETURNS_CTE = `
+      effective_returns AS (
+        SELECT r.*,
+          CASE
+            WHEN COALESCE((SELECT SUM(ri.subtotal) FROM returns r2 JOIN return_items ri ON ri.return_id = r2.id
+                           WHERE r2.original_sale_id = r.original_sale_id AND r2.id <= r.id), 0)
+                   >= COALESCE((SELECT total FROM sales WHERE id = r.original_sale_id), 0) - 0.01
+             AND COALESCE((SELECT SUM(ri.subtotal) FROM returns r2 JOIN return_items ri ON ri.return_id = r2.id
+                           WHERE r2.original_sale_id = r.original_sale_id AND r2.id < r.id), 0)
+                   < COALESCE((SELECT total FROM sales WHERE id = r.original_sale_id), 0) - 0.01
+            THEN 1 ELSE 0
+          END AS completes_refund
+        FROM returns r
+        WHERE DATE(r.return_date) BETWEEN ? AND ?
+          AND (EXISTS (SELECT 1 FROM return_items x WHERE x.return_id = r.id AND x.sale_item_id IS NOT NULL)
+          OR NOT EXISTS (
+            SELECT 1 FROM returns d
+            WHERE d.original_sale_id = r.original_sale_id
+              AND d.id < r.id
+              AND ABS(d.total - r.total) < 0.005
+              AND ABS(julianday(r.return_date) - julianday(d.return_date)) * 86400 < 60
+          ))
+      )`;
+
 class POSDatabase {
   constructor() {
     const userDataPath = app.getPath('userData');
@@ -608,6 +636,24 @@ class POSDatabase {
       // Column already exists, ignore error
       if (!error.message.includes('duplicate column name')) {
         console.error('Error adding discount_percent column:', error);
+      }
+    }
+
+    // Receipt printer "plain text" mode (ASCII only, for printers stuck in Chinese mode)
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN printer_plain_text INTEGER DEFAULT 0').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding printer_plain_text column:', error);
+      }
+    }
+
+    // Link return lines to the exact sale line, so partial returns can be tracked per line.
+    try {
+      this.db.prepare('ALTER TABLE return_items ADD COLUMN sale_item_id INTEGER').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding return_items.sale_item_id column:', error);
       }
     }
 
@@ -1412,14 +1458,22 @@ class POSDatabase {
         WHERE si.sale_id = ?
       `).all(id);
 
-      // Attach latest return info (if refunded)
-      sale.return = this.db.prepare(`
-        SELECT id, return_date, subtotal, tax, total, refund_method, reason
-        FROM returns
-        WHERE original_sale_id = ?
-        ORDER BY return_date DESC
-        LIMIT 1
-      `).get(id) || null;
+      // Attach return info. A sale can have several partial returns.
+      sale.returns = this.db.prepare(`
+        SELECT r.id, r.return_date, r.subtotal, r.tax, r.total, r.refund_method, r.reason,
+          COALESCE((SELECT SUM(ri.subtotal) FROM return_items ri WHERE ri.return_id = r.id), r.total) AS items_total
+        FROM returns r
+        WHERE r.original_sale_id = ?
+        ORDER BY r.return_date DESC, r.id DESC
+      `).all(id);
+      sale.return = sale.returns[0] || null;
+      const returnedQty = this.getReturnedQuantitiesBySaleItem(id);
+      sale.items.forEach((item) => {
+        item.returned_quantity = returnedQty.get(item.id) || 0;
+      });
+      sale.returned_total = sale.returns.reduce((sum, r) => sum + (Number(r.items_total) || 0), 0);
+      sale.fully_refunded = sale.items.length > 0
+        && sale.items.every((item) => item.returned_quantity >= Number(item.quantity || 0) - 0.0005);
 
       // Parse split_payments JSON if exists
       if (sale.split_payments) {
@@ -1508,39 +1562,18 @@ class POSDatabase {
   getSalesReport(startDate, endDate) {
     // Include returns (refunds) in sales reports.
     // - Returns are counted on their return_date.
-    // - De-duplicate returns per original_sale_id (keep latest) to avoid historical duplicate refunds.
+    // - Several partial returns per receipt all count. Only accidental duplicates made by old
+    //   versions (no sale line recorded; same receipt and amount within 60 s) are dropped.
     // - Compute return totals + return tax from return_items (more reliable than stored totals).
     const returnsCte = `
-      return_latest_date AS (
-        SELECT original_sale_id, MAX(return_date) AS max_return_date
-        FROM returns
-        WHERE DATE(return_date) BETWEEN ? AND ?
-        GROUP BY original_sale_id
-      ),
-      return_candidates AS (
-        SELECT r.*
-        FROM returns r
-        JOIN return_latest_date m
-          ON m.original_sale_id = r.original_sale_id
-         AND m.max_return_date = r.return_date
-      ),
-      effective_returns AS (
-        SELECT rc.*
-        FROM return_candidates rc
-        JOIN (
-          SELECT original_sale_id, MAX(id) AS max_id
-          FROM return_candidates
-          GROUP BY original_sale_id
-        ) mx
-          ON mx.original_sale_id = rc.original_sale_id
-         AND mx.max_id = rc.id
-      ),
+${EFFECTIVE_RETURNS_CTE},
       return_totals AS (
         SELECT
           er.id AS return_id,
           er.return_date,
           er.original_sale_id,
-          er.refund_method
+          er.refund_method,
+          er.completes_refund
         FROM effective_returns er
       ),
       return_item_totals AS (
@@ -1548,6 +1581,7 @@ class POSDatabase {
           rt.return_id,
           DATE(rt.return_date) AS date,
           COUNT(DISTINCT rt.return_id) AS return_count,
+          MAX(rt.completes_refund) AS refunded_count,
           COALESCE(SUM(ri.subtotal), 0) AS return_total,
           COALESCE(SUM(
             CASE
@@ -1572,6 +1606,7 @@ class POSDatabase {
         SELECT
           date,
           COUNT(*) AS return_count,
+          COALESCE(SUM(refunded_count), 0) AS refunded_count,
           COALESCE(SUM(return_total), 0) AS return_total,
           COALESCE(SUM(return_tax), 0) AS return_tax,
           COALESCE(SUM(return_subtotal), 0) AS return_subtotal
@@ -1605,8 +1640,8 @@ class POSDatabase {
       SELECT
         d.date AS date,
         CASE
-          WHEN (COALESCE(s.sales_count, 0) - COALESCE(r.return_count, 0)) > 0
-            THEN (COALESCE(s.sales_count, 0) - COALESCE(r.return_count, 0))
+          WHEN (COALESCE(s.sales_count, 0) - COALESCE(r.refunded_count, 0)) > 0
+            THEN (COALESCE(s.sales_count, 0) - COALESCE(r.refunded_count, 0))
           ELSE 0
         END AS transaction_count,
         (COALESCE(s.sales_total, 0) - COALESCE(r.return_total, 0)) AS total_sales,
@@ -2262,6 +2297,9 @@ class POSDatabase {
         lp.*,
         l.sale_id AS sale_id,
         l.loan_amount AS loan_amount,
+        l.customer_type AS loan_customer_type,
+        l.customer_name AS loan_customer_name,
+        l.restaurant_name AS loan_restaurant_name,
         s.total AS sale_total,
         s.sale_date AS sale_date,
         (SELECT json_group_array(json_object(
@@ -2341,6 +2379,144 @@ class POSDatabase {
 
   // Remove a single item line from a loan's underlying sale and recalculate totals.
   // Used for editing PARKING before payment.
+  // Recalculates a PARKING's sale totals from its sale_items, then the loan amount,
+  // remaining amount and status (keeping what was already paid).
+  _recalcLoanTotals(loan, saleId) {
+    const loanId = loan.id;
+    const moneyToCents = (amount) => {
+      const num = Number(amount);
+      if (!Number.isFinite(num)) return 0;
+      return Math.round((num + Number.EPSILON) * 100);
+    };
+    const centsToMoney = (cents) => {
+      const num = Number(cents);
+      if (!Number.isFinite(num)) return 0;
+      return num / 100;
+    };
+
+    // Recalculate sale totals from the sale_items
+    const rows = this.db.prepare(`
+      SELECT si.*, COALESCE(p.tax_rate, c.tax_rate, 0) AS tax_rate
+      FROM sale_items si
+      LEFT JOIN products p ON p.id = si.product_id
+      LEFT JOIN categories c ON c.name = p.category
+      WHERE si.sale_id = ?
+    `).all(saleId);
+
+    let subtotalCents = 0;
+    let taxCents = 0;
+    let discountCents = 0;
+    let totalCents = 0;
+
+    for (const r of rows) {
+      const qty = Number(r.quantity || 0);
+      const unitPriceCents = moneyToCents(Number(r.unit_price || 0));
+      const originalCents = Math.round(unitPriceCents * qty);
+      const discPercent = Number(r.discount_percent || 0);
+      const lineDiscountCents = Math.round(originalCents * (discPercent / 100));
+      const finalCents = Math.max(0, originalCents - lineDiscountCents);
+
+      const taxRate = Number(r.tax_rate || 0);
+      const baseCents = Math.round(finalCents / (1 + taxRate));
+      const lineTaxCents = finalCents - baseCents;
+
+      subtotalCents += baseCents;
+      taxCents += lineTaxCents;
+      discountCents += lineDiscountCents;
+      totalCents += finalCents;
+    }
+
+    this.db.prepare(`
+      UPDATE sales
+      SET subtotal = ?, tax = ?, discount = ?, total = ?
+      WHERE id = ?
+    `).run(
+      centsToMoney(subtotalCents),
+      centsToMoney(taxCents),
+      centsToMoney(discountCents),
+      centsToMoney(totalCents),
+      saleId
+    );
+
+    const paidAmount = Number(loan.paid_amount || 0);
+    const newLoanAmount = centsToMoney(totalCents);
+    const remainingAmount = Math.max(0, newLoanAmount - paidAmount);
+    const status = remainingAmount <= 0.01
+      ? 'paid'
+      : (paidAmount > 0.01 ? 'partial' : 'pending');
+
+    this.db.prepare(`
+      UPDATE loans
+      SET loan_amount = ?, remaining_amount = ?, status = ?
+      WHERE id = ?
+    `).run(
+      newLoanAmount,
+      remainingAmount,
+      status,
+      loanId
+    );
+  }
+
+  // Saves cashier edits (name, unit price, quantity, discount) of lines already in a PARKING.
+  // Only lines that changed are written; stock follows the quantity change.
+  updateLoanSaleItems(loanId, edits) {
+    const transaction = this.db.transaction(() => {
+      const loan = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId);
+      if (!loan) throw new Error('Loan not found');
+      if ((loan.status || '').toString().toLowerCase() === 'paid') {
+        throw new Error('Cannot edit a paid PARKING');
+      }
+      const saleId = loan.sale_id;
+      if (!saleId) throw new Error('Loan sale not found');
+
+      const getItem = this.db.prepare('SELECT * FROM sale_items WHERE id = ? AND sale_id = ?');
+      const updateItem = this.db.prepare(`
+        UPDATE sale_items
+        SET product_name = ?, unit_price = ?, quantity = ?, discount_percent = ?, subtotal = ?
+        WHERE id = ? AND sale_id = ?
+      `);
+      const updateStock = this.db.prepare('UPDATE products SET stock = stock + ? WHERE id = ?');
+
+      let changed = 0;
+      for (const edit of (edits || [])) {
+        const item = getItem.get(Number(edit.saleItemId), saleId);
+        if (!item) continue;
+
+        const name = String(edit.productName ?? item.product_name).trim() || item.product_name;
+        const unitPrice = Number.isFinite(Number(edit.unitPrice)) && Number(edit.unitPrice) >= 0 ? Number(edit.unitPrice) : Number(item.unit_price);
+        const quantity = Number.isFinite(Number(edit.quantity)) && Number(edit.quantity) > 0 ? Number(edit.quantity) : Number(item.quantity);
+        const discountPercent = Number.isFinite(Number(edit.discountPercent))
+          ? Math.min(100, Math.max(0, Number(edit.discountPercent)))
+          : Number(item.discount_percent || 0);
+
+        const same = name === item.product_name
+          && Math.abs(unitPrice - Number(item.unit_price)) < 0.00001
+          && Math.abs(quantity - Number(item.quantity)) < 0.00001
+          && Math.abs(discountPercent - Number(item.discount_percent || 0)) < 0.00001;
+        if (same) continue;
+
+        // Same rounding as the totals: price x qty, minus the discount (stored subtotal is final).
+        const originalCents = Math.round(Math.round(unitPrice * 100) * quantity);
+        const finalCents = Math.max(0, originalCents - Math.round(originalCents * (discountPercent / 100)));
+        updateItem.run(name, unitPrice, quantity, discountPercent, finalCents / 100, item.id, saleId);
+
+        if (item.product_id !== null && item.product_id !== undefined) {
+          try { updateStock.run(Number(item.quantity) - quantity, item.product_id); } catch { /* ignore */ }
+        }
+        changed++;
+      }
+
+      if (changed > 0) this._recalcLoanTotals(loan, saleId);
+
+      const updated = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId);
+      try { updated.sale = this.getSaleById(updated.sale_id); } catch { /* ignore */ }
+      updated.changedItems = changed;
+      return updated;
+    });
+
+    return transaction();
+  }
+
   removeSaleItemFromLoan(loanId, saleItemId) {
     const moneyToCents = (amount) => {
       const num = Number(amount);
@@ -2378,67 +2554,7 @@ class POSDatabase {
 
       this.db.prepare('DELETE FROM sale_items WHERE id = ? AND sale_id = ?').run(saleItemId, saleId);
 
-      // Recalculate sale totals from remaining sale_items
-      const rows = this.db.prepare(`
-        SELECT si.*, COALESCE(p.tax_rate, c.tax_rate, 0) AS tax_rate
-        FROM sale_items si
-        LEFT JOIN products p ON p.id = si.product_id
-        LEFT JOIN categories c ON c.name = p.category
-        WHERE si.sale_id = ?
-      `).all(saleId);
-
-      let subtotalCents = 0;
-      let taxCents = 0;
-      let discountCents = 0;
-      let totalCents = 0;
-
-      for (const r of rows) {
-        const qty = Number(r.quantity || 0);
-        const unitPriceCents = moneyToCents(Number(r.unit_price || 0));
-        const originalCents = Math.round(unitPriceCents * qty);
-        const discPercent = Number(r.discount_percent || 0);
-        const lineDiscountCents = Math.round(originalCents * (discPercent / 100));
-        const finalCents = Math.max(0, originalCents - lineDiscountCents);
-
-        const taxRate = Number(r.tax_rate || 0);
-        const baseCents = Math.round(finalCents / (1 + taxRate));
-        const lineTaxCents = finalCents - baseCents;
-
-        subtotalCents += baseCents;
-        taxCents += lineTaxCents;
-        discountCents += lineDiscountCents;
-        totalCents += finalCents;
-      }
-
-      this.db.prepare(`
-        UPDATE sales
-        SET subtotal = ?, tax = ?, discount = ?, total = ?
-        WHERE id = ?
-      `).run(
-        centsToMoney(subtotalCents),
-        centsToMoney(taxCents),
-        centsToMoney(discountCents),
-        centsToMoney(totalCents),
-        saleId
-      );
-
-      const paidAmount = Number(loan.paid_amount || 0);
-      const newLoanAmount = centsToMoney(totalCents);
-      const remainingAmount = Math.max(0, newLoanAmount - paidAmount);
-      const status = remainingAmount <= 0.01
-        ? 'paid'
-        : (paidAmount > 0.01 ? 'partial' : 'pending');
-
-      this.db.prepare(`
-        UPDATE loans
-        SET loan_amount = ?, remaining_amount = ?, status = ?
-        WHERE id = ?
-      `).run(
-        newLoanAmount,
-        remainingAmount,
-        status,
-        loanId
-      );
+      this._recalcLoanTotals(loan, saleId);
 
       const updated = this.db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId);
       try {
@@ -2519,18 +2635,64 @@ class POSDatabase {
   }
 
   // Returns Management
+  // Quantity already returned per sale line. Older returns have no sale_item_id; those are
+  // matched by product, filling the sale's lines of that product in order.
+  getReturnedQuantitiesBySaleItem(originalSaleId) {
+    const saleItems = this.db.prepare('SELECT id, product_id, quantity FROM sale_items WHERE sale_id = ? ORDER BY id').all(originalSaleId);
+    const returnedLines = this.db.prepare(`
+      SELECT ri.sale_item_id, ri.product_id, ri.quantity
+      FROM return_items ri
+      JOIN returns r ON r.id = ri.return_id
+      WHERE r.original_sale_id = ?
+    `).all(originalSaleId);
+
+    const returned = new Map(saleItems.map((si) => [si.id, 0]));
+    const unlinked = [];
+    returnedLines.forEach((line) => {
+      if (line.sale_item_id != null && returned.has(line.sale_item_id)) {
+        returned.set(line.sale_item_id, returned.get(line.sale_item_id) + Number(line.quantity || 0));
+      } else {
+        unlinked.push(line);
+      }
+    });
+    unlinked.forEach((line) => {
+      let left = Number(line.quantity || 0);
+      saleItems.filter((si) => si.product_id === line.product_id).forEach((si) => {
+        if (left <= 0) return;
+        const free = Math.max(0, Number(si.quantity || 0) - returned.get(si.id));
+        const take = Math.min(free, left);
+        returned.set(si.id, returned.get(si.id) + take);
+        left -= take;
+      });
+    });
+    return returned;
+  }
+
   createReturn(returnData) {
     const transaction = this.db.transaction((data) => {
-      const existing = this.db.prepare(
-        'SELECT id, return_date FROM returns WHERE original_sale_id = ? ORDER BY return_date DESC LIMIT 1'
-      ).get(data.originalSaleId);
-
-      if (existing) {
-        const msg = `Return already exists for receipt #${data.originalSaleId} (Return ID: ${existing.id}).`;
-        const err = new Error(msg);
-        err.code = 'RETURN_ALREADY_EXISTS';
+      const items = (data.items || []).filter((item) => Number(item.quantity) > 0);
+      if (items.length === 0) {
+        const err = new Error('No items selected to return.');
+        err.code = 'RETURN_NO_ITEMS';
         throw err;
       }
+
+      // Never refund more than was sold on a line (also blocks double-clicked duplicates).
+      const saleItems = new Map(
+        this.db.prepare('SELECT id, product_name, quantity FROM sale_items WHERE sale_id = ?').all(data.originalSaleId)
+          .map((si) => [si.id, si])
+      );
+      const returned = this.getReturnedQuantitiesBySaleItem(data.originalSaleId);
+      items.forEach((item) => {
+        const si = saleItems.get(Number(item.saleItemId));
+        if (!si) return; // legacy callers without a sale line id
+        const remaining = Number(si.quantity || 0) - (returned.get(si.id) || 0);
+        if (Number(item.quantity) > remaining + 0.0005) {
+          const err = new Error(`RETURN_QTY_EXCEEDED: ${si.product_name} - only ${Math.max(0, +remaining.toFixed(3))} left to return.`);
+          err.code = 'RETURN_QTY_EXCEEDED';
+          throw err;
+        }
+      });
 
       // Create return record
       const returnStmt = this.db.prepare(`
@@ -2552,20 +2714,21 @@ class POSDatabase {
       
       // Insert return items and restore stock
       const itemStmt = this.db.prepare(`
-        INSERT INTO return_items (return_id, product_id, product_name, quantity, unit_price, subtotal)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO return_items (return_id, product_id, product_name, quantity, unit_price, subtotal, sale_item_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
       
       const updateStockStmt = this.db.prepare('UPDATE products SET stock = stock + ? WHERE id = ?');
       
-      data.items.forEach(item => {
+      items.forEach(item => {
         itemStmt.run(
           returnId,
           item.productId,
           item.productName,
           item.quantity,
           item.unitPrice,
-          item.subtotal
+          item.subtotal,
+          item.saleItemId != null ? Number(item.saleItemId) : null
         );
         
         // Restore stock
@@ -2579,6 +2742,7 @@ class POSDatabase {
             'product_name', ri.product_name,
             'quantity', ri.quantity,
             'unit_price', ri.unit_price,
+            'sale_item_id', ri.sale_item_id,
             'subtotal', ri.subtotal
           ))
           FROM return_items ri WHERE ri.return_id = r.id) as items
@@ -2598,6 +2762,7 @@ class POSDatabase {
           'product_name', ri.product_name,
           'quantity', ri.quantity,
           'unit_price', ri.unit_price,
+            'sale_item_id', ri.sale_item_id,
           'subtotal', ri.subtotal
         ))
         FROM return_items ri WHERE ri.return_id = r.id) as items
@@ -2625,6 +2790,7 @@ class POSDatabase {
           'product_name', ri.product_name,
           'quantity', ri.quantity,
           'unit_price', ri.unit_price,
+            'sale_item_id', ri.sale_item_id,
           'subtotal', ri.subtotal
         ))
         FROM return_items ri WHERE ri.return_id = r.id) as items
@@ -2641,6 +2807,7 @@ class POSDatabase {
           'product_name', ri.product_name,
           'quantity', ri.quantity,
           'unit_price', ri.unit_price,
+            'sale_item_id', ri.sale_item_id,
           'subtotal', ri.subtotal
         ))
         FROM return_items ri WHERE ri.return_id = r.id) as items
@@ -2830,6 +2997,7 @@ class POSDatabase {
           'product_name', ri.product_name,
           'quantity', ri.quantity,
           'unit_price', ri.unit_price,
+            'sale_item_id', ri.sale_item_id,
           'subtotal', ri.subtotal
         ))
         FROM return_items ri WHERE ri.return_id = r.id) as items
@@ -2853,6 +3021,7 @@ class POSDatabase {
           'product_name', ri.product_name,
           'quantity', ri.quantity,
           'unit_price', ri.unit_price,
+            'sale_item_id', ri.sale_item_id,
           'subtotal', ri.subtotal
         ))
         FROM return_items ri WHERE ri.return_id = r.id) as items
@@ -2889,6 +3058,7 @@ class POSDatabase {
           receipt_footer = ?,
           printer_name = ?,
           customer_display_port = ?,
+          printer_plain_text = COALESCE(?, printer_plain_text),
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
     `);
@@ -2902,8 +3072,9 @@ class POSDatabase {
       settings.currencyCode,
       settings.taxRate,
       settings.receiptFooter,
-      settings.printerName || null,
-      settings.customerDisplayPort || null
+      String(settings.printerName || '').trim() || null,
+      settings.customerDisplayPort || null,
+      settings.printerPlainText === undefined ? null : (settings.printerPlainText ? 1 : 0)
     );
     return this.getSystemSettings();
   }
@@ -3032,38 +3203,16 @@ class POSDatabase {
   getAnalyticsData(startDate, endDate) {
     // Returns are stored separately from sales. For analytics we want net figures:
     //   net = sales in range - returns in range
-    // Also, de-duplicate returns by original_sale_id (keep the latest) to avoid old duplicate refunds
-    // inflating reports.
+    // A receipt can have several partial returns: all count toward the amounts, but a
+    // transaction is only removed from the counts once its receipt is fully refunded.
     const returnsCte = `
-      return_latest_date AS (
-        SELECT original_sale_id, MAX(return_date) AS max_return_date
-        FROM returns
-        WHERE DATE(return_date) BETWEEN ? AND ?
-        GROUP BY original_sale_id
-      ),
-      return_candidates AS (
-        SELECT r.*
-        FROM returns r
-        JOIN return_latest_date m
-          ON m.original_sale_id = r.original_sale_id
-         AND m.max_return_date = r.return_date
-      ),
-      effective_returns AS (
-        SELECT rc.*
-        FROM return_candidates rc
-        JOIN (
-          SELECT original_sale_id, MAX(id) AS max_id
-          FROM return_candidates
-          GROUP BY original_sale_id
-        ) mx
-          ON mx.original_sale_id = rc.original_sale_id
-         AND mx.max_id = rc.id
-      ),
+${EFFECTIVE_RETURNS_CTE},
       return_totals AS (
         SELECT er.id AS return_id,
                er.return_date,
                er.original_sale_id,
                er.refund_method,
+               er.completes_refund,
                COALESCE((SELECT SUM(subtotal) FROM return_items ri WHERE ri.return_id = er.id), 0) AS return_total
         FROM effective_returns er
       )
@@ -3094,7 +3243,7 @@ class POSDatabase {
       returns_by_date AS (
         SELECT
           DATE(rt.return_date) AS date,
-          COUNT(*) AS return_count,
+          COALESCE(SUM(rt.completes_refund), 0) AS return_count,
           COALESCE(SUM(rt.return_total), 0) AS total_returns
         FROM return_totals rt
         GROUP BY DATE(rt.return_date)
@@ -3138,7 +3287,7 @@ class POSDatabase {
       returns_by_hour AS (
         SELECT
           CAST(strftime('%H', rt.return_date) AS INTEGER) AS hour,
-          COUNT(*) AS return_count,
+          COALESCE(SUM(rt.completes_refund), 0) AS return_count,
           COALESCE(SUM(rt.return_total), 0) AS total_returns
         FROM return_totals rt
         GROUP BY hour
@@ -3274,7 +3423,7 @@ class POSDatabase {
       returns_by_method AS (
         SELECT
           COALESCE(rt.refund_method, 'Unknown') AS payment_method,
-          COUNT(*) AS return_count,
+          COALESCE(SUM(rt.completes_refund), 0) AS return_count,
           COALESCE(SUM(rt.return_total), 0) AS total_returns
         FROM return_totals rt
         GROUP BY rt.refund_method

@@ -410,9 +410,6 @@ function showBarcodeOverlay({ barcode, name } = {}) {
   const close = () => {
     try { overlay.remove(); } catch { /* ignore */ }
   };
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
   header.querySelector('#barcodeOverlayClose')?.addEventListener('click', close);
 
   const svg = body.querySelector('#barcodeOverlaySvg');
@@ -655,9 +652,7 @@ function showConfirmDialog({
       resolve(true);
     };
 
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) onCancel();
-    });
+    // Forms stay open on a tap outside; they close with their own buttons.
     document.getElementById('copilotConfirmCancel')?.addEventListener('click', onCancel, { once: true });
     document.getElementById('copilotConfirmOk')?.addEventListener('click', onOk, { once: true });
     document.addEventListener('keydown', function escHandler(e) {
@@ -727,10 +722,6 @@ function promptForVatPercent() {
       if (n < 0 || n > 100) return null;
       return n;
     };
-
-    o.addEventListener('click', (e) => {
-      if (e.target === o) closePrompt(null);
-    });
 
     document.getElementById('quickVatPromptCancel')?.addEventListener('click', () => closePrompt(null), { once: true });
     document.getElementById('quickVatPromptOk')?.addEventListener('click', () => {
@@ -1162,9 +1153,7 @@ async function showQuickAddProductDialog({ barcode, defaults = {} } = {}) {
       }
     };
 
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) close();
-    });
+    // Forms stay open on a tap outside; they close with their own buttons.
     document.getElementById('quickAddCancel')?.addEventListener('click', close, { once: true });
     document.getElementById('quickAddProductClose')?.addEventListener('click', close, { once: true });
     document.getElementById('quickAddSave')?.addEventListener('click', onSave);
@@ -1776,7 +1765,7 @@ function showLoadingScreen() {
 async function updateLoadingBranding() {
   try {
     const systemSettings = await window.api.getSystemSettings();
-    const storeName = systemSettings?.store_name || 'Supermarket POS';
+    const storeName = systemSettings?.store_name || 'BDCONNECT POS';
     const storeLogo = systemSettings?.store_logo || '';
     
     const hasLogo = storeLogo && storeLogo.trim() !== '';
@@ -1938,7 +1927,7 @@ async function updateBrandingUI() {
       systemSettings = await window.api.getSystemSettings();
     }
     
-    const storeName = systemSettings?.store_name || 'Supermarket POS';
+    const storeName = systemSettings?.store_name || 'BDCONNECT POS';
     const storeLogo = systemSettings?.store_logo || '';
     
     // Check if logo exists
@@ -1949,20 +1938,18 @@ async function updateBrandingUI() {
     const loginLogo = document.getElementById('loginLogo');
     const loginTitle = document.getElementById('loginTitle');
     if (loginLogo && loginTitle) {
+      // Login always shows the product name BDCONNECT POS; the store logo (if any) sits above it.
+      loginTitle.style.display = 'block';
+      loginTitle.textContent = 'BDCONNECT POS';
       if (hasLogo) {
-        // Show logo, hide name
         loginLogo.style.display = 'flex';
-        loginTitle.style.display = 'none';
         if (isImage) {
           loginLogo.innerHTML = `<img src="${storeLogo}" alt="Logo">`;
         } else {
           loginLogo.textContent = storeLogo;
         }
       } else {
-        // Show name, hide logo
         loginLogo.style.display = 'none';
-        loginTitle.style.display = 'block';
-        loginTitle.textContent = storeName;
       }
     }
     
@@ -2229,9 +2216,7 @@ async function promptForRolePassword(user) {
 
     if (cancelBtn) cancelBtn.addEventListener('click', () => cleanup(null), { once: true });
     if (okBtn) okBtn.addEventListener('click', submit);
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) cleanup(null);
-    });
+    // Forms stay open on a tap outside; they close with their own buttons.
 
     setTimeout(() => {
       try {
@@ -3055,9 +3040,9 @@ function openCoPanel(view, pinConfirmed = false) {
   const titleEl = document.getElementById('coPanelTitle');
   if (!panel || !content) return;
 
-  // Toggle: clicking the same button again closes the panel
+  // Tapping the button of the page already open keeps it open: the panel closes
+  // only with its own close button, so a double tap never shuts it by accident.
   if (panel.dataset.openView === view && panel.classList.contains('co-panel--open')) {
-    closeCoPanel();
     return;
   }
 
@@ -3418,14 +3403,7 @@ function setupPaymentModal() {
     });
   }
 
-  // Close modal when clicking outside
-  if (paymentModal) {
-    paymentModal.addEventListener('click', (e) => {
-      if (e.target === paymentModal) {
-        closePaymentModalFunc();
-      }
-    });
-  }
+  // Payment does not close on a tap outside; only its own close button closes it.
 
   // Payment mode toggle
   if (singlePaymentModeBtn) {
@@ -5107,8 +5085,45 @@ function promptForWeight(productId) {
     return isZeroPriceProduct ? getTypedUnitPrice() : product.price;
   }
 
+  // Zero-price products: the keypad types into the field the cashier last tapped
+  // (unit price by default, or the weight to override the scale reading).
+  let keypadTarget = 'price';
+  let weightTypedManually = false;
+
+  function setKeypadTarget(target) {
+    keypadTarget = target;
+    unitPriceInput?.classList.toggle('keypad-target', target === 'price');
+    weightInput?.classList.toggle('keypad-target', target === 'weight');
+  }
+
+  function applyWeightKey(key) {
+    // The first key replaces the scale reading / default quantity.
+    let v = weightTypedManually ? String(weightInput.value || '').replace(/\s*kg$/i, '') : '';
+    if (key === 'clear') v = '';
+    else if (key === 'backspace') v = v.slice(0, -1);
+    else if (key === 'dot') {
+      if (v.includes('.')) return;
+      v = v ? v + '.' : '0.';
+    } else if (/^\d$/.test(key)) {
+      const dot = v.indexOf('.');
+      if (dot >= 0 && v.length - dot > 3) return; // max 3 decimals (grams)
+      v = (v === '0') ? key : v + key;
+    } else {
+      return;
+    }
+    // Typed weight wins over the live scale reading for this item.
+    weightTypedManually = true;
+    stopScaleAutoRead();
+    weightInput.value = (v && isWeightBased) ? `${v} kg` : v;
+    updateDisplayedTotal();
+  }
+
   function applyUnitPriceKey(key) {
     if (!unitPriceInput) return;
+    if (keypadTarget === 'weight') {
+      applyWeightKey(key);
+      return;
+    }
     let v = String(unitPriceInput.value || '');
     if (key === 'clear') v = '';
     else if (key === 'backspace') v = v.slice(0, -1);
@@ -5140,6 +5155,13 @@ function promptForWeight(productId) {
     };
   }
   if (unitPriceBackspace) unitPriceBackspace.onclick = () => applyUnitPriceKey('backspace');
+  // Readonly weight field on zero-price products: the keypad edits it, so tapping it
+  // must not pop the on-screen keyboard.
+  weightInput.readOnly = isZeroPriceProduct;
+  weightInput.inputMode = isZeroPriceProduct ? 'none' : 'decimal';
+  weightInput.onpointerdown = isZeroPriceProduct ? () => setKeypadTarget('weight') : null;
+  if (unitPriceInput) unitPriceInput.onpointerdown = isZeroPriceProduct ? () => setKeypadTarget('price') : null;
+  setKeypadTarget(isZeroPriceProduct ? 'price' : null);
 
   function getEnteredUnitPrice() {
     const rawText = (priceInput.value || '').toString().trim();
@@ -5408,6 +5430,7 @@ function promptForWeight(productId) {
   // Toggle button handlers
   weightModeBtn.onclick = () => {
     isWeightBased = true;
+    weightTypedManually = false;
     weightUnit = 'kg';
     updateModeUI();
 
@@ -5418,6 +5441,7 @@ function promptForWeight(productId) {
   
   quantityModeBtn.onclick = () => {
     isWeightBased = false;
+    weightTypedManually = false;
     updateModeUI();
     weightInput.removeEventListener('input', handleManualWeightInput);
     weightInput.addEventListener('input', handleManualQuantityInput);
@@ -5672,6 +5696,8 @@ function editCartWeight(productId) {
   const modalTitle = document.getElementById('weightModalTitle');
   
   modalTitle.textContent = 'Edit Weight';
+  weightInput.readOnly = false;
+  weightInput.inputMode = 'decimal';
   productNameEl.textContent = product.name;
   productPriceEl.textContent = `${currencySymbol}${product.price.toFixed(2)}/kg (Current: ${cartItem.quantity.toFixed(2)} kg)`;
   weightInput.value = cartItem.quantity.toFixed(2);
@@ -6072,9 +6098,7 @@ function openProductWeightFlow(productId, options = {}) {
 
   if (cancelBtn) cancelBtn.addEventListener('click', cleanup, { once: true });
   if (okBtn) okBtn.addEventListener('click', submit);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) cleanup();
-  });
+  // Forms stay open on a tap outside; they close with their own buttons.
 
   // Keep focus off the readonly field on touch Windows PCs so the OS/app keyboard
   // does not pop up when this price-entry overlay opens.
@@ -6191,9 +6215,6 @@ function promptForVariosPrice() {
       applyKey(btn.dataset.value);
     });
 
-    o.addEventListener('click', (e) => {
-      if (e.target === o) closePrompt(null);
-    });
     document.getElementById('variosPromptCancel')?.addEventListener('click', () => closePrompt(null), { once: true });
     document.getElementById('variosPromptOk')?.addEventListener('click', submit, { once: true });
 
@@ -6424,6 +6445,23 @@ function updateCartQuantity(productId, change) {
     recalcCartItemMoney(item);
     updateCartDisplay();
   }
+}
+
+// Cart lines that are already in a PARKING (they have a saleItemId) can be edited like any
+// other line; this writes those edits (name, price, quantity, discount) to the PARKING.
+async function saveParkedItemEdits() {
+  const parked = (Array.isArray(cart) ? cart : []).filter(i =>
+    Number.isFinite(Number(i?.saleItemId)) && Number.isFinite(Number(i?.loanId)));
+  if (parked.length === 0) return null;
+  const loanId = Number(parked[0].loanId);
+  const edits = parked.map(i => ({
+    saleItemId: Number(i.saleItemId),
+    productName: i.productName,
+    unitPrice: Number.isFinite(Number(i.unitPriceCents)) ? centsToMoney(i.unitPriceCents) : Number(i.unitPrice),
+    quantity: Number(i.quantity),
+    discountPercent: Number(i.discountPercent || 0)
+  }));
+  return await window.api.updateLoanSaleItems(loanId, edits);
 }
 
 function removeFromCart(cartItemId) {
@@ -6724,7 +6762,8 @@ function setupInlineCartEditing() {
     if (!editableEl || !cartTableBody.contains(editableEl)) return;
     if (editableEl.querySelector('input')) return;
 
-    const cartItemId = parseInt(editableEl.dataset.cartItemId, 10);
+    // Not parseInt: PARKING items get fractional ids (Date.now() + Math.random()).
+    const cartItemId = Number(editableEl.dataset.cartItemId);
     if (!Number.isFinite(cartItemId)) return;
     const cartItem = cart.find(item => item.cartItemId === cartItemId);
     if (!cartItem) return;
@@ -7251,6 +7290,8 @@ async function printTicket() {
       || name.includes('tp7001')
       || name.includes('tp 7001')
       || name.includes('iggual')
+      || name.includes('jp-80')
+      || name.includes('jp80')
       || name.includes('tm-t20')
       || name.includes('tm t20')
       || name.includes('tm-t88')
@@ -7503,6 +7544,9 @@ async function completeSale() {
         throw new Error('This PARKING is already paid');
       }
 
+      // Keep edits made to items that were already parked.
+      await saveParkedItemEdits();
+
       const newItems = (Array.isArray(cart) ? cart : []).filter(i => !Number.isFinite(Number(i?.saleItemId)));
       if (newItems.length === 0) {
         // No new scanned items. Still allow using PARKING as a "Done" action
@@ -7616,6 +7660,26 @@ async function completeSale() {
       // must be appended to the underlying loan sale BEFORE we settle the payment.
       // Otherwise the newly added products won't be part of the final PARKING bill.
       {
+        // Edits to already-parked items change what is owed: save them and pay the new amount.
+        try {
+          const edited = await saveParkedItemEdits();
+          if (edited && Number(edited.changedItems) > 0) {
+            paymentData.amount = Number(edited.remaining_amount || 0);
+            // Already-paid money now covers the new total: nothing left to charge.
+            if (String(edited.status || '').toLowerCase() === 'paid') {
+              sessionStorage.removeItem('parkingPayment');
+              closePaymentModalFunc();
+              cart = [];
+              updateCartDisplay();
+              showAlert('PARKING updated. It is now fully paid, nothing left to charge.', 'success');
+              return;
+            }
+          }
+        } catch (e) {
+          showAlert('Failed to save PARKING changes: ' + (e?.message || e), 'error', 'PARKING');
+          return;
+        }
+
         const receiptNumber = String(paymentData?.receiptNumber || '').trim();
         const newItems = (Array.isArray(cart) ? cart : []).filter(i => {
           if (!i) return false;
@@ -7741,35 +7805,7 @@ async function completeSale() {
       cart = [];
       updateCartDisplay();
       
-      // Navigate back to parking view and show only pending transactions
-      setTimeout(() => {
-        // Update active nav button
-        const navBtns = document.querySelectorAll('.tab-btn');
-        navBtns.forEach(b => b.classList.remove('active'));
-        const targetBtn = document.querySelector('[data-view="loans"]');
-        if (targetBtn) {
-          targetBtn.classList.add('active');
-        }
-        
-        // Show loans view
-        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-        document.getElementById('loansView').classList.add('active');
-        
-        // Toggle navbar visibility
-        toggleNavbarForView('loans');
-        
-        // Switch to "All PARKING" tab to show clean active transactions (no paid)
-        document.querySelectorAll('.loan-filter-tab').forEach(t => t.classList.remove('active'));
-        const allTab = document.querySelector('[data-status="all"]');
-        if (allTab) {
-          allTab.classList.add('active');
-        }
-        
-        // Load only active loans (pending + partial, excluding paid)
-        setTimeout(() => {
-          loadLoansView('active');
-        }, 500);
-      }, 1000);
+      // Stay on Checkout with an empty cart, ready for the next customer.
       
       return;
       }
@@ -7993,12 +8029,21 @@ function showReceipt(sale) {
     </div>
     
     <div class="receipt-items">
-      ${sale.items.map(item => `
-        <div class="receipt-item">
+      ${sale.items.map(item => {
+        const returnedQty = Number(item.returned_quantity) || 0;
+        const fullyReturned = returnedQty > 0 && returnedQty >= (Number(item.quantity) || 0) - 0.0005;
+        return `
+        <div class="receipt-item" ${fullyReturned ? 'style="text-decoration: line-through; color: #94a3b8;"' : ''}>
           <span>${item.product_name} x${item.quantity}</span>
           <span>${currencySymbol}${item.subtotal.toFixed(2)}</span>
         </div>
-      `).join('')}
+        ${returnedQty > 0 ? `
+        <div class="receipt-item" style="color: #dc2626; font-size: 12px;">
+          <span style="text-decoration: line-through;">↩️ returned x${formatReturnQty(returnedQty)}</span>
+          <span></span>
+        </div>` : ''}
+      `;
+      }).join('')}
     </div>
     
     <div class="receipt-summary">
@@ -8015,6 +8060,16 @@ function showReceipt(sale) {
         <span>TOTAL:</span>
         <span>${currencySymbol}${sale.total.toFixed(2)}</span>
       </div>
+      ${Number(sale.returned_total) > 0 ? `
+        <div class="receipt-item" style="color: #dc2626; font-weight: bold;">
+          <span>REFUNDED (${(sale.returns || []).length}):</span>
+          <span>-${currencySymbol}${Number(sale.returned_total).toFixed(2)}</span>
+        </div>
+        <div class="receipt-item" style="font-weight: bold;">
+          <span>NET:</span>
+          <span>${currencySymbol}${(sale.total - Number(sale.returned_total)).toFixed(2)}</span>
+        </div>
+      ` : ''}
       ${sale.payment_method === 'split' && sale.split_payments ? `
         <div class="receipt-item" style="border-top: 1px solid #000; padding-top: 8px; margin-top: 8px;">
           <span>Payment Method:</span>
@@ -8353,6 +8408,34 @@ async function completeLoanPaymentFromCheckout(receiptNumber, amount, paymentMet
 // Function to handle parking payment in checkout page
 async function payParkingInCheckout(receiptNumber, remainingAmount) {
   try {
+    // Switch to Checkout right away so the PARKING page never lingers while the
+    // loan details load; the cart and banner fill in once the lookup returns.
+    // PARKING opened from the Checkout menu bar lives in the side panel, which sits
+    // over the cart: close it, or the cashier stays on the PARKING page.
+    try { closeCoPanel(); } catch { /* ignore */ }
+    setParkingPaymentContext({
+      receiptNumber: receiptNumber,
+      amount: remainingAmount,
+      remainingAmount: Number(remainingAmount || 0),
+      timestamp: Date.now()
+    });
+
+    const navBtns = document.querySelectorAll('.tab-btn');
+    navBtns.forEach(b => b.classList.remove('active'));
+    const targetBtn = document.querySelector('[data-view="checkout"]');
+    if (targetBtn) {
+      targetBtn.classList.add('active');
+    }
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById('checkoutView').classList.add('active');
+    _currentView = 'checkout';
+    toggleNavbarForView('checkout');
+    try { updateParkingContextBanner(); } catch { /* ignore */ }
+
+    // Load checkout view data (kept as a promise so we can wait for it below;
+    // otherwise its late cart refresh can reset the auto-selected payment).
+    const checkoutReady = loadCheckoutView().catch(() => {});
+
     // Store parking payment info for checkout (include party details for banner)
     let loanForCtx = null;
     try {
@@ -8374,26 +8457,6 @@ async function payParkingInCheckout(receiptNumber, remainingAmount) {
     });
 
     try { updateParkingContextBanner(); } catch { /* ignore */ }
-    
-    // Navigate to checkout page using the correct method
-    // Update active nav button
-    const navBtns = document.querySelectorAll('.tab-btn');
-    navBtns.forEach(b => b.classList.remove('active'));
-    const targetBtn = document.querySelector('[data-view="checkout"]');
-    if (targetBtn) {
-      targetBtn.classList.add('active');
-    }
-    
-    // Show checkout view
-    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-    document.getElementById('checkoutView').classList.add('active');
-    
-    // Toggle navbar visibility for checkout
-    toggleNavbarForView('checkout');
-    
-    // Load checkout view data (kept as a promise so we can wait for it below;
-    // otherwise its late cart refresh can reset the auto-selected payment).
-    const checkoutReady = loadCheckoutView().catch(() => {});
     
     // Load the parking items into the cart once Checkout is ready
     setTimeout(async () => {
@@ -8477,8 +8540,8 @@ async function searchLoanByReceipt(receiptNumber) {
       return;
     }
     
-    // Show loan payment modal
-    showLoanPaymentModal(loan);
+    // Go straight to Checkout with the PARKING items in the cart
+    payParkingInCheckout(loan.receipt_number, Number(loan.remaining_amount || 0));
   } catch (error) {
     alert('Error searching for PARKING: ' + error.message);
   }
@@ -8494,7 +8557,7 @@ async function handleLoanSearchSubmit(rawQuery) {
     return;
   }
 
-  // 1) Quick path: exact receipt number match -> open Pay modal.
+  // 1) Quick path: exact receipt number match -> go to Checkout with its items in the cart.
   // 2) Otherwise: filter the PARKING list by receipt/customer/restaurant/phone.
   try {
     const loan = await window.api.getLoanByReceipt(query);
@@ -8502,7 +8565,7 @@ async function handleLoanSearchSubmit(rawQuery) {
       if (String(loan.status || '').toLowerCase() === 'paid') {
         showAlert('This PARKING has already been paid in full', 'info');
       } else {
-        showLoanPaymentModal(loan);
+        payParkingInCheckout(loan.receipt_number, Number(loan.remaining_amount || 0));
         return;
       }
     }
@@ -8676,7 +8739,9 @@ async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentM
       || printerName.includes('tp easy 80')
       || printerName.includes('tp7001')
       || printerName.includes('tp 7001')
-      || printerName.includes('iggual');
+      || printerName.includes('iggual')
+      || printerName.includes('jp-80')
+      || printerName.includes('jp80');
 
     const before = loanBefore || {};
     const after = loanAfter || {};
@@ -10260,9 +10325,7 @@ function promptForBarcodeLabelQuantity({ title = 'Print Labels', defaultQty = 1,
       return Math.max(1, Math.min(safeMax, n));
     };
 
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) close(null);
-    });
+    // Forms stay open on a tap outside; they close with their own buttons.
 
     cancelBtn?.addEventListener('click', () => close(null), { once: true });
     okBtn?.addEventListener('click', () => {
@@ -10426,8 +10489,8 @@ async function openProductModal(product = null, categoryId = null, categoryName 
   const form = document.getElementById('productForm');
   const title = document.getElementById('productModalTitle');
 
-  // Price-only mode (used from Checkout): hide every field except the prices.
-  // Hidden fields keep the product's current values, so saving leaves them unchanged.
+  // Checkout edit mode: a panel over the cart (left side) with only name, prices and
+  // sales VAT. Hidden fields keep the product's current values, so saving leaves them unchanged.
   const priceOnly = !!(options && options.priceOnly && product);
   modal.classList.toggle('price-only-mode', priceOnly);
   form.noValidate = priceOnly;
@@ -10436,7 +10499,7 @@ async function openProductModal(product = null, categoryId = null, categoryName 
   await loadCategoriesForProductForm();
   
   if (product) {
-    title.textContent = priceOnly ? `Edit Price - ${product.name}` : 'Edit Product';
+    title.textContent = priceOnly ? `Edit - ${product.name}` : 'Edit Product';
     document.getElementById('productId').value = product.id;
     {
       const bc = String(product.barcode || '').trim();
@@ -10684,6 +10747,12 @@ async function saveProduct() {
 
   const regularPriceRaw = document.getElementById('productRegularPrice')?.value;
   const salePriceRaw = document.getElementById('productSalePrice')?.value;
+
+  // The Checkout edit panel skips browser validation, so check the name here.
+  if (!String(document.getElementById('productName')?.value || '').trim()) {
+    showAlert('Please enter a product name', 'error', 'Invalid Name');
+    return;
+  }
 
   let regularPrice = parseOptionalMoneyZero(regularPriceRaw);
   const salePrice = parseOptionalMoneyNull(salePriceRaw);
@@ -11054,6 +11123,10 @@ async function loadSalesByDateFilter(filterType, startDate = null, endDate = nul
           tax: 0,
           total: amt,
           payment_method: pm,
+          // Paid PARKING keeps who it was for (restaurant / customer) for the Customer column.
+          loan_customer_type: p?.loan_customer_type || null,
+          loan_customer_name: p?.loan_customer_name || null,
+          loan_restaurant_name: p?.loan_restaurant_name || null,
           items: Array.isArray(p?.items) ? p.items : []
         };
       }).filter(r => r.payment_method === 'cash' || r.payment_method === 'card');
@@ -11179,6 +11252,7 @@ async function displayFilteredSales() {
 
   // Keep the summary in sync with what the table shows (include returns for the same period)
   const baseSummary = calculateSummary(filteredSales);
+  let periodReturns = [];
   try {
     const now = new Date();
     let startDate;
@@ -11218,14 +11292,16 @@ async function displayFilteredSales() {
 
       const deduped = dedupeReturnsByOriginalSaleId(parsedReturns);
       baseSummary.returns_amount = deduped.reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
+      periodReturns = deduped.filter(r => currentPaymentFilter === 'all'
+        || String(r?.refund_method || '').toLowerCase() === String(currentPaymentFilter || '').toLowerCase());
     }
   } catch {
     // ignore returns summary errors
   }
   updateSalesSummary(baseSummary, currentSalesFilter?.type || 'today');
   
-  if (filteredSales.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="icon">💰</div><p>No sales found</p></td></tr>';
+  if (filteredSales.length === 0 && periodReturns.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state"><div class="icon">💰</div><p>No sales found</p></td></tr>';
     return;
   }
   
@@ -11243,21 +11319,52 @@ async function displayFilteredSales() {
     })
   );
 
-  // Hide refunded receipts from Sales History
-  const visibleSales = salesWithItems.filter(s => !s?.return);
-  const refundedCount = salesWithItems.length - visibleSales.length;
+  // Receipts with returns stay listed (badge); each refund is its own row below.
+  const visibleSales = salesWithItems.filter(Boolean);
+  const refundedCount = visibleSales.filter(s => s?.fully_refunded).length;
 
   // Update summary counts to match what the table shows
   baseSummary.refunded_count = refundedCount;
-  baseSummary.net_transaction_count = visibleSales.length;
+  baseSummary.net_transaction_count = visibleSales.length - refundedCount;
   updateSalesSummary(baseSummary, currentSalesFilter?.type || 'today');
 
-  if (visibleSales.length === 0 && salesWithItems.length > 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="icon">↩️</div><p>All sales in this period were refunded</p></td></tr>';
-    return;
-  }
-  
-  tbody.innerHTML = visibleSales.map(sale => {
+  const dateTimeOpts = {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  };
+  const refundRows = periodReturns.map(ret => {
+    const date = parseAppDateTimeLoose(ret.return_date);
+    const items = Array.isArray(ret.items) ? ret.items : [];
+    const total = getReturnGrossTotal(ret);
+    const tax = Number(ret.tax) || 0;
+    const itemsList = items.map(it => `${it.product_name} (${formatReturnQty(it.quantity)})`).join(', ');
+    const method = String(ret.refund_method || 'cash').toLowerCase();
+    return {
+      time: date ? date.getTime() : 0,
+      html: `
+      <tr class="sales-refund-row">
+        <td>${formatDateTimeWithDisplayTimeZone(date, 'en-GB', dateTimeOpts)}</td>
+        <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="Refund for receipt #${ret.original_sale_id}: ${itemsList}">
+          <div style="font-weight: 800;">↩️ REFUND · receipt #${ret.original_sale_id}</div>
+          <div class="returned-items" style="font-size: 12px;">${itemsList}</div>
+        </td>
+        <td></td>
+        <td>-${currencySymbol}${(total - tax).toFixed(2)}</td>
+        <td>-${currencySymbol}${tax.toFixed(2)}</td>
+        <td style="font-weight: 700;">-${currencySymbol}${total.toFixed(2)}</td>
+        <td><span class="payment-badge payment-${method}">${method.toUpperCase()}</span></td>
+        <td><button class="action-btn" onclick="viewSale(${ret.original_sale_id})" title="View original receipt">👁️</button></td>
+      </tr>
+    `
+    };
+  });
+
+  const saleRows = visibleSales.map(sale => {
     const date = parseAppDateTimeLoose(sale.sale_date);
     const saleDateTime = formatDateTimeWithDisplayTimeZone(date, 'en-GB', {
       year: 'numeric',
@@ -11271,31 +11378,32 @@ async function displayFilteredSales() {
     const itemsList = sale.items.map(item => `${item.product_name} (${item.quantity})`).join(', ');
     const itemsShort = itemsList.length > 50 ? itemsList.substring(0, 50) + '...' : itemsList;
 
-    const refundedBadge = sale?.return
+    const refundedBadge = sale?.fully_refunded
       ? ' <span class="status-badge status-refunded">Refunded</span>'
-      : '';
+      : (sale?.return ? ' <span class="status-badge status-refunded">Partly refunded</span>' : '');
 
     const displayMethod = getDisplayPaymentMethod(sale);
 
     const loanType = (sale?.loan_customer_type || '').toString().toLowerCase();
     const restaurantName = (sale?.loan_restaurant_name || '').toString().trim();
     const customerName = (sale?.loan_customer_name || '').toString().trim();
-    const partyLabel = (loanType === 'restaurant' && restaurantName)
-      ? `🍽️ ${restaurantName}`
-      : (customerName ? `👤 ${customerName}` : '');
+    // Customer column: restaurant / customer name for PARKING, "VENTA CONTADO" for a normal sale.
+    const customerCellHtml = (loanType === 'restaurant' && restaurantName)
+      ? `<span style="font-weight: 800; color: #0f172a;">🍽️ ${restaurantName}</span>`
+      : (customerName
+        ? `<span style="font-weight: 800; color: #0f172a;">👤 ${customerName}</span>`
+        : '<span style="color: #64748b;">VENTA CONTADO</span>');
 
-     const titleText = partyLabel ? `${partyLabel} — ${itemsList}` : itemsList;
-     const itemsCellHtml = partyLabel
-      ? `<div style="font-weight: 800; color: #0f172a;">${partyLabel}${refundedBadge}</div>
-        <div style="font-size: 12px; color: #64748b; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${itemsShort}</div>`
-      : `${itemsShort}${refundedBadge}`;
+    const titleText = itemsList;
+    const itemsCellHtml = `${itemsShort}${refundedBadge}`;
     
-    return `
+    return { time: date ? date.getTime() : 0, html: `
       <tr>
         <td>${saleDateTime}</td>
         <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${titleText}">
           ${itemsCellHtml}
         </td>
+        <td style="white-space: nowrap;">${customerCellHtml}</td>
         <td>${currencySymbol}${sale.subtotal.toFixed(2)}</td>
         <td>${currencySymbol}${sale.tax.toFixed(2)}</td>
         <td style="font-weight: 700;">${currencySymbol}${sale.total.toFixed(2)}</td>
@@ -11306,8 +11414,13 @@ async function displayFilteredSales() {
             : `<button class="action-btn" onclick="viewSale(${sale.id})" title="View">👁️</button>`}
         </td>
       </tr>
-    `;
-  }).join('');
+    ` };
+  });
+
+  tbody.innerHTML = [...saleRows, ...refundRows]
+    .sort((a, b) => b.time - a.time)
+    .map(r => r.html)
+    .join('');
 }
 
 async function viewSale(id) {
@@ -11352,6 +11465,8 @@ async function printSalesHistoryThermal() {
         || name.includes('tp7001')
         || name.includes('tp 7001')
         || name.includes('iggual')
+        || name.includes('jp-80')
+        || name.includes('jp80')
         || name.includes('tm-t20')
         || name.includes('tm t20')
         || name.includes('tm-t88')
@@ -12303,6 +12418,8 @@ async function printSalesReportThermal() {
         || name.includes('tp7001')
         || name.includes('tp 7001')
         || name.includes('iggual')
+        || name.includes('jp-80')
+        || name.includes('jp80')
         || name.includes('tm-t20')
         || name.includes('tm t20')
         || name.includes('tm-t88')
@@ -13458,6 +13575,8 @@ async function loadSystemSettingsView() {
     }
     document.getElementById('receiptFooter').value = systemSettings.receipt_footer || '';
     document.getElementById('printerName').value = systemSettings.printer_name || '';
+    const plainTextEl = document.getElementById('printerPlainText');
+    if (plainTextEl) plainTextEl.checked = Number(systemSettings.printer_plain_text || 0) === 1;
     // Customer display COM port (persisted)
     await refreshCustomerDisplayPortOptions(systemSettings.customer_display_port || '');
   } catch (error) {
@@ -13605,9 +13724,7 @@ function setupSystemSettingsHandlers() {
         return v === expectedUpper;
       };
 
-      overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) close(false);
-      });
+      // Forms stay open on a tap outside; they close with their own buttons.
       cancelBtn?.addEventListener('click', () => close(false), { once: true });
       okBtn?.addEventListener('click', () => close(isMatch()), { once: true });
       input?.addEventListener('keydown', (e) => {
@@ -13769,7 +13886,8 @@ async function saveSystemSettings() {
       currencyCode: document.getElementById('currencyCode').value,
       taxRate: Number.isFinite(taxRate) ? taxRate : 0,
       receiptFooter: document.getElementById('receiptFooter').value,
-      printerName: document.getElementById('printerName').value,
+      printerName: document.getElementById('printerName').value.trim(),
+      printerPlainText: !!document.getElementById('printerPlainText')?.checked,
       customerDisplayPort: (document.getElementById('customerDisplayPort')?.value || '').toString().trim().toUpperCase() || null
     };
     
@@ -14451,30 +14569,9 @@ function setupModalHandlers() {
     });
   });
   
-  // Close on outside click
-  document.querySelectorAll('.modal').forEach(modal => {
-    // Only a press that *starts* on the backdrop may close the modal. Tapping an
-    // input opens the virtual keyboard, which moves the dialog up; the release then
-    // lands on the backdrop and the resulting click used to close the modal.
-    let pressStartedOnBackdrop = false;
-    modal.addEventListener('pointerdown', (e) => {
-      pressStartedOnBackdrop = e.target === modal;
-    }, true);
-    modal.addEventListener('click', (e) => {
-      if (!pressStartedOnBackdrop) return;
-      pressStartedOnBackdrop = false;
-      // Guard against touch devices generating a delayed click after pressing
-      // the on-screen keyboard buttons ("click-through" onto the backdrop).
-      const vkLast = Number(window.__virtualKeyboardLastPressAt || 0);
-      if (vkLast && (Date.now() - vkLast) < 600) {
-        return;
-      }
-      if (e.target === modal) {
-        closeModal(modal.id);
-      }
-    });
-  });
-  
+  // Forms (modals) do not close on a tap outside: a stray tap would lose what was typed.
+  // They close only with their own close / cancel / save buttons.
+
   // Print receipt - with debounce to prevent multiple prints
   let isPrinting = false;
   const printBtn = document.getElementById('printReceiptBtn');
@@ -15115,6 +15212,32 @@ function setupVirtualKeyboard() {
     }
   };
 
+  // Keys act on press, and Done hides the keyboard at once, so the click that follows the
+  // finger lifting lands on whatever was under the key (e.g. CAJON / SALIR in the checkout
+  // menu bar), opening the cash drawer. Every real tap starts with its own press, so a click
+  // whose last press was on the keyboard but lands outside it is that stray click.
+  if (!window.__vkGhostClickGuard) {
+    window.__vkGhostClickGuard = true;
+    let lastPressOnKeyboard = false;
+    let lastPressAt = 0;
+    const onPress = (e) => {
+      lastPressOnKeyboard = !!e.target?.closest?.('#virtualKeyboard');
+      lastPressAt = Date.now();
+    };
+    document.addEventListener('pointerdown', onPress, true);
+    document.addEventListener('touchstart', onPress, { capture: true, passive: true });
+    document.addEventListener('click', (e) => {
+      if (!lastPressOnKeyboard) return;
+      if (e.target?.closest?.('#virtualKeyboard')) return;
+      lastPressOnKeyboard = false;
+      // Safety net: only a click shortly after that press can be its stray click.
+      if (Date.now() - lastPressAt > 3000) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+    }, true);
+  }
+
   // Attach delegated handler once
   if (keyboard.dataset.vkDelegatedAttached !== '1') {
     keyboard.dataset.vkDelegatedAttached = '1';
@@ -15154,6 +15277,25 @@ function setupVirtualKeyboard() {
 
     // Ignore the same gesture window that just opened the keyboard.
     if ((Date.now() - lastVirtualKeyboardOpenAt) < 250) return;
+
+    // Tapping a button (e.g. "Save Category") while the keyboard is open: closing it now
+    // moves the modal (it re-centers), so the finger lifts off somewhere else and the tap
+    // never becomes a click. Close only after the click has landed.
+    const tappedButton = typeof e?.target?.closest === 'function'
+      ? e.target.closest('button, [role="button"], a, input[type="submit"], input[type="button"], .action-btn, .btn-action')
+      : null;
+    if (tappedButton) {
+      const closeAfterTap = () => {
+        document.removeEventListener('pointerup', closeAfterTap, true);
+        document.removeEventListener('pointercancel', closeAfterTap, true);
+        setTimeout(() => {
+          if (keyboard.classList.contains('active')) closeVirtualKeyboard({ blurInput: true });
+        }, 80);
+      };
+      document.addEventListener('pointerup', closeAfterTap, true);
+      document.addEventListener('pointercancel', closeAfterTap, true);
+      return;
+    }
 
     closeVirtualKeyboard({ blurInput: true });
   }, true);
@@ -15294,89 +15436,123 @@ async function lookupSaleForReturn() {
       return;
     }
 
-    // Only allow one return per receipt
-    const existingReturn = await getExistingReturnForSaleId(sale.id);
-    if (existingReturn) {
-      const when = existingReturn.return_date
-        ? formatDateTimeWithDisplayTimeZone(parseAppDateTimeLoose(existingReturn.return_date), 'en-GB', {
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hour12: false,
-        })
-        : 'unknown date';
-      showAlert(`Receipt #${sale.id} was already refunded.\nReturn ID: ${existingReturn.id}\nDate: ${when}`, 'warning', 'Already Refunded');
+    // Several partial returns per receipt are allowed; only block when nothing is left.
+    if (sale.fully_refunded) {
+      showAlert(`All items of receipt #${sale.id} were already returned.`, 'warning', 'Already Refunded');
       return;
     }
     
     currentReturnSale = sale;
-    selectedReturnItems = [];
-    
-    // Display sale items
-    const itemsList = document.getElementById('returnItemsList');
-    const currencySymbol = systemSettings?.currency_symbol || '€';
-    
-    itemsList.innerHTML = sale.items.map((item, index) => `
-      <div class=\"return-item\">
-        <input type=\"checkbox\" class=\"return-item-checkbox\" data-index=\"${index}\" checked>
-        <div class=\"return-item-info\">
-          <div class=\"return-item-name\">${item.product_name}</div>
-          <div class=\"return-item-details\">Qty: ${item.quantity} × ${currencySymbol}${item.unit_price.toFixed(2)} = ${currencySymbol}${item.subtotal.toFixed(2)}</div>
-        </div>
-      </div>
-    `).join('');
-    
-    // Add change listeners to checkboxes
-    document.querySelectorAll('.return-item-checkbox').forEach(checkbox => {
-      checkbox.addEventListener('change', calculateReturnTotal);
+    currentReturnSale.items.forEach((item) => {
+      const sold = Number(item.quantity) || 0;
+      item.__remaining = Math.max(0, +(sold - (Number(item.returned_quantity) || 0)).toFixed(3));
+      item.__isWeighed = sold % 1 !== 0;
+      item.__returnQty = 0;
     });
+    renderReturnItems();
     
     document.getElementById('returnSaleDetails').style.display = 'block';
-    document.getElementById('completeReturnBtn').disabled = false;
-    
     calculateReturnTotal();
   } catch (error) {
     showAlert('Error loading sale: ' + error.message, 'error', 'Error');
   }
 }
 
-function calculateReturnTotal() {
-  const checkboxes = document.querySelectorAll('.return-item-checkbox:checked');
-  selectedReturnItems = [];
-  let subtotalCents = 0;
-  let taxCents = 0;
-  let totalCents = 0;
-  
-  checkboxes.forEach(checkbox => {
-    const index = parseInt(checkbox.dataset.index);
-    const item = currentReturnSale.items[index];
-    selectedReturnItems.push(item);
-    
-    // Sale item subtotals are tax-inclusive. Extract base + tax from the gross.
-    const product = allProducts.find(p => p.id === item.product_id);
-    const taxRateRaw = Number(product?.tax_rate);
-    const taxRate = Number.isFinite(taxRateRaw) ? taxRateRaw : 0;
+function formatReturnQty(qty) {
+  const n = Number(qty) || 0;
+  return n % 1 === 0 ? String(n) : n.toFixed(3);
+}
 
-    const lineTotalCents = moneyToCents(item.subtotal || 0);
-    const baseCents = taxRate > 0 ? Math.round(lineTotalCents / (1 + taxRate)) : lineTotalCents;
-    const lineTaxCents = lineTotalCents - baseCents;
+function renderReturnItems() {
+  const itemsList = document.getElementById('returnItemsList');
+  const currencySymbol = systemSettings?.currency_symbol || '€';
 
-    totalCents += lineTotalCents;
-    subtotalCents += baseCents;
-    taxCents += lineTaxCents;
+  itemsList.innerHTML = currentReturnSale.items.map((item, index) => {
+    const done = item.__remaining <= 0;
+    const alreadyReturned = Number(item.returned_quantity) || 0;
+    // Weighed items are returned whole; unit items can be returned one by one.
+    const control = done
+      ? '<span class="status-badge status-refunded">Returned</span>'
+      : item.__isWeighed
+        ? `<button type="button" class="return-qty-toggle ${item.__returnQty > 0 ? 'active' : ''}" data-index="${index}">${item.__returnQty > 0 ? '✓ Returning' : 'Return'}</button>`
+        : `<div class="return-qty-stepper">
+            <button type="button" class="return-qty-btn" data-index="${index}" data-delta="-1" ${item.__returnQty <= 0 ? 'disabled' : ''}>−</button>
+            <span class="return-qty-value">${item.__returnQty}</span>
+            <button type="button" class="return-qty-btn" data-index="${index}" data-delta="1" ${item.__returnQty >= item.__remaining ? 'disabled' : ''}>+</button>
+          </div>`;
+    return `
+      <div class="return-item ${item.__returnQty > 0 ? 'selected' : ''} ${done ? 'done' : ''}">
+        <div class="return-item-info">
+          <div class="return-item-name">${item.product_name}</div>
+          <div class="return-item-details">Qty: ${formatReturnQty(item.quantity)} × ${currencySymbol}${Number(item.unit_price).toFixed(2)} = ${currencySymbol}${Number(item.subtotal).toFixed(2)}${alreadyReturned > 0 ? ` <span class="return-item-already">· already returned: ${formatReturnQty(alreadyReturned)}</span>` : ''}</div>
+        </div>
+        ${control}
+      </div>
+    `;
+  }).join('');
+
+  itemsList.querySelectorAll('.return-qty-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const item = currentReturnSale.items[Number(btn.dataset.index)];
+      item.__returnQty = Math.min(item.__remaining, Math.max(0, item.__returnQty + Number(btn.dataset.delta)));
+      renderReturnItems();
+      calculateReturnTotal();
+    });
   });
+  itemsList.querySelectorAll('.return-qty-toggle').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const item = currentReturnSale.items[Number(btn.dataset.index)];
+      item.__returnQty = item.__returnQty > 0 ? 0 : item.__remaining;
+      renderReturnItems();
+      calculateReturnTotal();
+    });
+  });
+}
 
-  const total = centsToMoney(totalCents);
+// Tax rate of a sale line: stored on the line, else product, else category.
+function getReturnItemTaxRate(item) {
+  let taxRate = Number(item?.tax_rate);
+  if (!Number.isFinite(taxRate) || taxRate <= 0) {
+    const product = allProducts.find(p => p.id === item.product_id);
+    taxRate = Number(product?.tax_rate);
+    if (!Number.isFinite(taxRate)) {
+      const category = product ? allCategories.find(c => c.name === product.category) : null;
+      taxRate = Number(category?.tax_rate || 0);
+    }
+  }
+  return Number.isFinite(taxRate) && taxRate > 0 ? taxRate : 0;
+}
+
+// Builds the lines being returned. The refund is the line's paid amount (after discount)
+// pro rata to the quantity returned; returning what is left gets the exact rest.
+function buildSelectedReturnLines() {
+  return (currentReturnSale?.items || [])
+    .filter((item) => item.__returnQty > 0)
+    .map((item) => {
+      const sold = Number(item.quantity) || 0;
+      const lineCents = moneyToCents(item.subtotal || 0);
+      const alreadyCents = sold > 0 ? Math.round(lineCents * (Number(item.returned_quantity) || 0) / sold) : 0;
+      const isRest = item.__returnQty >= item.__remaining;
+      const refundCents = isRest
+        ? lineCents - alreadyCents
+        : (sold > 0 ? Math.round(lineCents * item.__returnQty / sold) : 0);
+      return { item, quantity: item.__returnQty, refundCents, taxRate: getReturnItemTaxRate(item) };
+    });
+}
+
+function calculateReturnTotal() {
+  const lines = buildSelectedReturnLines();
+  selectedReturnItems = lines;
+  const totalCents = lines.reduce((sum, l) => sum + l.refundCents, 0);
   const currencySymbol = systemSettings?.currency_symbol || '€';
   
-  document.getElementById('returnTotalDisplay').value = `${currencySymbol}${total.toFixed(2)}`;
+  document.getElementById('returnTotalDisplay').value = `${currencySymbol}${centsToMoney(totalCents).toFixed(2)}`;
+  document.getElementById('completeReturnBtn').disabled = lines.length === 0;
 }
 
 async function completeReturn() {
-  if (selectedReturnItems.length === 0) {
+  const lines = buildSelectedReturnLines();
+  if (lines.length === 0) {
     showAlert('Please select at least one item to return', 'warning', 'No Items Selected');
     return;
   }
@@ -15385,55 +15561,115 @@ async function completeReturn() {
   let subtotalCents = 0;
   let taxCents = 0;
   let totalCents = 0;
-
-  selectedReturnItems.forEach(item => {
-    const product = allProducts.find(p => p.id === item.product_id);
-    const taxRateRaw = Number(product?.tax_rate);
-    const taxRate = Number.isFinite(taxRateRaw) ? taxRateRaw : 0;
-
-    const lineTotalCents = moneyToCents(item.subtotal || 0);
-    const baseCents = taxRate > 0 ? Math.round(lineTotalCents / (1 + taxRate)) : lineTotalCents;
-    const lineTaxCents = lineTotalCents - baseCents;
-
-    totalCents += lineTotalCents;
+  lines.forEach((l) => {
+    const baseCents = l.taxRate > 0 ? Math.round(l.refundCents / (1 + l.taxRate)) : l.refundCents;
+    totalCents += l.refundCents;
     subtotalCents += baseCents;
-    taxCents += lineTaxCents;
+    taxCents += l.refundCents - baseCents;
   });
 
-  const subtotal = centsToMoney(subtotalCents);
-  const tax = centsToMoney(taxCents);
-  const total = centsToMoney(totalCents);
-  
+  const refundMethod = document.getElementById('returnRefundMethod').value;
   const returnData = {
     originalSaleId: currentReturnSale.id,
-    subtotal: subtotal,
-    tax: tax,
-    total: total,
-    refundMethod: document.getElementById('returnRefundMethod').value,
+    subtotal: centsToMoney(subtotalCents),
+    tax: centsToMoney(taxCents),
+    total: centsToMoney(totalCents),
+    refundMethod,
     cashierId: currentUser.id,
     reason: document.getElementById('returnReason').value,
     notes: document.getElementById('returnNotes').value || '',
-    items: selectedReturnItems.map(item => ({
-      productId: item.product_id,
-      productName: item.product_name,
-      quantity: item.quantity,
-      unitPrice: item.unit_price,
-      subtotal: item.subtotal
+    items: lines.map((l) => ({
+      saleItemId: l.item.id,
+      productId: l.item.product_id,
+      productName: l.item.product_name,
+      quantity: l.quantity,
+      unitPrice: l.item.unit_price,
+      subtotal: centsToMoney(l.refundCents)
     }))
   };
-  
+
+  const completeBtn = document.getElementById('completeReturnBtn');
+  completeBtn.disabled = true; // no double refunds from a double tap
   try {
     const result = await window.api.createReturn(returnData);
     closeModal('returnModal');
-    // Return processed - no popup
+    await printRefundReceipt(result, currentReturnSale, lines);
     await loadReturnsView();
   } catch (error) {
+    completeBtn.disabled = false;
     const msg = String(error?.message || error || 'Unknown error');
-    if (msg.includes('RETURN_ALREADY_EXISTS')) {
-      showAlert('This receipt was already refunded.', 'warning', 'Already Refunded');
+    const exceeded = msg.match(/RETURN_QTY_EXCEEDED:\s*(.+)/);
+    if (exceeded) {
+      showAlert(exceeded[1], 'warning', 'Already Returned');
     } else {
       showAlert('Error processing return: ' + msg, 'error', 'Error');
     }
+  }
+}
+
+// Prints the refund ticket (DEVOLUCION) and opens the drawer for a cash refund.
+async function printRefundReceipt(returnRecord, sale, lines) {
+  try {
+    if (!systemSettings) systemSettings = await window.api.getSystemSettings();
+    const printerName = (systemSettings?.printer_name || '').toString().toLowerCase();
+    const looks80mm = /80\s?mm|posprinter|pos[- ]?80|easy 80|tp ?7001|iggual|jp-?80/.test(printerName);
+
+    const taxBreakdown = {};
+    lines.forEach((l) => {
+      const ratePct = Math.round(l.taxRate * 100);
+      const total = centsToMoney(l.refundCents);
+      const base = l.taxRate > 0 ? total / (1 + l.taxRate) : total;
+      if (!taxBreakdown[ratePct]) taxBreakdown[ratePct] = { base: 0, tax: 0, total: 0 };
+      taxBreakdown[ratePct].base -= base;
+      taxBreakdown[ratePct].tax -= (total - base);
+      taxBreakdown[ratePct].total -= total;
+    });
+    const totalCents = lines.reduce((sum, l) => sum + l.refundCents, 0);
+    const refundMethod = String(returnRecord?.refund_method || 'cash').toLowerCase();
+
+    // The refund ticket shows the customer's whole bill, with the returned items marked.
+    const fresh = (await window.api.getSaleById(sale.id)) || sale;
+    const { refunds, refundedBySaleItem } = await getSaleRefundMarks(fresh);
+    const refundedTotalAll = refunds.reduce((sum, r) => sum + r.total, 0);
+
+    const result = await window.api.printReceipt({
+      isRefund: true,
+      refundId: returnRecord?.id,
+      storeName: systemSettings?.store_name || 'SUPERMARKET POS',
+      ownerName: systemSettings?.owner_name || '',
+      nieNumber: systemSettings?.nie_number || '',
+      companyAddress: systemSettings?.company_address || '',
+      lineWidth: looks80mm ? 48 : undefined,
+      receiptId: sale.id,
+      dateIso: returnRecord?.return_date || new Date().toISOString(),
+      items: (fresh.items || []).map((item) => ({
+        name: item.product_name,
+        quantity: item.quantity,
+        unitPrice: item.unit_price,
+        taxRate: item.tax_rate,
+        discountPercent: item.discount_percent,
+        subtotal: item.subtotal,
+        returnedQuantity: Number(item.returned_quantity || 0),
+        returnedAmount: refundedBySaleItem.get(item.id) || 0
+      })),
+      originalTotal: Number(fresh.total || 0),
+      refundedTotalAll,
+      subtotal: -Number(returnRecord?.subtotal || 0),
+      tax: -Number(returnRecord?.tax || 0),
+      total: -centsToMoney(totalCents),
+      taxBreakdown: Object.keys(taxBreakdown).map(Number).sort((a, b) => a - b)
+        .map((rate) => ({ rate, ...taxBreakdown[rate] })),
+      paymentMethod: refundMethod,
+      kickDrawer: refundMethod === 'cash',
+      currency: systemSettings?.currency_symbol || '€',
+      footer: systemSettings?.receipt_footer || '',
+      cashier: currentUser?.full_name || ''
+    });
+    if (!result?.success) {
+      showAlert('Return saved, but the refund ticket could not be printed: ' + (result?.error || 'Printer not configured'), 'warning', 'Print Error');
+    }
+  } catch (error) {
+    showAlert('Return saved, but the refund ticket could not be printed: ' + error.message, 'warning', 'Print Error');
   }
 }
 
@@ -15464,21 +15700,41 @@ function getReturnGrossTotal(ret) {
   return Number(ret?.total) || 0;
 }
 
+// A receipt can have several partial returns, and all of them count. Only accidental
+// duplicates made by old versions (same receipt and amount within 60 s) are dropped.
 function dedupeReturnsByOriginalSaleId(returns) {
-  const bySaleId = new Map();
-  (returns || []).forEach(r => {
+  const kept = [];
+  const sorted = [...(returns || [])].sort((a, b) => Number(a?.id || 0) - Number(b?.id || 0));
+  sorted.forEach(r => {
     const saleId = Number(r?.original_sale_id);
     if (!Number.isFinite(saleId)) return;
-    const prev = bySaleId.get(saleId);
-    if (!prev) {
-      bySaleId.set(saleId, r);
+    // Returns made by this version record their sale lines and are validated on save.
+    const items = typeof r?.items === 'string' ? (() => { try { return JSON.parse(r.items); } catch { return []; } })() : (r?.items || []);
+    if (items.some(it => it?.sale_item_id != null)) {
+      kept.push(r);
       return;
     }
-    const prevTime = new Date(prev?.return_date || 0).getTime();
-    const nextTime = new Date(r?.return_date || 0).getTime();
-    if (nextTime >= prevTime) bySaleId.set(saleId, r);
+    const time = parseAppDateTimeLoose(r?.return_date)?.getTime?.() || 0;
+    const total = getReturnGrossTotal(r);
+    const isDuplicate = kept.some(k => Number(k.original_sale_id) === saleId
+      && Math.abs(getReturnGrossTotal(k) - total) < 0.005
+      && Math.abs((parseAppDateTimeLoose(k.return_date)?.getTime?.() || 0) - time) < 60000);
+    if (!isDuplicate) kept.push(r);
   });
-  return Array.from(bySaleId.values());
+  return kept;
+}
+
+// Number of receipts whose whole amount was refunded (partial returns don't count).
+function countFullyRefundedSales(returns, sales) {
+  const refundedBySale = new Map();
+  (returns || []).forEach(r => {
+    const id = Number(r?.original_sale_id);
+    refundedBySale.set(id, (refundedBySale.get(id) || 0) + getReturnGrossTotal(r));
+  });
+  return (sales || []).filter(s => {
+    const refunded = refundedBySale.get(Number(s?.id));
+    return refunded !== undefined && refunded >= (Number(s?.total) || 0) - 0.01;
+  }).length;
 }
 
 // ============== Z-REPORT HANDLERS ==============
@@ -16017,8 +16273,7 @@ async function openZReportModal() {
     const totalSales = nonLoanSales.length + loanPaymentDocCount;
     const dedupedReturns = dedupeReturnsByOriginalSaleId(returns);
     const totalReturns = dedupedReturns.length;
-    const saleIds = new Set(nonLoanSales.map(s => Number(s?.id)).filter(Number.isFinite));
-    const refundedSalesCount = dedupedReturns.filter(r => saleIds.has(Number(r?.original_sale_id))).length;
+    const refundedSalesCount = countFullyRefundedSales(dedupedReturns, nonLoanSales);
     const netSalesCount = Math.max(0, (nonLoanSales.length - refundedSalesCount) + loanPaymentDocCount);
     
     const totalReturnsAmount = dedupedReturns.reduce((sum, ret) => sum + getReturnGrossTotal(ret), 0);
@@ -16443,8 +16698,7 @@ async function viewZReportDetails(reportId) {
         : window.api.getReturnsByDateRange(start, end, cashierId));
       const returns = Array.isArray(returnsData) ? returnsData : (returnsData?.returns || []);
       const dedupedReturns = dedupeReturnsByOriginalSaleId(returns);
-      const saleIds = new Set(nonLoanSales.map(s => Number(s?.id)).filter(Number.isFinite));
-      const refundedSalesCount = dedupedReturns.filter(r => saleIds.has(Number(r?.original_sale_id))).length;
+      const refundedSalesCount = countFullyRefundedSales(dedupedReturns, nonLoanSales);
       computedNetSalesCount = Math.max(0, (nonLoanSales.length - refundedSalesCount) + loanPaymentDocCount);
     } catch {
       // ignore
@@ -16639,6 +16893,8 @@ async function printZReport(report) {
         || name.includes('tp7001')
         || name.includes('tp 7001')
         || name.includes('iggual')
+        || name.includes('jp-80')
+        || name.includes('jp80')
         || name.includes('tm-t20')
         || name.includes('tm t20')
         || name.includes('tm-t88')
@@ -17651,6 +17907,33 @@ async function openCashDrawer() {
   }
 }
 
+// Refunds made on a sale, and the refunded money per sale line, for printing returned
+// items marked on a ticket. Old returns without a line id are matched by product.
+async function getSaleRefundMarks(sale) {
+  const refunds = [];
+  for (const ret of (Array.isArray(sale?.returns) ? sale.returns : [])) {
+    try {
+      const full = await window.api.getReturnById(ret.id);
+      const items = Array.isArray(full?.items) ? full.items : [];
+      refunds.push({
+        id: ret.id,
+        dateIso: full?.return_date || ret.return_date,
+        method: full?.refund_method || ret.refund_method,
+        items: items.map(it => ({ name: it.product_name, saleItemId: it.sale_item_id, productId: it.product_id, quantity: Number(it.quantity) || 0, subtotal: Number(it.subtotal) || 0 })),
+        total: items.reduce((sum, it) => sum + (Number(it.subtotal) || 0), 0)
+      });
+    } catch {
+      // ignore: print the sale without this refund
+    }
+  }
+  const refundedBySaleItem = new Map();
+  refunds.forEach(ref => ref.items.forEach(it => {
+    const line = (sale.items || []).find(si => (it.saleItemId != null ? si.id === Number(it.saleItemId) : si.product_id === it.productId));
+    if (line) refundedBySaleItem.set(line.id, (refundedBySaleItem.get(line.id) || 0) + it.subtotal);
+  }));
+  return { refunds, refundedBySaleItem };
+}
+
 async function printReceiptToThermalPrinter(sale, options = {}) {
   try {
     if (!systemSettings) {
@@ -17674,7 +17957,9 @@ async function printReceiptToThermalPrinter(sale, options = {}) {
       || printerName.includes('tp easy 80')
       || printerName.includes('tp7001')
       || printerName.includes('tp 7001')
-      || printerName.includes('iggual');
+      || printerName.includes('iggual')
+      || printerName.includes('jp-80')
+      || printerName.includes('jp80');
 
     // Calculate tax breakdown by rate (to match the on-screen receipt)
     const taxBreakdown = {};
@@ -17717,6 +18002,9 @@ async function printReceiptToThermalPrinter(sale, options = {}) {
         total: taxBreakdown[rate].total
       }));
     
+    // A reprint of a sale with returns marks the returned items, like the on-screen receipt.
+    const { refunds, refundedBySaleItem } = await getSaleRefundMarks(sale);
+
     const duplicateNumber = Number(options?.duplicateNumber || 0);
     const shouldKickDrawerInReceipt = options?.kickDrawer === true
       && String(sale?.payment_method || '').toLowerCase() === 'cash'
@@ -17742,7 +18030,9 @@ async function printReceiptToThermalPrinter(sale, options = {}) {
         unitPrice: item.unit_price,
         taxRate: item.tax_rate,
         discountPercent: item.discount_percent,
-        subtotal: item.subtotal
+        subtotal: item.subtotal,
+        returnedQuantity: Number(item.returned_quantity || 0),
+        returnedAmount: refundedBySaleItem.get(item.id) || 0
       })),
       subtotal: sale.subtotal,
       tax: sale.tax,
@@ -17752,6 +18042,7 @@ async function printReceiptToThermalPrinter(sale, options = {}) {
       paymentAmount: sale.payment_amount || sale.total,
       changeAmount: sale.change_amount || 0,
       kickDrawer: shouldKickDrawerInReceipt,
+      refunds,
       currency: currencySymbol,
       footer: receiptFooter,
       cashier: currentUser.full_name
@@ -17825,7 +18116,7 @@ async function detectPrinters() {
       // Auto-select a best match to help customers (still shows the list below)
       if (printers.length > 0) {
         const best =
-          printers.find(p => /TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) ||
+          printers.find(p => /JP-?80|TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) ||
           printers[0];
         selectPrinter(best);
       }
@@ -18166,6 +18457,24 @@ function displayAnalytics(data) {
 }
 
 window.detectPrinters = detectPrinters;
+
+async function runScaleTest() {
+  const btn = document.getElementById('scaleTestBtn');
+  const out = document.getElementById('scaleTestResult');
+  if (!btn || !out) return;
+  btn.disabled = true;
+  out.style.display = 'block';
+  out.textContent = 'Testing scale... please wait (up to 1 minute)';
+  try {
+    const result = await window.api.diagnoseScale();
+    out.textContent = result?.text || 'No result';
+  } catch (e) {
+    out.textContent = 'Scale test failed: ' + (e?.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+window.runScaleTest = runScaleTest;
 window.selectPrinter = selectPrinter;
 
 // ============== CUSTOMER DISPLAY FUNCTIONS ==============

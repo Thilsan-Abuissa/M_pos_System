@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Supermarket POS System</title>
+  <title>BDCONNECT POS</title>
   <link rel="stylesheet" href="styles.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
@@ -13,7 +13,7 @@
     <div class="loading-container">
       <div class="loading-logo-container">
         <div id="loadingLogo" class="loading-logo">🛒</div>
-        <h1 id="loadingTitle" class="loading-title">Supermarket POS</h1>
+        <h1 id="loadingTitle" class="loading-title">BDCONNECT POS</h1>
       </div>
       
       <div class="loading-spinner">
@@ -34,7 +34,7 @@
     <div class="login-container">
       <div class="login-logo-container">
         <div id="loginLogo" class="login-logo">🛒</div>
-        <h1 id="loginTitle">Supermarket POS</h1>
+        <h1 id="loginTitle">BDCONNECT POS</h1>
       </div>
       <div class="role-selection">
         <h2 style="color: white; margin-bottom: 30px; font-size: 24px;">Select User</h2>
@@ -50,7 +50,7 @@
     <div class="login-container">
       <div class="login-logo-container">
         <div class="login-logo">🛒</div>
-        <h1 style="color: white; margin: 0;">Supermarket POS</h1>
+        <h1 style="color: white; margin: 0;">BDCONNECT POS</h1>
       </div>
       <div class="role-selection" style="max-width: 520px; width: 100%;">
         <h2 style="color: white; margin-bottom: 10px; font-size: 24px;">Activation Required</h2>
@@ -79,7 +79,7 @@
       <div class="navbar-left">
         <div class="logo">
           <span class="logo-icon" id="navbarLogo">🛒</span>
-          <span class="logo-text" id="navbarTitle">Supermarket POS</span>
+          <span class="logo-text" id="navbarTitle">BDCONNECT POS</span>
         </div>
       </div>
       
@@ -739,6 +739,7 @@
                     <tr>
                       <th>Date/Time</th>
                       <th>Items</th>
+                      <th>Customer</th>
                       <th>Subtotal</th>
                       <th>Tax</th>
                       <th>Total</th>
@@ -1116,6 +1117,22 @@
                     </div>
                     <small>Enter printer name (Windows: printer share name, USB: \\.\COMx, or LPT1)</small>
                     <div id="printerList" style="margin-top: 10px;"></div>
+                  </div>
+                  <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
+                      <input type="checkbox" id="printerPlainText" style="width: 24px; height: 24px; flex: 0 0 auto;">
+                      Safe printing (printer shows Chinese symbols)
+                    </label>
+                    <small>Turn on if tickets print Chinese symbols or lines run into each other. € still prints; accents are removed (ñ → n).</small>
+                  </div>
+                </div>
+
+                <div class="settings-section">
+                  <h3>Scale</h3>
+                  <div class="form-group">
+                    <button type="button" class="btn-secondary" id="scaleTestBtn" onclick="runScaleTest()" style="font-size: 18px; padding: 14px 24px;">⚖️ Test scale</button>
+                    <small style="display: block; margin-top: 6px;">Turn the scale on and put an item on it, then tap. Takes up to 1 minute.</small>
+                    <pre id="scaleTestResult" style="display: none; margin-top: 10px; padding: 10px; background: #111; color: #0f0; font-size: 13px; line-height: 1.4; white-space: pre-wrap; word-break: break-all; max-height: 420px; overflow-y: auto; border-radius: 6px;"></pre>
                   </div>
                 </div>
 

@@ -1511,21 +1511,35 @@ body {
 .modal-numpad-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 3px;
+  gap: 8px;
+  justify-items: center;
+  align-items: center;
 }
 
+/* Round dark keys, same look as the "Enter Price" dial keypad */
 .modal-numpad-btn {
-  background: #2c5f8a;
+  width: 58px;
+  height: 58px;
+  padding: 0;
   border: none;
-  border-radius: 10px;
-  padding: 10px 8px;
+  border-radius: 999px;
+  background: radial-gradient(circle at 30% 25%, #1f2937 0%, #0b1220 70%);
   color: white;
-  font-size: 17px;
+  font-size: 22px;
   font-weight: 900;
   cursor: pointer;
-  min-height: 44px;
-  transition: transform 0.05s ease, filter 0.15s ease;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.25);
+  transition: transform 0.08s ease, filter 0.12s ease;
   user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Word keys (CLEAR / EXACT / NEXT) and 00 / 000 need a smaller font to fit the circle */
+.modal-numpad-clear,
+.modal-numpad-fill,
+.modal-numpad-btn[data-value="00"],
+.modal-numpad-btn[data-value="000"] {
+  font-size: 13px;
 }
 
 @media (max-height: 800px) {
@@ -1550,10 +1564,10 @@ body {
     font-size: 34px;
   }
 
+  .modal-numpad-grid { gap: 6px; }
   .modal-numpad-btn {
-    min-height: 42px;
-    padding: 10px 8px;
-    font-size: 16px;
+    width: 50px;
+    height: 50px;
   }
 
   .payment-modal-footer {
@@ -1562,24 +1576,18 @@ body {
 }
 
 .modal-numpad-btn:active {
-  transform: scale(0.98);
-  filter: brightness(0.95);
+  transform: scale(0.97);
+  filter: brightness(1.08);
 }
 
-.modal-numpad-clear {
-  background: #dc2626;
-}
-
-.modal-numpad-back {
-  background: #334155;
-}
-
+.modal-numpad-clear,
+.modal-numpad-back,
 .modal-numpad-dot {
-  background: #0ea5e9;
+  background: radial-gradient(circle at 30% 25%, #334155 0%, #0f172a 70%);
 }
 
 .modal-numpad-fill {
-  background: #10b981;
+  background: radial-gradient(circle at 30% 25%, #34d399 0%, #059669 70%);
 }
 
 /* Open Drawer Button */
@@ -4133,6 +4141,78 @@ button {
   cursor: pointer;
 }
 
+.return-item.selected {
+  outline: 2px solid #ef4444;
+  background: #fef2f2;
+}
+
+.return-item.done {
+  opacity: 0.55;
+}
+
+.return-item.done .return-item-name {
+  text-decoration: line-through;
+}
+
+.return-item-already {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.return-qty-stepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.return-qty-btn {
+  width: 44px;
+  height: 44px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 22px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.return-qty-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.return-qty-value {
+  min-width: 32px;
+  text-align: center;
+  font-size: 20px;
+  font-weight: 800;
+}
+
+.return-qty-toggle {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.return-qty-toggle.active {
+  background: #ef4444;
+  border-color: #ef4444;
+  color: #fff;
+}
+
+.sales-refund-row td {
+  color: #dc2626;
+  background: #fef2f2;
+}
+
+.sales-refund-row .returned-items {
+  text-decoration: line-through;
+}
+
 /* ============== Z-REPORT STYLES ============== */
 .report-tabs {
   display: flex;
@@ -5345,11 +5425,58 @@ button {
   flex-direction: column;
 }
 
-/* Checkout "Edit Price": show only the price fields in the product modal */
-#productModal.price-only-mode #productForm > .form-group,
-#productModal.price-only-mode #productForm > .form-row:not(:has(#productRegularPrice)),
+/* Checkout "Edit": a panel docked over the cart (left side) with only
+   name, prices and sales VAT. */
+#productModal.price-only-mode #productForm > .form-group:not(:has(#productName)),
+#productModal.price-only-mode #productForm > .form-row:not(:has(#productRegularPrice)):not(:has(#productSalesVat)),
+#productModal.price-only-mode #productForm .form-group:has(#productPurchaseVat),
 #productModal.price-only-mode #productPrintLabelBtn {
   display: none !important;
+}
+#productModal.price-only-mode.active {
+  justify-content: flex-start;
+  align-items: stretch;
+  padding: 0 !important;
+  background-color: rgba(0,0,0,0.35);
+  backdrop-filter: none;
+}
+#productModal.price-only-mode .modal-content {
+  width: 47vw;
+  max-width: none;
+  height: 100vh;
+  max-height: none;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+  animation: none;
+}
+body.vk-open #productModal.price-only-mode .modal-content {
+  height: calc(100vh - var(--vk-height));
+}
+#productModal.price-only-mode .modal-header { padding: 14px 24px; }
+#productModal.price-only-mode .modal-header h2 { font-size: 22px; }
+#productModal.price-only-mode #productForm {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 24px 0;
+}
+#productModal.price-only-mode #productForm input,
+#productModal.price-only-mode #productForm select {
+  font-size: 22px;
+  padding: 14px 16px;
+}
+#productModal.price-only-mode #productForm .form-row:has(#productSalesVat) {
+  grid-template-columns: 1fr;
+}
+#productModal.price-only-mode #productForm > .modal-footer {
+  margin: auto -24px 0;
+  border-radius: 0;
+}
+#productModal.price-only-mode #productForm > .modal-footer button {
+  flex: 1;
+  min-height: 56px;
+  font-size: 18px;
 }
 
 /* Weight modal: dial keypad for zero-price products (compact version of the unit-price keypad) */
@@ -5364,6 +5491,7 @@ button {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 8px;
+  justify-items: center;
 }
 
 #weightModal .dial-btn,
@@ -5380,6 +5508,7 @@ button {
 }
 
 #weightModal .dial-btn {
+  width: 56px;
   height: 56px;
   font-size: 24px;
 }
@@ -5429,6 +5558,13 @@ button {
   margin: 0 0 6px;
 }
 
+/* Zero-price: the field the keypad is typing into */
+#weightModal.zero-price input.keypad-target {
+  border-color: #f59e0b !important;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.35);
+}
+#weightModal.zero-price #weightInput { cursor: pointer; }
+
 #weightModal.zero-price .weight-body {
   display: grid;
   grid-template-columns: minmax(260px, 1fr) auto;
@@ -5451,5 +5587,224 @@ button {
 }
 
 #weightModal.zero-price .dial-btn {
+  width: 60px;
   height: 60px;
+}
+
+/* ============================================================
+   1024x768 POS screens (shop PC). Compact layout so the top bar,
+   checkout buttons and tables fit without cut-off text.
+   Larger screens are not affected.
+   ============================================================ */
+@media (max-width: 1100px) {
+  /* Top bar: everything (tabs, user, date, logout) on one line */
+  .top-navbar {
+    padding: 0 8px;
+    height: 60px;
+    gap: 8px;
+  }
+  .navbar-left {
+    flex: 0 0 auto;
+    max-width: none;
+  }
+  .logo { gap: 6px; }
+  .logo-icon { font-size: 22px; }
+  .logo-text {
+    font-size: 13px;
+    line-height: 1.1;
+    max-width: 90px;
+  }
+  .navbar-center {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .nav-tabs {
+    gap: 2px;
+    padding: 3px;
+  }
+  .tab-btn {
+    padding: 6px 9px;
+    gap: 5px;
+    min-height: 44px;
+  }
+  .tab-icon { font-size: 15px; }
+  .tab-text { font-size: 12px; }
+  .navbar-right { gap: 6px; }
+  .user-display {
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+  .user-display .user-role-badge { display: none; }
+  .datetime-display {
+    font-size: 10px;
+    white-space: normal;
+    max-width: 66px;
+    line-height: 1.25;
+    text-align: center;
+  }
+  .logout-btn {
+    padding: 8px 12px;
+    min-height: 44px;
+  }
+
+  /* Checkout: CAJON / BORRAR TODO / DESHACER / NOTA / VARIOS */
+  .action-btns-row { gap: 4px; }
+  .action-btns-row .action-btn {
+    flex-direction: column;
+    gap: 2px;
+    height: 48px;
+    padding: 2px;
+    margin: 0;
+    min-width: 0;
+    min-height: 0;
+    font-size: 10px !important;
+    line-height: 1.05;
+    white-space: normal;
+    text-align: center;
+  }
+
+  /* Checkout bottom menu: labels fit their buttons */
+  .cmb-btn {
+    min-height: 54px;
+    padding: 6px 2px 4px;
+    min-width: 0;
+  }
+  .cmb-label {
+    font-size: 9px;
+    letter-spacing: -0.2px;
+    max-width: 100%;
+    white-space: nowrap;
+  }
+
+  /* Other screens: less padding, compact tables */
+  .view-wrapper { padding: 12px; }
+  .view-content { padding: 16px; }
+  .view-header {
+    margin-bottom: 14px;
+    padding-bottom: 12px;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .view-header h2 { font-size: 20px; }
+  .header-buttons {
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .header-buttons .btn-primary,
+  .header-buttons button {
+    padding: 10px 14px;
+    font-size: 14px;
+  }
+  .table-container {
+    padding: 8px;
+    max-height: calc(100vh - 230px);
+  }
+  table th {
+    padding: 10px 8px;
+    font-size: 11px;
+    letter-spacing: 0;
+  }
+  table td {
+    padding: 8px;
+    font-size: 13px;
+  }
+  /* Row buttons in tables (edit / delete / view): smaller so rows stay short */
+  table td:has(> .action-btn) { white-space: nowrap; }
+  table td .action-btn {
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 2px;
+    margin: 1px;
+    font-size: 15px;
+  }
+  table td .status-badge { white-space: nowrap; }
+  .settings-page { padding: 16px; }
+  .settings-page-title {
+    font-size: 28px;
+    margin-bottom: 16px;
+  }
+}
+
+/* ============================================================
+   Forms on 1024x768: every field fits on one screen, no scrolling.
+   ============================================================ */
+@media (max-width: 1100px), (max-height: 820px) {
+  /* All windows: slimmer header, body and footer */
+  .modal-header { padding: 12px 20px; }
+  .modal-header h2 { font-size: 20px; }
+  .modal-content { max-height: 96vh; }
+  .modal-content form { padding: 14px 20px; }
+  .modal-footer {
+    padding: 12px 20px;
+    gap: 10px;
+  }
+  .form-group { margin-bottom: 12px; }
+  .form-group label {
+    margin-bottom: 4px;
+    font-size: 14px;
+  }
+  .form-group input,
+  .form-group select,
+  .form-group textarea {
+    padding: 9px 12px;
+    border-width: 2px;
+    border-radius: 10px;
+    font-size: 16px;
+  }
+  .form-row { gap: 12px; }
+}
+
+/* Add / Edit Product: wide window, fields in 3 columns on every screen size,
+   so the whole form fits without scrolling. */
+#productModal:not(.price-only-mode) .modal-content,
+#categoryModal .modal-content,
+#subcategoryModal .modal-content {
+  max-width: 1000px;
+  width: 98vw;
+}
+#productModal:not(.price-only-mode) .modal-header,
+#categoryModal .modal-header,
+#subcategoryModal .modal-header { padding: 14px 24px; }
+#productModal:not(.price-only-mode) .modal-header h2,
+#categoryModal .modal-header h2,
+#subcategoryModal .modal-header h2 { font-size: 22px; }
+#categoryModal #categoryForm,
+#subcategoryModal #subcategoryForm { padding: 16px 24px; }
+#categoryModal #categoryForm > .modal-footer,
+#subcategoryModal #subcategoryForm > .modal-footer {
+  margin: 6px -24px -16px;
+  padding: 12px 24px;
+}
+#productModal:not(.price-only-mode) #productForm {
+  padding: 16px 24px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 14px;
+  align-items: start;
+}
+#productModal:not(.price-only-mode) #productForm > .form-row { display: contents; }
+#productModal:not(.price-only-mode) #productForm .form-group { margin: 0; }
+#productModal:not(.price-only-mode) #productForm small { display: none !important; }
+#productModal:not(.price-only-mode) #productBarcodePreviewWrap {
+  margin-top: 6px !important;
+  padding: 4px 8px !important;
+}
+#productModal:not(.price-only-mode) #productBarcodePreviewWrap > div { display: none; }
+#productModal:not(.price-only-mode) #productBarcodePreview { height: 34px !important; }
+#productModal:not(.price-only-mode) #productImagePreviewImg {
+  max-width: 60px !important;
+  max-height: 60px !important;
+}
+#productModal:not(.price-only-mode) .checkout-visibility-toggle {
+  padding: 8px 10px;
+  border-width: 2px;
+  gap: 8px;
+}
+#productModal:not(.price-only-mode) .checkout-visibility-help { display: none; }
+#productModal:not(.price-only-mode) #productForm > .modal-footer {
+  grid-column: 1 / -1;
+  margin: 6px -24px -16px;
+  padding: 12px 24px;
 }

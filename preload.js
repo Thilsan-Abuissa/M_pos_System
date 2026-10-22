@@ -65,6 +65,7 @@ contextBridge.exposeInMainWorld('api', {
   getLoanById: (id) => ipcRenderer.invoke('loans:getById', id),
   getMonthlyRestaurantReport: (month, year) => ipcRenderer.invoke('loans:getMonthlyRestaurantReport', month, year),
   removeLoanSaleItem: (loanId, saleItemId) => ipcRenderer.invoke('loans:removeSaleItem', loanId, saleItemId),
+  updateLoanSaleItems: (loanId, edits) => ipcRenderer.invoke('loans:updateSaleItems', loanId, edits),
   deleteLoan: (loanId) => ipcRenderer.invoke('loans:delete', loanId),
   
   // Returns
@@ -144,6 +145,7 @@ contextBridge.exposeInMainWorld('api', {
   connectScale: (portPath) => ipcRenderer.invoke('scale:connect', portPath),
   readScaleWeight: () => ipcRenderer.invoke('scale:readWeight'),
   getScaleModuleStatus: () => ipcRenderer.invoke('scale:moduleStatus'),
+  diagnoseScale: () => ipcRenderer.invoke('scale:diagnose'),
   disconnectScale: () => ipcRenderer.invoke('scale:disconnect'),
   
   // Customer Display

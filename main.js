@@ -17,13 +17,99 @@ const POS_PRINT_ENCODING = (() => {
   return enc || 'cp858';
 })();
 
-function safeEncode(text) {
+// Some receipt printers stay in Chinese double-byte mode (they ignore FS .): every byte
+// above 0x7F then swallows the next one, so lines merge and "für" prints a Chinese glyph.
+// The "safe printing" setting sends only ASCII to such printers (and '€' as an image).
+function isPrinterPlainText() {
   try {
-    return iconv.encode(String(text ?? ''), POS_PRINT_ENCODING);
+    return Number(db?.getSystemSettings?.()?.printer_plain_text || 0) === 1;
   } catch {
-    // Fallback to cp858 (Euro) if a custom encoding is invalid.
-    return iconv.encode(String(text ?? ''), 'cp858');
+    return false;
   }
+}
+
+// One ASCII character per input character, so layouts built before this keep their width.
+// '€' is kept: encodePrinterText() draws it as a small image.
+function toPlainPrinterText(text) {
+  // The drawer kick (ESC p m t1 t2) carries a raw byte above 0x7F: keep it untouched.
+  return String(text ?? '').split(/(\x1Bp[\s\S]{3})/).map((part, i) => {
+    if (i % 2 === 1) return part;
+    return part
+      .replace(/ß/g, 's')
+      .replace(/[¿]/g, '?')
+      .replace(/[¡]/g, '!')
+      .replace(/º/g, 'o')
+      .replace(/ª/g, 'a')
+      .normalize('NFD')
+      .replace(/[̀-ͯ]/g, '')
+      .replace(/[^\x00-\x7F€]/g, '?');
+  }).join('');
+}
+
+// '€' as a 12x24-dot bit image (ESC * 33), the size of one Font A character. Printed as
+// an image it cannot be garbled by a printer stuck in Chinese mode, and keeps columns aligned.
+const EURO_BITMAP_ROWS = [
+  '............',
+  '............',
+  '............',
+  '............',
+  '............',
+  '.....######.',
+  '....########',
+  '...###....##',
+  '..###.......',
+  '..###.......',
+  '########....',
+  '########....',
+  '..###.......',
+  '########....',
+  '########....',
+  '..###.......',
+  '..###.......',
+  '...###....##',
+  '....########',
+  '.....######.',
+  '............',
+  '............',
+  '............',
+  '............'
+];
+const EURO_IMAGE_BYTES = (() => {
+  const width = EURO_BITMAP_ROWS[0].length;
+  const bytes = [0x1B, 0x2A, 33, width & 0xFF, width >> 8];
+  for (let x = 0; x < width; x++) {
+    for (let band = 0; band < 3; band++) {
+      let b = 0;
+      for (let bit = 0; bit < 8; bit++) {
+        if (EURO_BITMAP_ROWS[band * 8 + bit][x] === '#') b |= 0x80 >> bit;
+      }
+      bytes.push(b);
+    }
+  }
+  return Buffer.from(bytes);
+})();
+
+// Safe printing: plain text, with every '€' replaced by the euro image.
+function encodePlainPrinterText(text, encode) {
+  const parts = toPlainPrinterText(text).split('€');
+  const chunks = [];
+  parts.forEach((part, i) => {
+    if (i > 0) chunks.push(EURO_IMAGE_BYTES);
+    chunks.push(encode(part));
+  });
+  return Buffer.concat(chunks);
+}
+
+function safeEncode(text) {
+  const encode = (t) => {
+    try {
+      return iconv.encode(String(t ?? ''), POS_PRINT_ENCODING);
+    } catch {
+      // Fallback to cp858 (Euro) if a custom encoding is invalid.
+      return iconv.encode(String(t ?? ''), 'cp858');
+    }
+  };
+  return isPrinterPlainText() ? encodePlainPrinterText(text, encode) : encode(text);
 }
 
 // Prevent multiple running instances (common cause of COM port "Access denied")
@@ -96,20 +182,20 @@ const AUTO_PRINTER_TTL_MS = 10 * 60 * 1000;
 
 function pickLikelyThermalPrinter(printers) {
   const list = (Array.isArray(printers) ? printers : []).map(p => String(p || '').trim()).filter(Boolean);
-  return list.find(p => /TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) || list[0] || null;
+  return list.find(p => /JP-?80|TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) || list[0] || null;
 }
 
 async function autoDetectPrinterName() {
   try {
     if (process.platform === 'win32') {
       const { stdout } = await execPromise('powershell -command "Get-Printer | Select-Object Name | ForEach-Object { $_.Name }"');
-      const printers = stdout.trim().split('\n').filter(p => p.trim() && !p.includes('----'));
+      const printers = stdout.split(/\r?\n/).map(p => p.trim()).filter(p => p && !p.includes('----'));
       return pickLikelyThermalPrinter(printers);
     }
 
     // macOS/Linux
     const { stdout } = await execPromise('lpstat -p | awk \'{print $2}\'');
-    const printers = stdout.trim().split('\n').filter(p => p.trim());
+    const printers = stdout.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
     return pickLikelyThermalPrinter(printers);
   } catch (error) {
     console.error('Error auto-detecting printer:', error);
@@ -120,7 +206,7 @@ async function autoDetectPrinterName() {
 async function getPrinterNameFast() {
   try {
     const settings = db?.getSystemSettings?.();
-    const configured = settings?.printer_name;
+    const configured = String(settings?.printer_name || '').trim();
     if (configured) return configured;
 
     const now = Date.now();
@@ -354,6 +440,28 @@ async function kickScalePort(port) {
   }
 }
 
+// Overwrites <userData>/scale-debug.txt (at most every 2s) with the latest raw bytes from
+// the scale, so an unknown scale format can be diagnosed from the shop PC.
+let lastScaleDebugWriteAt = 0;
+function writeScaleDebugSnapshot(rawText, weight) {
+  const now = Date.now();
+  if (now - lastScaleDebugWriteAt < 2000) return;
+  lastScaleDebugWriteAt = now;
+  try {
+    const visible = String(rawText || '').slice(-300).replace(/[\x00-\x1F\x7F]/g, (c) => `<${c.charCodeAt(0).toString(16).padStart(2, '0')}>`);
+    const lines = [
+      `time: ${new Date(now).toISOString()}`,
+      `port: ${scaleState.portPath || '-'}  config: ${JSON.stringify(scaleState.config || {})}`,
+      `parsed weight (kg): ${weight === null || weight === undefined ? 'none' : weight}`,
+      `raw (control bytes as <hex>):`,
+      visible
+    ];
+    fs.writeFileSync(path.join(app.getPath('userData'), 'scale-debug.txt'), lines.join('\n') + '\n');
+  } catch {
+    // ignore
+  }
+}
+
 function attachScaleStreaming(port) {
   if (!port) return;
   if (port.__scaleStreamingAttached) return;
@@ -362,15 +470,19 @@ function attachScaleStreaming(port) {
   port.on('data', (data) => {
     try {
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
-      const text = buf.toString('utf8');
-      // Keep a rolling window of recent raw text
-      const combined = (scaleState.lastRawText || '') + text;
-      scaleState.lastRawText = combined.slice(-800);
-      scaleState.lastUpdatedAt = Date.now();
+      const text = buf.toString('latin1');
+      const combined = ((scaleState.lastRawText || '') + text).slice(-800);
 
-      const weight = parseWeightFromScalePayload(scaleState.lastRawText);
+      const { weight, rest, framed } = parseLatestScaleWeight(combined, { framed: scaleState.framed });
+      // Drop consumed frames so old readings can never be picked up again.
+      scaleState.lastRawText = rest;
+      if (framed) scaleState.framed = true;
+      writeScaleDebugSnapshot(combined, weight);
       if (typeof weight === 'number') {
         scaleState.lastWeightKg = weight;
+        // Only fresh *parsed* weights count as an update; otherwise a stale weight
+        // would keep being served as current.
+        scaleState.lastUpdatedAt = Date.now();
       }
     } catch {
       // ignore
@@ -390,9 +502,75 @@ function attachScaleStreaming(port) {
   });
 }
 
+// Scales stream one reading per frame (terminated by CR/LF or ETX). Parse only the
+// newest complete frame: parsing a buffer with several frames mixes old readings in,
+// which showed the previous weight at 0 and flickered between old and new weights.
+// Returns { weight, rest } where `rest` is the unterminated tail to keep buffering.
+function parseLatestScaleWeight(text, { framed = false } = {}) {
+  const raw = String(text || '');
+  const parts = raw.split(/[\r\n\x03]+/);
+  const tail = parts.pop() || '';
+  const frames = parts.filter((p) => p.trim());
+
+  // 1) Terminated frames (CR/LF/ETX): newest frame wins. Look back a few frames only,
+  //    for multi-line outputs whose last line has no weight.
+  for (let i = frames.length - 1; i >= Math.max(0, frames.length - 3); i--) {
+    const frame = frames[i];
+    // A Dialog error frame (e.g. unstable) means "no valid weight now" — don't fall back to older frames.
+    if (/(^|\x02)\s*09\x1B/.test(frame)) return { weight: null, rest: tail, framed: true };
+    const weight = parseWeightFromScalePayload(frame);
+    if (weight !== null) return { weight, rest: tail, framed: true };
+  }
+  // This scale ends its frames with CR/LF/ETX: an unterminated tail is a half-received
+  // frame (e.g. "1.2" of "1.250kg"), so wait for the rest instead of parsing it.
+  if (framed || frames.length > 0) return { weight: null, rest: tail, framed: true };
+
+  // 2) No usable terminated frame: newest number+unit token (e.g. "  0.500kg" streams).
+  const tokens = Array.from(raw.matchAll(/[+-]?\s*\d+(?:[\.,]\d+)?\s*k?g\b/gi));
+  if (tokens.length > 0) {
+    const last = tokens[tokens.length - 1];
+    const weight = parseWeightFromScalePayload(last[0]);
+    if (weight !== null) return { weight, rest: raw.slice(last.index + last[0].length) };
+  }
+
+  // 3) STX-framed without terminators: newest complete segment between two STX bytes.
+  const stxSegments = raw.split('\x02');
+  if (stxSegments.length >= 3) {
+    for (let i = stxSegments.length - 2; i >= 1; i--) {
+      const weight = parseWeightFromScalePayload(stxSegments[i]);
+      if (weight !== null) return { weight, rest: '\x02' + stxSegments[stxSegments.length - 1] };
+    }
+  }
+
+  // 4) Anything else (unitless, unframed): same parsing as before on a short rolling window.
+  return { weight: parseWeightFromScalePayload(raw), rest: raw.slice(-200), framed: false };
+}
+
 function parseWeightFromScalePayload(payload) {
   try {
     const textRaw = Buffer.isBuffer(payload) ? payload.toString('latin1') : String(payload || '');
+
+    // Dialog 02/06 protocol (GRAM XFOC+ and other price-computing scales in POS mode).
+    // Weight reply: STX "02" ESC <status> ESC <weight 5 digits, grams> ESC <unit price> ESC <total> ETX
+    // Error reply:  STX "09" ESC <code> ETX (e.g. 30/31 = unstable / no valid weight)
+    // These frames must be handled before control chars are stripped, otherwise the
+    // ESC-separated fields merge into one bogus number.
+    if (textRaw.includes('\x1B')) {
+      const frames = Array.from(textRaw.matchAll(/\x02?\s*(0[29])\x1B([^\x03]*)/g));
+      if (frames.length > 0) {
+        const last = frames[frames.length - 1];
+        if (last[1] === '09') return null;
+        const fields = last[2].split('\x1B');
+        const weightField = fields.find((f) => /^\d{5}$/.test(f.trim()));
+        if (weightField) {
+          const grams = parseInt(weightField.trim(), 10);
+          if (grams === 0) return 0;
+          const kg = grams / 1000;
+          return kg >= 0.001 && kg <= 100 ? kg : null;
+        }
+        return null;
+      }
+    }
 
     // Remove control characters (STX/ETX/etc) but keep printable text
     const text = textRaw.replace(/[\x00-\x1F\x7F]/g, '');
@@ -487,7 +665,7 @@ function parseWeightFromScalePayload(payload) {
     if (!Number.isFinite(rawValue)) return null;
 
     // Convert to kilograms when needed.
-    // GRAM ZFOC commonly outputs in kg, but some outputs are grams (e.g. 500 => 500g).
+    // GRAM ZFOC/XFOC+ commonly output in kg, but some outputs are grams (e.g. 500 => 500g).
     let weightKg = rawValue;
     if (unit === 'g') {
       weightKg = rawValue / 1000;
@@ -509,6 +687,19 @@ function parseWeightFromScalePayload(payload) {
 async function openScalePort(portPath, options) {
   if (!SerialPort) {
     throw new Error('SerialPort module not available');
+  }
+
+  // If the customer display is holding this port, the scale takes it back and the
+  // display is barred from it (it was e.g. saved by mistake as the display port).
+  try {
+    const norm = (p) => String(p || '').replace(/^\\\\\.\\/, '').toLowerCase();
+    if (customerDisplay?.port?.path && norm(customerDisplay.port.path) === norm(portPath)) {
+      console.warn(`[Scale] ${portPath} is held by the customer display - releasing it for the scale`);
+      excludePortFromCustomerDisplay(portPath);
+      try { await customerDisplay.disconnect(); } catch { /* ignore */ }
+    }
+  } catch {
+    // ignore
   }
 
   const baudRate = options?.baudRate ?? 9600;
@@ -562,6 +753,9 @@ async function openScalePort(portPath, options) {
 
   await kickScalePort(port);
 
+  scaleState.framed = false;
+  scaleState.lastRawText = '';
+
   // Attach streaming listener so we can capture continuous output
   attachScaleStreaming(port);
 
@@ -589,6 +783,7 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
     const chunks = [];
     const timers = [];
     let lastParsedWeight = null;
+    let lastSentPoll = null;
     let settleTimer = null;
     const settleMs = 80;
 
@@ -633,8 +828,9 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
       const combined = Buffer.concat(chunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))));
       const raw = combined.toString('latin1');
       console.log('[Scale Debug] Received data:', raw.replace(/[\r\n\t\0]/g, ' ').substring(0, 100), `(${combined.length} bytes)`);
-      const weight = parseWeightFromScalePayload(combined);
+      const { weight } = parseLatestScaleWeight(raw, { framed: scaleState.framed });
       if (weight === null) return;
+      if (lastSentPoll) scaleState.workingPoll = lastSentPoll;
 
       // Record the most recently parsed weight, and wait a tiny window for any newer frame.
       // This avoids "buffered" frames from reappearing after a change on the platform.
@@ -677,6 +873,7 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
         } catch {
           // ignore
         }
+        lastSentPoll = name;
         console.log(`[Scale Debug] Sent: ${name}`);
       } catch (e) {
         console.log(`[Scale Debug] Failed to send ${name}:`, e.message);
@@ -693,11 +890,24 @@ async function readWeightFromOpenPortOnce(port, timeoutMs) {
       timers.push(t);
     };
 
-    scheduleWriteIfSilent(0, 'P\r\n', 'P\\r\\n');
-    scheduleWriteIfSilent(60, Buffer.from([0x05]), 'ENQ (0x05)');
-    scheduleWriteIfSilent(120, 'W\r\n', 'W\\r\\n');
-    scheduleWriteIfSilent(180, 'S\r\n', 'S\\r\\n');
-    scheduleWriteIfSilent(240, '\r\n', '\\r\\n only');
+    // GRAM scales (ZFOC/XFOC+) answer "$" with the weight, so try it first. Once a
+    // command is known to work it is sent alone first, so polled scales update fast.
+    const polls = [
+      ['$', '$'],
+      ['P\\r\\n', 'P\r\n'],
+      ['ENQ (0x05)', Buffer.from([0x05])],
+      ['W\\r\\n', 'W\r\n'],
+      ['S\\r\\n', 'S\r\n'],
+      ['\\r\\n only', '\r\n'],
+      ['EOT ENQ (Dialog)', Buffer.from([0x04, 0x05])]
+    ];
+    const known = polls.find(([name]) => name === scaleState.workingPoll);
+    const ordered = known ? [known, ...polls.filter((p) => p !== known)] : polls;
+    ordered.forEach(([name, bytes], i) => {
+      // Give the known-good command time to answer before trying the others.
+      const delay = known ? (i === 0 ? 0 : 300 + (i - 1) * 80) : i * 80;
+      scheduleWriteIfSilent(delay, bytes, name);
+    });
   });
 }
 
@@ -716,6 +926,8 @@ function rankScalePorts(ports, options = {}) {
       .map((p) => String(p).toLowerCase())
   );
 
+  const forcedPath = String(process.env.SCALE_PORT || '').trim().toLowerCase();
+
   const scored = ports
     .map((port) => {
       const manufacturer = (port.manufacturer || '').toString();
@@ -726,6 +938,11 @@ function rankScalePorts(ports, options = {}) {
       const pathLower = pathVal.toLowerCase();
 
       let score = 0;
+
+      // Explicit override (e.g. SCALE_PORT=COM5) always wins, even for Prolific adapters.
+      if (forcedPath && (pathLower === forcedPath || pathLower === `\\\\.\\${forcedPath}`)) {
+        score += 100000;
+      }
 
       // Never choose an explicitly configured customer display port for the scale.
       if (excludePaths.size > 0 && excludePaths.has(pathLower)) {
@@ -771,6 +988,7 @@ function rankScalePorts(ports, options = {}) {
       if (excludePaths.size > 0 && excludePaths.has(pathLower)) return false;
 
       // Drop very negative scores (e.g. Prolific / VFD ports).
+      if (score >= 100000) return true;
       if (score <= -500) return false;
       return (
         /CH340|USB.*Serial|FTDI|Silicon|CP210/i.test(manufacturer) ||
@@ -783,22 +1001,63 @@ function rankScalePorts(ports, options = {}) {
   return scored.map((s) => s.port);
 }
 
-async function sendRawFileToPrinterWindows(printerName, filePath) {
-  const fs = require('fs');
-  const { exec } = require('child_process');
-  const { promisify } = require('util');
-  const execPromise = promisify(exec);
+// Some receipt printers (e.g. JP-80M over USB) show up as a CH340 virtual COM port.
+// The scale and customer display auto-detection must never open that port, or the
+// Windows spooler can no longer print to it.
+let cachedPrinterComPorts = [];
+let cachedPrinterComPortsAt = 0;
+async function getPrinterComPorts() {
+  if (process.platform !== 'win32') return [];
+  if (Date.now() - cachedPrinterComPortsAt < 60 * 1000) return cachedPrinterComPorts;
+  try {
+    // Only the configured receipt printer: other (old/unused) printer entries on a COM
+    // port must not block the scale from using that port.
+    const printerName = String(db?.getSystemSettings?.()?.printer_name || '').trim();
+    if (!printerName) {
+      cachedPrinterComPorts = [];
+      cachedPrinterComPortsAt = Date.now();
+      return cachedPrinterComPorts;
+    }
+    const psName = printerName.replace(/'/g, "''").replace(/"/g, '\\"');
+    const { stdout } = await execPromise(`powershell -NoProfile -Command "(Get-Printer -Name '${psName}').PortName"`);
+    cachedPrinterComPorts = stdout
+      .split(/\r?\n/)
+      .map((p) => p.trim().replace(/:$/, ''))
+      .filter((p) => /^COM\d+$/i.test(p));
+  } catch {
+    cachedPrinterComPorts = [];
+  }
+  cachedPrinterComPortsAt = Date.now();
 
-  const tempPs1 = path.join(app.getPath('temp'), `raw_print_${Date.now()}_${Math.random().toString(16).slice(2)}.ps1`);
-  const safePrinterName = (printerName || '').toString().replace(/"/g, '""');
-  const safeFilePath = (filePath || '').toString().replace(/"/g, '""');
+  if (cachedPrinterComPorts.length > 0) {
+    const existing = String(process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS || '')
+      .split(/[;,\s]+/)
+      .filter(Boolean);
+    process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS = Array.from(new Set([...existing, ...cachedPrinterComPorts])).join(',');
+  }
+  return cachedPrinterComPorts;
+}
 
-  const script = `param(
-  [Parameter(Mandatory=$true)][string]$PrinterName,
-  [Parameter(Mandatory=$true)][string]$FilePath
-)
+function excludePortFromCustomerDisplay(portPath) {
+  if (!portPath) return;
+  const existing = String(process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS || '').split(/[;,\s]+/).filter(Boolean);
+  process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS = Array.from(new Set([...existing, String(portPath)])).join(',');
+}
 
-Add-Type -TypeDefinition @"
+async function getScaleExcludePorts(ports = []) {
+  // Keep the scale off a configured customer display port, unless that port is a CH340
+  // (wch.cn, 1A86:7523) — that is the scale's own USB-RS232 cable, so the scale wins.
+  const displayPort = String(process.env.CUSTOMER_DISPLAY_PORT || '').trim();
+  const displayInfo = ports.find((p) => String(p.path || '').toLowerCase() === displayPort.toLowerCase());
+  const displayIsCh340 = displayInfo && (/ch340|wch/i.test(String(displayInfo.manufacturer || '')) || String(displayInfo.productId || '').toLowerCase() === '7523');
+  const exclude = displayPort && !displayIsCh340 ? [displayPort] : [];
+  // An explicit SCALE_PORT always wins over automatic exclusions.
+  const forced = String(process.env.SCALE_PORT || '').trim().toLowerCase();
+  return [...exclude, ...(await getPrinterComPorts())].filter((p) => String(p).toLowerCase() !== forced);
+}
+
+// The C# raw-print helper, shared by the persistent print worker and the one-shot fallback.
+const RAW_PRINTER_ADD_TYPE = `Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 
@@ -831,44 +1090,234 @@ public class RawPrinterHelper {
   [DllImport("winspool.Drv", EntryPoint = "WritePrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
   public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
 
-  public static bool SendBytesToPrinter(string printerName, byte[] bytes) {
+  // Returns "" on success, otherwise a description of the failing step + Win32 error code.
+  static string TrySend(string printerName, byte[] bytes, string dataType) {
     IntPtr hPrinter;
-    DOCINFOA di = new DOCINFOA();
-    di.pDocName = "RAW ESC/POS";
-    di.pDataType = "RAW";
-
-    if (!OpenPrinter(printerName, out hPrinter, IntPtr.Zero)) return false;
-    bool ok = false;
+    if (!OpenPrinter(printerName, out hPrinter, IntPtr.Zero)) {
+      return "OpenPrinter failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+    }
     try {
-      if (!StartDocPrinter(hPrinter, 1, di)) return false;
-      if (!StartPagePrinter(hPrinter)) return false;
-
-      int dwWritten = 0;
-      IntPtr unmanagedBytes = Marshal.AllocCoTaskMem(bytes.Length);
-      Marshal.Copy(bytes, 0, unmanagedBytes, bytes.Length);
-      ok = WritePrinter(hPrinter, unmanagedBytes, bytes.Length, out dwWritten);
-      Marshal.FreeCoTaskMem(unmanagedBytes);
-
-      EndPagePrinter(hPrinter);
-      EndDocPrinter(hPrinter);
-      return ok;
+      DOCINFOA di = new DOCINFOA();
+      di.pDocName = "RAW ESC/POS";
+      di.pDataType = dataType;
+      if (!StartDocPrinter(hPrinter, 1, di)) {
+        return "StartDocPrinter[" + (dataType ?? "default") + "] failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+      }
+      try {
+        if (!StartPagePrinter(hPrinter)) {
+          return "StartPagePrinter failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+        }
+        int dwWritten = 0;
+        IntPtr unmanagedBytes = Marshal.AllocCoTaskMem(bytes.Length);
+        try {
+          Marshal.Copy(bytes, 0, unmanagedBytes, bytes.Length);
+          if (!WritePrinter(hPrinter, unmanagedBytes, bytes.Length, out dwWritten)) {
+            return "WritePrinter failed (Win32 error " + Marshal.GetLastWin32Error() + ")";
+          }
+          if (dwWritten != bytes.Length) {
+            return "WritePrinter wrote " + dwWritten + " of " + bytes.Length + " bytes";
+          }
+        } finally {
+          Marshal.FreeCoTaskMem(unmanagedBytes);
+          EndPagePrinter(hPrinter);
+        }
+      } finally {
+        EndDocPrinter(hPrinter);
+      }
+      return "";
     } finally {
       ClosePrinter(hPrinter);
     }
   }
+
+  // Some drivers (Windows v4 / XPS-based, common on generic POS80 drivers) reject the
+  // "RAW" datatype, so fall back to XPS_PASS and the driver default.
+  public static string SendBytesToPrinter(string printerName, byte[] bytes) {
+    string[] dataTypes = new string[] { "RAW", "XPS_PASS", null };
+    string errors = "";
+    foreach (string dt in dataTypes) {
+      string err = TrySend(printerName, bytes, dt);
+      if (err == "") return "";
+      errors += (errors == "" ? "" : "; ") + err;
+      // Only a rejected datatype is worth retrying; anything later could print twice.
+      if (!err.StartsWith("StartDocPrinter")) break;
+    }
+    return errors;
+  }
 }
 "@
+`;
+
+// Persistent PowerShell print worker (Windows). Starting PowerShell and compiling the
+// helper with Add-Type took 2-4 s per print; the worker does that once at startup and
+// then prints each job in milliseconds. Jobs: one line "id<TAB>base64(printer)<TAB>base64(file)".
+const PRINT_WORKER_SCRIPT = `$ErrorActionPreference = 'Stop'
+${RAW_PRINTER_ADD_TYPE}
+[Console]::Out.WriteLine('READY')
+[Console]::Out.Flush()
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($line -eq $null) { break }
+  $parts = $line.Split([char]9)
+  if ($parts.Length -lt 3) { continue }
+  $err = ''
+  try {
+    $printerName = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
+    $filePath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[2]))
+    $bytes = [System.IO.File]::ReadAllBytes($filePath)
+    $err = [RawPrinterHelper]::SendBytesToPrinter($printerName, $bytes)
+    if ($err) {
+      try {
+        $p = Get-Printer -Name $printerName -ErrorAction Stop
+        $err += " [Status: $($p.PrinterStatus), Port: $($p.PortName), Driver: $($p.DriverName)]"
+      } catch { }
+    }
+  } catch { $err = $_.Exception.Message }
+  $err = ($err -replace '[\\r\\n\\t]', ' ')
+  [Console]::Out.WriteLine("RESULT" + [char]9 + $parts[0] + [char]9 + $err)
+  [Console]::Out.Flush()
+}
+`;
+
+const PRINT_JOB_TIMEOUT_MS = 20000;
+let printWorker = null;
+let printJobSeq = 0;
+
+function startPrintWorker() {
+  if (process.platform !== 'win32') return null;
+  if (printWorker && !printWorker.dead) return printWorker;
+
+  const scriptPath = path.join(app.getPath('temp'), 'pos_print_worker.ps1');
+  fs.writeFileSync(scriptPath, PRINT_WORKER_SCRIPT, 'utf8');
+  const proc = spawn('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const worker = { proc, ready: false, dead: false, pending: new Map(), buf: '', stderr: '' };
+  printWorker = worker;
+
+  const failAll = (reason) => {
+    worker.dead = true;
+    if (printWorker === worker) printWorker = null;
+    for (const job of worker.pending.values()) {
+      clearTimeout(job.timer);
+      // Never got READY: nothing was sent to the printer, so the caller may safely retry another way.
+      job.reject(Object.assign(new Error(reason), { workerNeverReady: !worker.ready }));
+    }
+    worker.pending.clear();
+  };
+
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (chunk) => {
+    worker.buf += chunk;
+    let nl;
+    while ((nl = worker.buf.indexOf('\n')) >= 0) {
+      const line = worker.buf.slice(0, nl).replace(/\r$/, '');
+      worker.buf = worker.buf.slice(nl + 1);
+      if (line === 'READY') {
+        worker.ready = true;
+        continue;
+      }
+      const [tag, id, err] = line.split('\t');
+      if (tag !== 'RESULT') continue;
+      const job = worker.pending.get(id);
+      if (!job) continue;
+      worker.pending.delete(id);
+      clearTimeout(job.timer);
+      if (err && err.trim()) job.reject(new Error(`Failed to send raw data to printer '${job.printerName}': ${err.trim()}`));
+      else job.resolve();
+    }
+  });
+  proc.stderr.setEncoding('utf8');
+  proc.stderr.on('data', (chunk) => { worker.stderr = (worker.stderr + chunk).slice(-2000); });
+  proc.on('error', (e) => failAll(`Print worker error: ${e.message}`));
+  proc.on('exit', (code) => failAll(`Print worker exited (code ${code}) ${worker.stderr.trim()}`.trim()));
+  proc.stdin.on('error', () => { /* handled by exit */ });
+  return worker;
+}
+
+function stopPrintWorker() {
+  const worker = printWorker;
+  printWorker = null;
+  if (!worker) return;
+  try { worker.proc.stdin.end(); } catch { /* ignore */ }
+  try { worker.proc.kill(); } catch { /* ignore */ }
+}
+
+function printViaWorker(printerName, filePath) {
+  const worker = startPrintWorker();
+  if (!worker) return Promise.reject(Object.assign(new Error('Print worker unavailable'), { workerNeverReady: true }));
+  return new Promise((resolve, reject) => {
+    const id = String(++printJobSeq);
+    const b64 = (v) => Buffer.from(String(v || ''), 'utf8').toString('base64');
+    const timer = setTimeout(() => {
+      worker.pending.delete(id);
+      // A stuck worker would block every later print: restart it on the next job.
+      stopPrintWorker();
+      reject(new Error('Printer did not respond (timeout)'));
+    }, PRINT_JOB_TIMEOUT_MS);
+    worker.pending.set(id, { resolve, reject, timer, printerName });
+    try {
+      worker.proc.stdin.write(`${id}\t${b64(printerName)}\t${b64(filePath)}\n`);
+    } catch (e) {
+      worker.pending.delete(id);
+      clearTimeout(timer);
+      reject(Object.assign(e, { workerNeverReady: !worker.ready }));
+    }
+  });
+}
+
+async function sendRawFileToPrinterWindows(printerName, filePath) {
+  // Names detected from PowerShell output can carry a trailing '\r'; Windows then fails
+  // with error 1801 (invalid printer name).
+  printerName = String(printerName || '').trim();
+  try {
+    return await printViaWorker(printerName, filePath);
+  } catch (error) {
+    if (!error?.workerNeverReady) throw error;
+    console.warn('[Print] Worker unavailable, using one-shot PowerShell:', error.message);
+    return await sendRawFileToPrinterWindowsOneShot(printerName, filePath);
+  }
+}
+
+async function sendRawFileToPrinterWindowsOneShot(printerName, filePath) {
+  const fs = require('fs');
+  const { exec } = require('child_process');
+  const { promisify } = require('util');
+  const execPromise = promisify(exec);
+
+  const tempPs1 = path.join(app.getPath('temp'), `raw_print_${Date.now()}_${Math.random().toString(16).slice(2)}.ps1`);
+  const safePrinterName = (printerName || '').toString().replace(/"/g, '""');
+  const safeFilePath = (filePath || '').toString().replace(/"/g, '""');
+
+  const script = `param(
+  [Parameter(Mandatory=$true)][string]$PrinterName,
+  [Parameter(Mandatory=$true)][string]$FilePath
+)
+
+${RAW_PRINTER_ADD_TYPE}
 
 $bytes = [System.IO.File]::ReadAllBytes($FilePath)
-$ok = [RawPrinterHelper]::SendBytesToPrinter($PrinterName, $bytes)
-if (-not $ok) {
-  throw "Failed to send raw data to printer: $PrinterName"
+$err = [RawPrinterHelper]::SendBytesToPrinter($PrinterName, $bytes)
+if ($err) {
+  $status = ''
+  try {
+    $p = Get-Printer -Name $PrinterName -ErrorAction Stop
+    $status = " [Status: $($p.PrinterStatus), Port: $($p.PortName), Driver: $($p.DriverName)]"
+  } catch { }
+  [Console]::Error.WriteLine("PRINT_ERROR: Failed to send raw data to printer '$PrinterName': $err$status")
+  exit 1
 }
 `;
 
   fs.writeFileSync(tempPs1, script, 'utf8');
   try {
     await execPromise(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tempPs1}" -PrinterName "${safePrinterName}" -FilePath "${safeFilePath}"`);
+  } catch (error) {
+    const out = `${error?.stderr || ''}\n${error?.stdout || ''}`;
+    const match = out.match(/PRINT_ERROR:\s*(.+)/);
+    if (match) throw new Error(match[1].trim());
+    throw error;
   } finally {
     try {
       if (fs.existsSync(tempPs1)) fs.unlinkSync(tempPs1);
@@ -1022,11 +1471,15 @@ app.whenReady().then(() => {
   // This prevents the customer display logic from ever grabbing the scale COM.
   try {
     if (scaleState?.portPath) {
-      process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS = String(scaleState.portPath);
+      excludePortFromCustomerDisplay(scaleState.portPath);
     }
   } catch {
     // ignore
   }
+  // Look up printers on COM ports early so display/scale probing skips them.
+  getPrinterComPorts().catch(() => {});
+  // Start the print worker now so the first ticket prints without the PowerShell startup delay.
+  try { startPrintWorker(); } catch (e) { console.warn('[Print] Could not start print worker:', e.message); }
   
   createWindow();
   
@@ -1036,7 +1489,7 @@ app.whenReady().then(() => {
     setTimeout(async () => {
       try {
         const ports = await SerialPort.list();
-        const exclude = process.env.CUSTOMER_DISPLAY_PORT ? [String(process.env.CUSTOMER_DISPLAY_PORT)] : [];
+        const exclude = await getScaleExcludePorts(ports);
         const bestPort = pickBestScalePort(ports, { excludePaths: exclude });
         
         if (bestPort) {
@@ -1054,7 +1507,7 @@ app.whenReady().then(() => {
 
           // Ensure customer display probing never grabs the scale COM port.
           try {
-            process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS = String(scalePortPath);
+            excludePortFromCustomerDisplay(scalePortPath);
           } catch {
             // ignore
           }
@@ -1082,6 +1535,7 @@ app.on('window-all-closed', () => {
 
 // Cleanly close the customer display serial port before the process exits.
 app.on('before-quit', (event) => {
+  stopPrintWorker();
   if (customerDisplay && customerDisplay.isDisplayConnected && customerDisplay.isDisplayConnected()) {
     event.preventDefault();
     // Safety timeout: if disconnect takes > 2s, exit anyway
@@ -1329,6 +1783,10 @@ ipcMain.handle('loans:removeSaleItem', async (event, loanId, saleItemId) => {
   return db.removeSaleItemFromLoan(Number(loanId), Number(saleItemId));
 });
 
+ipcMain.handle('loans:updateSaleItems', async (event, loanId, edits) => {
+  return db.updateLoanSaleItems(Number(loanId), Array.isArray(edits) ? edits : []);
+});
+
 // Returns handlers
 ipcMain.handle('returns:create', async (event, returnData) => {
   return db.createReturn(returnData);
@@ -1503,17 +1961,17 @@ ipcMain.handle('printer:getList', async () => {
     if (process.platform === 'win32') {
       // Get printers on Windows using PowerShell
       const { stdout } = await execPromise('powershell -command "Get-Printer | Select-Object Name | ForEach-Object { $_.Name }"');
-      const printers = stdout.trim().split('\n').filter(p => p.trim() && !p.includes('----'));
+      const printers = stdout.split(/\r?\n/).map(p => p.trim()).filter(p => p && !p.includes('----'));
       return { success: true, printers };
     } else if (process.platform === 'darwin') {
       // Get printers on macOS using lpstat
       const { stdout } = await execPromise('lpstat -p | awk \'{print $2}\'');
-      const printers = stdout.trim().split('\n').filter(p => p.trim());
+      const printers = stdout.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
       return { success: true, printers };
     } else {
       // Linux
       const { stdout } = await execPromise('lpstat -p | awk \'{print $2}\'');
-      const printers = stdout.trim().split('\n').filter(p => p.trim());
+      const printers = stdout.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
       return { success: true, printers };
     }
   } catch (error) {
@@ -1525,7 +1983,7 @@ ipcMain.handle('printer:getList', async () => {
 ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
   try {
     const settings = db.getSystemSettings();
-    let printerName = settings?.printer_name;
+    let printerName = String(settings?.printer_name || '').trim();
 
     // Auto-detect printer if not configured
     if (!printerName) {
@@ -1537,12 +1995,12 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       try {
         if (process.platform === 'win32') {
           const { stdout } = await execPromise('powershell -command "Get-Printer | Select-Object Name | ForEach-Object { $_.Name }"');
-          const printers = stdout.trim().split('\n').filter(p => p.trim() && !p.includes('----'));
-          printerName = printers.find(p => /TM|Epson|iggual|thermal|POS|receipt/i.test(p)) || printers[0];
+          const printers = stdout.split(/\r?\n/).map(p => p.trim()).filter(p => p && !p.includes('----'));
+          printerName = printers.find(p => /JP-?80|TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) || printers[0];
         } else if (process.platform === 'darwin') {
           const { stdout } = await execPromise('lpstat -p | awk \'{print $2}\'');
-          const printers = stdout.trim().split('\n').filter(p => p.trim());
-          printerName = printers.find(p => /TM|Epson|iggual|thermal|POS|receipt/i.test(p)) || printers[0];
+          const printers = stdout.split(/\r?\n/).map(p => p.trim()).filter(Boolean);
+          printerName = printers.find(p => /JP-?80|TM|Epson|iggual|thermal|POS|receipt|80/i.test(p)) || printers[0];
         }
 
         if (printerName) {
@@ -1563,10 +2021,10 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     const execPromise = promisify(exec);
     const iconv = require('iconv-lite');
 
+    const plainText = isPrinterPlainText();
     const normalizeCurrencySymbol = (value) => {
       const raw = value === undefined || value === null ? '' : String(value);
-      const trimmed = raw.trim();
-      return trimmed ? trimmed : '€';
+      return raw.trim() || '€';
     };
 
     const receiptEncoding = (() => {
@@ -1588,12 +2046,15 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     })();
 
     const safeEncode = (text) => {
-      try {
-        return iconv.encode(text, receiptEncoding);
-      } catch {
-        // Fallback to cp858 (Euro) if a custom encoding is invalid.
-        return iconv.encode(text, 'cp858');
-      }
+      const encode = (t) => {
+        try {
+          return iconv.encode(t, receiptEncoding);
+        } catch {
+          // Fallback to cp858 (Euro) if a custom encoding is invalid.
+          return iconv.encode(t, 'cp858');
+        }
+      };
+      return plainText ? encodePlainPrinterText(text, encode) : encode(text);
     };
 
     const receiptTimeZone = 'Europe/Madrid';
@@ -1705,6 +2166,8 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
         || name.includes('tp7001')
         || name.includes('tp 7001')
         || name.includes('iggual')
+        || name.includes('jp-80')
+        || name.includes('jp80')
         || name.includes('tm-t20')
         || name.includes('tm t20')
         || name.includes('tm-t88')
@@ -1971,7 +2434,9 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
     // Header label (receipt vs ticket)
     receipt += ESC + '!' + String.fromCharCode(0x10); // Bold
-    if (receiptData.isTicket) {
+    if (receiptData.isRefund) {
+      receipt += 'DEVOLUCION\n';
+    } else if (receiptData.isTicket) {
       receipt += 'NO VALIDO COMO FACTURA\n';
     } else {
       receipt += 'FACTURA SIMPLIFICADA\n';
@@ -2006,10 +2471,15 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
     receipt += ESC + 'a' + String.fromCharCode(0); // Left align
     receipt += 'FECHA: ' + formatReceiptDateTime(receiptData) + '\n';
-    if (!receiptData.isTicket) {
-      receipt += 'Factura Simplificada PRINCIPAL\n';
+    if (receiptData.isRefund) {
+      receipt += 'Devolucion N: D' + (receiptData.refundId || '') + '\n';
+      receipt += 'Ticket original: ' + (receiptData.receiptId || '') + '\n';
+    } else {
+      if (!receiptData.isTicket) {
+        receipt += 'Factura Simplificada PRINCIPAL\n';
+      }
+      receipt += 'Serie/N: ' + (receiptData.receiptId || '') + '\n';
     }
-    receipt += 'Serie/N: ' + (receiptData.receiptId || '') + '\n';
 
     // Columns header
     if (layout.isWide) {
@@ -2067,9 +2537,32 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
           + totalStr
           + '\n';
       }
+
+      // Returned part of this line (reprint after a refund), like the on-screen receipt.
+      const returnedQty = Number(item.returnedQuantity || 0);
+      if (returnedQty > 0) {
+        const qtyText = returnedQty % 1 === 0 ? String(returnedQty) : formatQty(returnedQty, { decimals: 3, decimal: ',' });
+        const label = `  ** DEVUELTO -${qtyText} **`;
+        const amount = formatMoney(-Number(item.returnedAmount || 0), { decimal: ',' });
+        receipt += GS + 'B' + String.fromCharCode(1); // White on black
+        receipt += rightLabelValue(label, amount + ' ') + '\n';
+        receipt += GS + 'B' + String.fromCharCode(0);
+      }
     });
 
     receipt += '-'.repeat(LINE_WIDTH) + '\n';
+
+    // Refund ticket: what the bill was, what has been returned, what the customer kept.
+    if (receiptData.isRefund && Number.isFinite(Number(receiptData.originalTotal))) {
+      const originalTotal = Number(receiptData.originalTotal);
+      const refundedAll = Number(receiptData.refundedTotalAll || 0);
+      receipt += rightLabelValue('TOTAL TICKET', formatMoney(originalTotal, { decimal: ',', suffix: currencySymbol })) + '\n';
+      receipt += rightLabelValue('TOTAL DEVUELTO', formatMoney(-refundedAll, { decimal: ',', suffix: currencySymbol })) + '\n';
+      receipt += ESC + '!' + String.fromCharCode(0x08); // Bold
+      receipt += rightLabelValue('NETO', formatMoney(originalTotal - refundedAll, { decimal: ',', suffix: currencySymbol })) + '\n';
+      receipt += ESC + '!' + String.fromCharCode(0);
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+    }
 
     // Tax breakdown table (scale to LINE_WIDTH)
     const ivaWidth = 5;
@@ -2118,7 +2611,9 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
 
     // Payment method line (like sample: CONTADO/TARJETA with amount)
     const paymentMethod = (receiptData.paymentMethod || 'CASH').toString().toUpperCase();
-    const paymentLabel = paymentMethod === 'CASH' ? 'CONTADO'
+    const paymentLabel = receiptData.isRefund
+      ? (paymentMethod === 'CARD' ? 'DEVUELTO TARJETA' : 'DEVUELTO EFECTIVO')
+      : paymentMethod === 'CASH' ? 'CONTADO'
       : paymentMethod === 'CARD' ? 'TARJETA'
       : paymentMethod === 'PARKING' ? 'CREDITO'
       : paymentMethod;
@@ -2134,12 +2629,32 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     receipt += '(Impuestos Incluidos)\n';
     receipt += '\n';
 
-    // ENTREGA / CAMBIO
+    // Refunds already made on this sale (shown on reprints): reference + net total
+    const refunds = Array.isArray(receiptData.refunds) ? receiptData.refunds : [];
+    if (!receiptData.isRefund && refunds.length > 0) {
+      const refundedTotal = refunds.reduce((sum, ref) => sum + Number(ref.total || 0), 0);
+      receipt += ESC + 'a' + String.fromCharCode(0); // Left align
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+      refunds.forEach(ref => {
+        receipt += `DEVOLUCION D${ref.id || ''}  ${formatReceiptDateTime({ dateIso: ref.dateIso })}\n`;
+      });
+      receipt += rightLabelValue('TOTAL DEVUELTO', formatMoney(-refundedTotal, { decimal: ',', suffix: currencySymbol })) + '\n';
+      receipt += '-'.repeat(LINE_WIDTH) + '\n';
+      receipt += ESC + 'a' + String.fromCharCode(1); // Center align
+      receipt += ESC + '!' + String.fromCharCode(0x30); // Double height + double width
+      receipt += 'NETO   ' + formatMoney(Number(receiptData.total || 0) - refundedTotal, { decimal: ',', suffix: currencySymbol }) + '\n';
+      receipt += ESC + '!' + String.fromCharCode(0);
+      receipt += '\n';
+    }
+
+    // ENTREGA / CAMBIO (not on a refund: money goes back to the customer)
     receipt += ESC + 'a' + String.fromCharCode(0); // Left align
-    const entrega = formatMoney((receiptData.paymentAmount || receiptData.total), { decimal: ',', suffix: currencySymbol });
-    const cambio = formatMoney((receiptData.changeAmount || 0), { decimal: ',', suffix: currencySymbol });
-    receipt += rightLabelValue('ENTREGA', entrega) + '\n';
-    receipt += rightLabelValue('CAMBIO', cambio) + '\n';
+    if (!receiptData.isRefund) {
+      const entrega = formatMoney((receiptData.paymentAmount || receiptData.total), { decimal: ',', suffix: currencySymbol });
+      const cambio = formatMoney((receiptData.changeAmount || 0), { decimal: ',', suffix: currencySymbol });
+      receipt += rightLabelValue('ENTREGA', entrega) + '\n';
+      receipt += rightLabelValue('CAMBIO', cambio) + '\n';
+    }
     receipt += '\n';
     
     // Services count
@@ -2202,12 +2717,12 @@ ipcMain.handle('printer:printBarcode', async (event, barcodeData) => {
 
     // Printer selection:
     // - LABEL_PRINTER_NAME env var (recommended for dedicated label printer)
-    // - otherwise fall back to configured receipt printer
-    const settings = db?.getSystemSettings?.();
-    const receiptPrinter = settings?.printer_name;
-    const printerName = (process.env.LABEL_PRINTER_NAME || receiptPrinter || '').toString().trim();
+    // - otherwise the receipt printer: the one set in Settings, or the auto-detected
+    //   one when Settings is empty (same as receipt printing)
+    const labelPrinterEnv = String(process.env.LABEL_PRINTER_NAME || '').trim();
+    const printerName = (labelPrinterEnv || await getPrinterNameFast() || '').toString().trim();
     if (!printerName) {
-      return { success: false, message: 'No printer configured. Set Receipt Printer Name in Settings or LABEL_PRINTER_NAME env var.' };
+      return { success: false, message: 'No printer found. Connect the printer, or set Receipt Printer Name in Settings.' };
     }
 
     const formatPrice = (amount) => {
@@ -2227,7 +2742,13 @@ ipcMain.handle('printer:printBarcode', async (event, barcodeData) => {
 
     // Try a "graphic" (HTML) label first so we can match the desired layout.
     // If it fails (driver/printer quirks), fall back to the raw ESC/POS implementation below.
-    const labelPrintMode = String(payload.labelPrintMode || process.env.LABEL_PRINT_MODE || 'auto').toLowerCase();
+    // On the receipt printer (no dedicated LABEL_PRINTER_NAME) always print raw ESC/POS, like
+    // receipts: an HTML page goes through the Windows driver, which on POS thermal printers
+    // prints a blank page and fires the driver's "open cash drawer" setting.
+    const onReceiptPrinter = !labelPrinterEnv;
+    const labelPrintMode = (onReceiptPrinter && !process.env.LABEL_PRINT_MODE)
+      ? 'raw'
+      : String(payload.labelPrintMode || process.env.LABEL_PRINT_MODE || 'auto').toLowerCase();
     const hasPrice = Number.isFinite(priceNum) && priceNum >= 0;
     const refValue = (payload.ref ?? payload.productId ?? payload.id ?? payload.sku ?? barcode);
 
@@ -2546,6 +3067,8 @@ ipcMain.handle('printer:printBarcode', async (event, barcodeData) => {
 
     let label = '';
     label += ESC + '@';
+    // Cancel Chinese (GB18030) mode — JP-80M ships with it on, which garbles € and accents.
+    label += '\x1C.';
     // Try to enable a code table that supports the Euro symbol.
     label += ESC + 't' + String.fromCharCode(CODEPAGE);
 
@@ -3013,6 +3536,123 @@ ipcMain.handle('scale:listPorts', async () => {
 });
 
 // Diagnostic: report whether SerialPort loaded and why not.
+// On-screen scale diagnosis (Settings → Test scale) for touch-only PCs: reports the
+// app's scale state and the raw bytes every COM port sends, so the scale format and
+// port conflicts can be read from a photo of the screen.
+ipcMain.handle('scale:diagnose', async () => {
+  const lines = [];
+  const log = (t) => lines.push(String(t));
+  const showBytes = (buf) => buf.toString('latin1').replace(/[\x00-\x1F\x7F-\xFF]/g, (c) => `<${c.charCodeAt(0).toString(16).padStart(2, '0')}>`);
+
+  log(`POS v${app.getVersion()}   ${new Date().toLocaleString('es-ES')}`);
+  if (!SerialPort) {
+    log(`SerialPort module NOT loaded: ${serialPortLoadError ? serialPortLoadError.message : '?'}`);
+    return { success: false, text: lines.join('\n') };
+  }
+
+  const ageS = scaleState.lastUpdatedAt ? ((Date.now() - scaleState.lastUpdatedAt) / 1000).toFixed(1) : '-';
+  log(`Scale: port=${scaleState.portPath || '-'} open=${!!(scalePort && scalePort.isOpen)} cfg=${JSON.stringify(scaleState.config || {})}`);
+  log(`       last weight=${scaleState.lastWeightKg ?? '-'} kg (${ageS}s ago) error=${scaleState.lastError || '-'}`);
+  log(`Display: mode=${getCustomerDisplayMode()} connected=${!!customerDisplay?.isConnected} port=${customerDisplay?.port?.path || '-'} exclude=${process.env.CUSTOMER_DISPLAY_EXCLUDE_PORTS || '-'}`);
+  log(`Printer: ${db?.getSystemSettings?.()?.printer_name || '-'}  COM ports used by printer: ${(await getPrinterComPorts()).join(',') || 'none'}`);
+  log(`SCALE_PORT=${process.env.SCALE_PORT || '-'}`);
+
+  const ports = await SerialPort.list();
+  log('');
+  log(`COM ports (${ports.length}):`);
+  for (const p of ports) log(`  ${p.path}  ${p.manufacturer || '?'}  vid=${p.vendorId || '-'} pid=${p.productId || '-'}`);
+
+  // Release the scale port during the test and stop auto-connect from grabbing it.
+  isConnecting = true;
+  try {
+    if (scalePort) await closeScalePort(scalePort);
+  } catch { /* ignore */ }
+  scalePort = null;
+  scaleParser = null;
+
+  const configs = [
+    { baudRate: 9600, dataBits: 8, parity: 'none' },
+    { baudRate: 4800, dataBits: 8, parity: 'none' },
+    { baudRate: 2400, dataBits: 8, parity: 'none' },
+    { baudRate: 19200, dataBits: 8, parity: 'none' },
+    { baudRate: 9600, dataBits: 7, parity: 'even' }
+  ];
+  const polls = [
+    ['$', Buffer.from('$')],
+    ['EOT ENQ', Buffer.from([0x04, 0x05])],
+    ['ENQ', Buffer.from([0x05])],
+    ['P', Buffer.from('P\r\n')],
+    ['W', Buffer.from('W\r\n')]
+  ];
+  // A lone ACK/NAK is only a handshake, not a weight: keep trying other commands.
+  const hasRealData = (chunks) => Buffer.concat(chunks).some((b) => b !== 0x06 && b !== 0x15);
+
+  try {
+    for (const p of ports) {
+      log('');
+      const normPath = (x) => String(x || '').replace(/^\\\\\.\\/, '').toLowerCase();
+      if (customerDisplay?.port?.path && normPath(customerDisplay.port.path) === normPath(p.path)) {
+        log(`${p.path}: was held by CUSTOMER DISPLAY - released for the scale`);
+        excludePortFromCustomerDisplay(p.path);
+        try { await customerDisplay.disconnect(); } catch { /* ignore */ }
+        await sleep(300);
+      }
+      for (const cfg of configs) {
+        const label = `${p.path} ${cfg.baudRate} ${cfg.dataBits}${cfg.parity[0].toUpperCase()}1`;
+        let port;
+        try {
+          port = new SerialPort({ path: p.path, baudRate: cfg.baudRate, dataBits: cfg.dataBits, parity: cfg.parity, stopBits: 1, autoOpen: false });
+          await new Promise((resolve, reject) => port.open((err) => (err ? reject(err) : resolve())));
+        } catch (e) {
+          log(`${label}: CANNOT OPEN - ${e.message}`);
+          break;
+        }
+
+        const chunks = [];
+        port.on('data', (d) => chunks.push(Buffer.from(d)));
+        try { port.set({ dtr: true, rts: true }, () => {}); } catch { /* ignore */ }
+
+        await sleep(1500);
+        let mode = 'by itself';
+        if (chunks.length === 0) {
+          const replies = [];
+          for (const [name, bytes] of polls) {
+            const before = chunks.length;
+            try { port.write(bytes); } catch { /* ignore */ }
+            await sleep(400);
+            if (chunks.length > before) {
+              replies.push(name);
+              if (hasRealData(chunks.slice(before))) { mode = `after ${name}`; break; }
+            }
+          }
+          if (mode === 'by itself') mode = replies.length ? `only ACK/NAK to ${replies.join(', ')}` : 'by itself';
+        }
+        await closeScalePort(port);
+
+        const data = Buffer.concat(chunks);
+        if (data.length === 0) {
+          log(`${label}: silent`);
+          continue;
+        }
+        const { weight } = parseLatestScaleWeight(data.toString('latin1'));
+        log(`${label}: ${data.length} bytes ${mode} -> parsed ${weight ?? 'none'} kg`);
+        log(`  ${showBytes(data.subarray(-120))}`);
+        // Mostly printable data means the speed is right; no need to try the others.
+        const printable = data.toString('latin1').replace(/[^\x20-\x7E\r\n]/g, '').length;
+        if (printable >= data.length * 0.7) break;
+      }
+    }
+  } finally {
+    isConnecting = false;
+    lastScaleAutoScanAt = 0;
+    lastScaleAutoScanResult = null;
+  }
+
+  const text = lines.join('\n');
+  try { fs.writeFileSync(path.join(app.getPath('userData'), 'scale-test.txt'), text); } catch { /* ignore */ }
+  return { success: true, text };
+});
+
 ipcMain.handle('scale:moduleStatus', async () => {
   return {
     scaleEnabled: SCALE_ENABLED,
@@ -3059,6 +3699,7 @@ ipcMain.handle('scale:connect', async (event, portPath) => {
     scaleParser = opened.parser;
 
     scaleState.portPath = portPath;
+    excludePortFromCustomerDisplay(portPath);
     scaleState.config = { baudRate: 57600, dataBits: 8, stopBits: 1, parity: 'none' };
     scaleState.lastError = null;
 
@@ -3081,7 +3722,7 @@ ipcMain.handle('scale:readWeight', async () => {
   // If we recently received streaming data, return immediately.
   if (scalePort && scalePort.isOpen && typeof scaleState.lastWeightKg === 'number') {
     const ageMs = Date.now() - (scaleState.lastUpdatedAt || 0);
-    if (ageMs >= 0 && ageMs <= 1500) {
+    if (ageMs >= 0 && ageMs <= (scaleState.workingPoll ? 250 : 1500)) {
       return {
         success: true,
         weight: scaleState.lastWeightKg,
@@ -3113,7 +3754,7 @@ ipcMain.handle('scale:readWeight', async () => {
     try {
       const ports = await SerialPort.list();
       console.log('[Scale] All ports found:', ports.length);
-      const exclude = process.env.CUSTOMER_DISPLAY_PORT ? [String(process.env.CUSTOMER_DISPLAY_PORT)] : [];
+      const exclude = await getScaleExcludePorts(ports);
       const rankedPorts = rankScalePorts(ports, { excludePaths: exclude });
       const candidates = rankedPorts.length > 0 ? rankedPorts : [];
       
@@ -3174,6 +3815,7 @@ ipcMain.handle('scale:readWeight', async () => {
               console.log('[Scale] Connected successfully using:', cfg, 'on', scalePortPath);
 
               scaleState.portPath = scalePortPath;
+              excludePortFromCustomerDisplay(scalePortPath);
               scaleState.config = cfg;
               scaleState.lastError = null;
 
@@ -3245,7 +3887,7 @@ ipcMain.handle('scale:readWeight', async () => {
       } else {
         isConnecting = false;
         lastScaleAutoScanAt = Date.now();
-        const noPortsMsg = `No scale found. Total ports detected: ${ports.length}. ${ports.length > 0 ? `Ports found: ${allPortsInfo}` : 'No COM ports detected - check USB connection and driver installation.'}`;
+        const noPortsMsg = `No scale found. Total ports detected: ${ports.length}. ${ports.length > 0 ? `Ports found: ${allPortsInfo}` : 'No COM ports detected - check USB connection and driver installation.'}${exclude.length ? ` Skipped (printer/display): ${exclude.join(', ')}` : ''}`;
         
         // Last resort: Try COM8 directly (common ZFOC scale port)
         if (ports.some(p => p.path === 'COM8' || p.path === '\\\\.\\COM8')) {
@@ -3255,6 +3897,7 @@ ipcMain.handle('scale:readWeight', async () => {
             scalePort = opened.port;
             scaleParser = opened.parser;
             scaleState.portPath = 'COM8';
+            excludePortFromCustomerDisplay('COM8');
             scaleState.config = { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' };
             scaleState.lastError = null;
             
@@ -3381,6 +4024,8 @@ async function initializeCustomerDisplay() {
   if (!isVfdCustomerDisplayEnabled()) {
     return false;
   }
+  // Never probe a COM port the receipt printer is using.
+  try { await getPrinterComPorts(); } catch { /* ignore */ }
   if (!customerDisplay) {
     customerDisplay = new CustomerDisplay();
   }
