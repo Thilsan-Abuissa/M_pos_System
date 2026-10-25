@@ -451,22 +451,26 @@ function setParkingPaymentContext(nextCtx) {
   }
 }
 
+// Resolves true only when it actually stored new details (callers re-render on true only;
+// re-rendering on every call loops forever when a PARKING has no name).
 async function hydrateParkingPaymentContextIfNeeded(ctx) {
   try {
-    if (!ctx || !ctx.receiptNumber) return;
+    if (!ctx || !ctx.receiptNumber) return false;
     const receiptNumber = String(ctx.receiptNumber || '').trim();
-    if (!receiptNumber) return;
+    if (!receiptNumber) return false;
 
     const hasNames = !!((ctx.restaurantName || ctx.customerName) && ctx.customerType);
-    if (hasNames && ctx.remainingAmount !== undefined) return;
-    if (parkingContextHydrateInFlight) return;
-    if (parkingContextLastHydratedReceipt === receiptNumber) return;
+    if (hasNames && ctx.remainingAmount !== undefined) return false;
+    if (parkingContextHydrateInFlight) return false;
+    if (parkingContextLastHydratedReceipt === receiptNumber) return false;
 
     parkingContextHydrateInFlight = true;
     parkingContextLastHydratedReceipt = receiptNumber;
 
     const loan = await window.api.getLoanByReceipt(receiptNumber);
-    if (!loan) return;
+    if (!loan) return false;
+    // A newer PARKING may have been opened meanwhile: don't overwrite its context.
+    if (getParkingPaymentContext()?.receiptNumber !== receiptNumber) return false;
 
     const updated = {
       ...ctx,
@@ -479,8 +483,9 @@ async function hydrateParkingPaymentContextIfNeeded(ctx) {
       customerPhone: loan.customer_phone || null
     };
     setParkingPaymentContext(updated);
+    return true;
   } catch {
-    // ignore
+    return false;
   } finally {
     parkingContextHydrateInFlight = false;
   }
@@ -524,7 +529,8 @@ function updateParkingContextBanner() {
 
   // Hydrate missing details asynchronously (best effort)
   if (!ctx.customerType || (!ctx.restaurantName && !ctx.customerName) || !Number.isFinite(remaining)) {
-    hydrateParkingPaymentContextIfNeeded(ctx).finally(() => {
+    hydrateParkingPaymentContextIfNeeded(ctx).then((updated) => {
+      if (!updated) return;
       try { updateParkingContextBanner(); } catch { /* ignore */ }
     });
   }
@@ -2340,7 +2346,7 @@ async function devPinConfirm() {
   if (!_devPinValue) return;
   try {
     const settings = await window.api.getSystemSettings();
-    const storedPin = String(settings?.developer_pin || '1234');
+    const storedPin = String(settings?.developer_pin || '1995');
     if (_devPinValue === storedPin) {
       document.getElementById('devPinOverlay').style.display = 'none';
       if (typeof _devPinCallback === 'function') _devPinCallback();
@@ -3100,9 +3106,20 @@ function setupCheckoutMenuBar() {
   if (!bar || bar.dataset.wired) return;
   bar.dataset.wired = '1';
 
+  // ☰ button: shows/hides the page buttons popup (the icon turns into ✕ while open).
+  // It closes again when a button is chosen or ☰/✕ is tapped, never on a stray tap.
+  const popup  = document.getElementById('cmbPopup');
+  const toggle = document.getElementById('cmbToggle');
+  const setMenuOpen = (open) => {
+    if (popup) popup.hidden = !open;
+    toggle?.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+  toggle?.addEventListener('click', () => setMenuOpen(!!popup?.hidden));
+
   bar.addEventListener('click', (e) => {
     const btn = e.target.closest('.cmb-btn');
     if (!btn) return;
+    setMenuOpen(false);
 
     const view   = btn.dataset.coView;
     const action = btn.dataset.coAction;
@@ -3261,12 +3278,23 @@ function setupCheckoutHandlers() {
     productSearch.dataset.scanHandlersAttached = '1';
 
     // Debounce search to keep typing smooth on slower Windows PCs.
+    // Digits only = a barcode being scanned: don't re-filter the product grid on every
+    // digit (it flickers / "buffers"); the scan is resolved on Enter instead.
     let productSearchDebounceTimer = null;
+    // True while the grid shows a typed (name) search, so a scan only resets it when needed.
+    let gridFilteredBySearch = false;
+    const renderGrid = (query) => {
+      gridFilteredBySearch = !!query;
+      displayQuickProducts(query);
+    };
     productSearch.addEventListener('input', (e) => {
       const searchQuery = e.target.value.trim();
       if (productSearchDebounceTimer) clearTimeout(productSearchDebounceTimer);
+      productSearchDebounceTimer = null;
+      if (/^\d+$/.test(searchQuery)) return;
       productSearchDebounceTimer = setTimeout(() => {
-        displayQuickProducts(searchQuery);
+        productSearchDebounceTimer = null;
+        renderGrid(searchQuery);
       }, 120);
     });
 
@@ -3276,13 +3304,19 @@ function setupCheckoutHandlers() {
       e.preventDefault();
       const q = String(productSearch.value || '').trim();
       if (!q) return;
+      // Clear right away so the next scan starts in an empty box (and never merges
+      // with this barcode while the lookup is still running).
+      if (productSearchDebounceTimer) clearTimeout(productSearchDebounceTimer);
+      productSearchDebounceTimer = null;
+      productSearch.value = '';
       await searchAndAddProduct(q);
       try {
-        productSearch.value = '';
-        displayQuickProducts('');
-        try { window.__virtualKeyboardSuppressOnce = true; } catch { /* ignore */ }
-        productSearch.focus();
-        productSearch.select?.();
+        if (gridFilteredBySearch) renderGrid('');
+        if (!productSearch.value) {
+          try { window.__virtualKeyboardSuppressOnce = true; } catch { /* ignore */ }
+          productSearch.focus();
+          productSearch.select?.();
+        }
       } catch {
         // ignore
       }
@@ -7272,7 +7306,7 @@ async function printTicket() {
   }
 
   const currencySymbol = systemSettings?.currency_symbol || '€';
-  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const storeName = systemSettings?.store_name || 'BDCONNECT POS';
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
   const companyAddress = systemSettings?.company_address || '';
@@ -7955,7 +7989,7 @@ function showReceipt(sale) {
   const content = document.getElementById('receiptContent');
   
   const date = parseAppDateTimeLoose(sale.sale_date);
-  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const storeName = systemSettings?.store_name || 'BDCONNECT POS';
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
   const companyAddress = systemSettings?.company_address || '';
@@ -8015,6 +8049,7 @@ function showReceipt(sale) {
       ${ownerName ? `<p>${ownerName}</p>` : ''}
       ${nieNumber ? `<p>${nieNumber}</p>` : ''}
       ${companyAddress ? `<p style="white-space: pre-line;">${companyAddress}</p>` : ''}
+      ${systemSettings?.store_phone ? `<p>Tel: ${systemSettings.store_phone}</p>` : ''}
       <h3 style="margin-top: 10px;">FACTURA SIMPLIFICADA</h3>
       <p>Receipt #${sale.id}</p>
       <p>${formatDateTimeWithDisplayTimeZone(date, 'en-GB', {
@@ -8266,7 +8301,7 @@ function showLoanReceipt(sale, loan) {
   const content = document.getElementById('receiptContent');
   
   const date = parseAppDateTimeLoose(sale.sale_date);
-  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const storeName = systemSettings?.store_name || 'BDCONNECT POS';
   const ownerName = systemSettings?.owner_name || '';
   const nieNumber = systemSettings?.nie_number || '';
   const companyAddress = systemSettings?.company_address || '';
@@ -8286,6 +8321,7 @@ function showLoanReceipt(sale, loan) {
       ${ownerName ? `<p>${ownerName}</p>` : ''}
       ${nieNumber ? `<p>${nieNumber}</p>` : ''}
       ${companyAddress ? `<p style="white-space: pre-line;">${companyAddress}</p>` : ''}
+      ${systemSettings?.store_phone ? `<p>Tel: ${systemSettings.store_phone}</p>` : ''}
       <h3 style="margin-top: 10px;">FACTURA SIMPLIFICADA</h3>
       <h3 style="color: #6E8FAF;">PARKING RECEIPT</h3>
       <p>Receipt #${loan.receipt_number}</p>
@@ -8817,7 +8853,7 @@ async function printLoanPaymentReceipt({ loanBefore, loanAfter, amount, paymentM
 
     // Standard receipt payload: DO NOT send type='loanPayment' (that triggers the special Parking-only format).
     const receiptData = {
-      storeName: systemSettings?.store_name || 'SUPERMARKET POS',
+      storeName: systemSettings?.store_name || 'BDCONNECT POS',
       ownerName: systemSettings?.owner_name || '',
       nieNumber: systemSettings?.nie_number || '',
       companyAddress: systemSettings?.company_address || '',
@@ -10489,8 +10525,8 @@ async function openProductModal(product = null, categoryId = null, categoryName 
   const form = document.getElementById('productForm');
   const title = document.getElementById('productModalTitle');
 
-  // Checkout edit mode: a panel over the cart (left side) with only name, prices and
-  // sales VAT. Hidden fields keep the product's current values, so saving leaves them unchanged.
+  // Checkout edit mode: a panel over the cart (left side) with only name, image, prices
+  // and sales VAT. Hidden fields keep the product's current values, so saving leaves them unchanged.
   const priceOnly = !!(options && options.priceOnly && product);
   modal.classList.toggle('price-only-mode', priceOnly);
   form.noValidate = priceOnly;
@@ -10698,7 +10734,24 @@ async function editProduct(id, options = {}) {
 
   await openProductModal(product, null, null, options);
 
-  if (options && options.priceOnly) {
+  // Checkout edit panel: tapping a price selects the whole number and the first key typed
+  // replaces it (⌫ clears it), so the cashier never deletes digits one by one. The old
+  // price stays until a key is pressed, so a stray tap can't turn it into 0.
+  const priceOnly = !!(options && options.priceOnly);
+  ['productRegularPrice', 'productSalePrice'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const arm = () => {
+      el.dataset.replaceOnNextKey = '1';
+      setTimeout(() => { try { el.select(); } catch { /* ignore */ } }, 0);
+    };
+    el.onfocus = priceOnly ? arm : null;
+    el.onclick = priceOnly ? arm : null;
+    el.oninput = priceOnly ? () => { el.dataset.replaceOnNextKey = '0'; } : null;
+    if (!priceOnly) delete el.dataset.replaceOnNextKey;
+  });
+
+  if (priceOnly) {
     const priceInput = document.getElementById('productRegularPrice');
     try { priceInput?.focus(); priceInput?.select?.(); } catch { /* ignore */ }
   }
@@ -11624,7 +11677,7 @@ async function printSalesHistoryThermal() {
     let receipt = '';
     receipt += ESC + '@';
 
-    receipt += center((settings?.store_name || 'SUPERMARKET POS').toString().toUpperCase()) + '\n';
+    receipt += center((settings?.store_name || 'BDCONNECT POS').toString().toUpperCase()) + '\n';
     receipt += center(reportTitle) + '\n';
     receipt += '='.repeat(LINE_WIDTH) + '\n';
     receipt += `FECHA.....: ${dateRange}\n`;
@@ -11709,7 +11762,7 @@ async function printSalesHistoryThermal() {
 
 function printTodaySalesWithTitle(salesData, title, dateRange) {
   const currency = systemSettings?.currency_symbol || '€';
-  const store = systemSettings?.store_name || 'SUPERMARKET POS';
+  const store = systemSettings?.store_name || 'BDCONNECT POS';
   
   // Create print window
   const printWindow = window.open('', '_blank');
@@ -11872,7 +11925,7 @@ function printTodaySalesWithTitle(salesData, title, dateRange) {
 
 function printTodaySales(todayData) {
   const currencySymbol = systemSettings?.currency_symbol || '€';
-  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const storeName = systemSettings?.store_name || 'BDCONNECT POS';
   const today = new Date();
   
   // Create print window
@@ -12510,7 +12563,7 @@ async function printSalesReportThermal() {
     let receipt = '';
     receipt += ESC + '@';
 
-    receipt += center((settings?.store_name || 'SUPERMARKET POS').toString().toUpperCase()) + '\n';
+    receipt += center((settings?.store_name || 'BDCONNECT POS').toString().toUpperCase()) + '\n';
     receipt += center(title) + '\n';
     receipt += '='.repeat(LINE_WIDTH) + '\n';
     receipt += `FECHAS....: ${fmtDate(startDate)} ${fmtDate(endDate)}\n`;
@@ -13554,6 +13607,7 @@ async function loadSystemSettingsView() {
     document.getElementById('ownerName').value = systemSettings.owner_name || '';
     document.getElementById('nieNumber').value = systemSettings.nie_number || '';
     document.getElementById('companyAddress').value = systemSettings.company_address || '';
+    document.getElementById('storePhone').value = systemSettings.store_phone || '';
     
     // Update logo preview
     const logoPreviewText = document.getElementById('logoPreviewText');
@@ -13882,6 +13936,7 @@ async function saveSystemSettings() {
       ownerName: document.getElementById('ownerName').value,
       nieNumber: document.getElementById('nieNumber').value,
       companyAddress: document.getElementById('companyAddress').value,
+      storePhone: document.getElementById('storePhone').value,
       currencySymbol: document.getElementById('currencySymbol').value,
       currencyCode: document.getElementById('currencyCode').value,
       taxRate: Number.isFinite(taxRate) ? taxRate : 0,
@@ -15048,6 +15103,13 @@ function setupVirtualKeyboard() {
     }
 
     if (key === 'Backspace') {
+      // A field armed to "replace on next key" is cleared entirely by ⌫.
+      if (currentKeyboardInput && currentKeyboardInput.dataset?.replaceOnNextKey === '1') {
+        currentKeyboardInput.value = '';
+        try { currentKeyboardInput.dataset.replaceOnNextKey = '0'; } catch { /* ignore */ }
+        currentKeyboardInput.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
       if (currentKeyboardInput) {
         try {
           const v = String(currentKeyboardInput.value || '');
@@ -15635,7 +15697,7 @@ async function printRefundReceipt(returnRecord, sale, lines) {
     const result = await window.api.printReceipt({
       isRefund: true,
       refundId: returnRecord?.id,
-      storeName: systemSettings?.store_name || 'SUPERMARKET POS',
+      storeName: systemSettings?.store_name || 'BDCONNECT POS',
       ownerName: systemSettings?.owner_name || '',
       nieNumber: systemSettings?.nie_number || '',
       companyAddress: systemSettings?.company_address || '',
@@ -16176,6 +16238,51 @@ function displayZReports(zReports) {
   });
 }
 
+// The money part of a Z report: shared by the Z-report receipt and the Arqueo period lists
+// (DÍA / MENSUAL / TRIMESTRE / ANUAL), so a list row always shows the same amount as the
+// receipt it opens. PARKING counts when paid (loan payments), never when parked; refunds are
+// taken off by the method they were refunded with.
+function computeZReportMoney(sales, returns, loanPayments) {
+  const nonLoanSales = (sales || []).filter(s => (String(s?.payment_method || '').toLowerCase() !== 'loan'));
+  const dedupedReturns = dedupeReturnsByOriginalSaleId((returns || []).map(r => (
+    typeof r?.items === 'string'
+      ? { ...r, items: (() => { try { return JSON.parse(r.items); } catch { return []; } })() }
+      : r
+  )));
+
+  const sumSales = (method) => nonLoanSales
+    .filter(s => (s.payment_method || '').toString().toLowerCase() === method)
+    .reduce((sum, s) => sum + (Number(s.total) || 0), 0);
+  const sumLoanPayments = (method) => (loanPayments || [])
+    .filter(p => (p.payment_method || '').toLowerCase() === method)
+    .reduce((sum, p) => sum + (p.amount || 0), 0);
+  const sumReturns = (method) => dedupedReturns
+    .filter(r => (r.refund_method || '').toString().toLowerCase() === method)
+    .reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
+
+  const cashSalesFromSales = sumSales('cash');
+  const cardSalesFromSales = sumSales('card');
+  const loanCashPayments = sumLoanPayments('cash');
+  const loanCardPayments = sumLoanPayments('card');
+  const cashSales = cashSalesFromSales + loanCashPayments;
+  const cardSales = cardSalesFromSales + loanCardPayments;
+  const cashReturns = sumReturns('cash');
+  const cardReturns = sumReturns('card');
+
+  return {
+    nonLoanSales,
+    dedupedReturns,
+    loanCashPayments,
+    loanCardPayments,
+    cashSales,
+    cardSales,
+    cashReturns,
+    cardReturns,
+    netCash: cashSales - cashReturns,
+    netCard: cardSales - cardReturns
+  };
+}
+
 async function openZReportModal() {
   try {
     // Calculate report data for the selected range
@@ -16255,7 +16362,8 @@ async function openZReportModal() {
     });
     
     // BUSINESS RULE: PARKING/loan sales are not counted until paid.
-    const nonLoanSales = (sales || []).filter(s => (String(s?.payment_method || '').toLowerCase() !== 'loan'));
+    const money = computeZReportMoney(sales, returns, loanPayments);
+    const nonLoanSales = money.nonLoanSales;
 
 
     // Count PARKING payments as documents on the paid day.
@@ -16271,31 +16379,15 @@ async function openZReportModal() {
 
     // Calculate totals (paid sales + paid PARKING documents)
     const totalSales = nonLoanSales.length + loanPaymentDocCount;
-    const dedupedReturns = dedupeReturnsByOriginalSaleId(returns);
+    const dedupedReturns = money.dedupedReturns;
     const totalReturns = dedupedReturns.length;
     const refundedSalesCount = countFullyRefundedSales(dedupedReturns, nonLoanSales);
     const netSalesCount = Math.max(0, (nonLoanSales.length - refundedSalesCount) + loanPaymentDocCount);
     
     const totalReturnsAmount = dedupedReturns.reduce((sum, ret) => sum + getReturnGrossTotal(ret), 0);
     
-    // Calculate payment methods (paid sales)
-    const cashSalesFromSales = nonLoanSales
-      .filter(s => (s.payment_method || '').toString().toLowerCase() === 'cash')
-      .reduce((sum, s) => sum + (Number(s.total) || 0), 0);
-    const cardSalesFromSales = nonLoanSales
-      .filter(s => (s.payment_method || '').toString().toLowerCase() === 'card')
-      .reduce((sum, s) => sum + (Number(s.total) || 0), 0);
-
-    // PARKING payments: count the money on the day it is paid
-    const loanCashPayments = (loanPayments || [])
-      .filter(p => (p.payment_method || '').toLowerCase() === 'cash')
-      .reduce((sum, p) => sum + (p.amount || 0), 0);
-    const loanCardPayments = (loanPayments || [])
-      .filter(p => (p.payment_method || '').toLowerCase() === 'card')
-      .reduce((sum, p) => sum + (p.amount || 0), 0);
-
-    const cashSales = cashSalesFromSales + loanCashPayments;
-    const cardSales = cardSalesFromSales + loanCardPayments;
+    // Payment methods: paid sales + PARKING payments (money counted on the day it is paid)
+    const { loanCashPayments, loanCardPayments, cashSales, cardSales } = money;
     // Store PARKING payments separately for visibility (they are already included in cash/card totals)
     const loanSales = loanCashPayments + loanCardPayments;
 
@@ -16310,12 +16402,7 @@ async function openZReportModal() {
     const totalTax = vatRows.reduce((sum, r) => sum + (Number(r?.cuota) || 0), 0);
     
     // Returns by method so cash/card match what was actually collected
-    const cashReturns = dedupedReturns
-      .filter(r => (r.refund_method || '').toString().toLowerCase() === 'cash')
-      .reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
-    const cardReturns = dedupedReturns
-      .filter(r => (r.refund_method || '').toString().toLowerCase() === 'card')
-      .reduce((sum, r) => sum + getReturnGrossTotal(r), 0);
+    const { cashReturns, cardReturns } = money;
 
     // Financial summary based on money movement (not including unpaid PARKING)
     const grossSales = cashSales + cardSales;
@@ -17107,7 +17194,7 @@ async function printZReport(report) {
     const endFmt = end ? formatDateTime(end) : null;
 
     // Header
-    receipt += center((settings?.store_name || 'SUPERMARKET POS').toString().toUpperCase()) + '\n';
+    receipt += center((settings?.store_name || 'BDCONNECT POS').toString().toUpperCase()) + '\n';
     receipt += center('ARQUEO DE CAJA') + '\n';
     receipt += '='.repeat(LINE_WIDTH) + '\n';
     receipt += `CAJA.......: PRINCIPAL\n`;
@@ -17940,7 +18027,7 @@ async function printReceiptToThermalPrinter(sale, options = {}) {
       systemSettings = await window.api.getSystemSettings();
     }
     
-    const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+    const storeName = systemSettings?.store_name || 'BDCONNECT POS';
     const ownerName = systemSettings?.owner_name || '';
     const nieNumber = systemSettings?.nie_number || '';
     const companyAddress = systemSettings?.company_address || '';
@@ -18481,7 +18568,7 @@ window.selectPrinter = selectPrinter;
 
 function buildMonitorCustomerDisplayPayload(extra = {}) {
   const currencySymbol = systemSettings?.currency_symbol || '€';
-  const storeName = systemSettings?.store_name || 'SUPERMARKET POS';
+  const storeName = systemSettings?.store_name || 'BDCONNECT POS';
 
   // Prices in this POS are tax-included; derive base/tax via reverse calc.
   let totalCents = 0;
@@ -19355,26 +19442,40 @@ function arqueoListBack() {
 }
 
 /**
- * Roll up the actual monthly sales totals (authoritative `sales` table) into
- * arbitrary buckets. `keyFn` maps a 'YYYY-MM' month to a bucket key (or null to skip).
- * Returns { [bucketKey]: { total, cash, card } }.
+ * Totals per period for the Arqueo lists, computed with the SAME money calculation as the
+ * Z-report receipt (computeZReportMoney) so a row's amount equals the receipt it opens.
+ * Rows are split by local calendar day — the same day boundaries the receipt's date range
+ * uses. `keyFn` maps a local 'YYYY-MM-DD' to a bucket key (or null to skip).
+ * Returns { [bucketKey]: { total, cash, card } } (net of refunds; PARKING when paid).
  */
-async function _arqueoActualTotalsBy(keyFn) {
+async function _arqueoMoneyBy(keyFn, startDateTime = '2000-01-01T00:00:00.000Z', endDateTime = new Date().toISOString()) {
   const map = {};
   try {
-    const actualRows = await window.api.getMonthlySalesActualTotals();
-    (actualRows || []).forEach(r => {
-      const month = String(r.month || '');
-      if (month.length < 7) return;
-      const key = keyFn(month);
+    const data = await window.api.getZReportMoneyRows(startDateTime, endDateTime);
+    const pad = (n) => String(n).padStart(2, '0');
+    const localYmd = (value) => {
+      const d = parseAppDateTimeLoose(value);
+      if (!d || Number.isNaN(d.getTime())) return null;
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    };
+    const buckets = {};
+    const add = (list, field, dateOf) => (list || []).forEach(row => {
+      const ymd = localYmd(dateOf(row));
+      const key = ymd ? keyFn(ymd) : null;
       if (!key) return;
-      if (!map[key]) map[key] = { total: 0, cash: 0, card: 0 };
-      map[key].total += Number(r.total) || 0;
-      map[key].cash  += Number(r.cash)  || 0;
-      map[key].card  += Number(r.card)  || 0;
+      if (!buckets[key]) buckets[key] = { sales: [], returns: [], loanPayments: [] };
+      buckets[key][field].push(row);
+    });
+    add(data?.sales, 'sales', r => r.sale_date);
+    add(data?.returns, 'returns', r => r.return_date);
+    add(data?.loanPayments, 'loanPayments', r => r.payment_date);
+
+    Object.entries(buckets).forEach(([key, b]) => {
+      const m = computeZReportMoney(b.sales, b.returns, b.loanPayments);
+      map[key] = { total: m.netCash + m.netCard, cash: m.netCash, card: m.netCard };
     });
   } catch (e) {
-    console.warn('Could not fetch actual monthly sales totals:', e);
+    console.warn('Could not compute Arqueo period totals:', e);
   }
   return map;
 }
@@ -19406,14 +19507,14 @@ async function _arqueoComputeAndRender() {
     const [y, m] = ym.split('-').map(Number);
     const daysInMonth = new Date(y, m, 0).getDate();
 
-    // Fetch actual daily sales totals
-    let actualDayMap = {};
-    try {
-      const actualRows = await window.api.getDailySalesActualTotals(ym);
-      (actualRows || []).forEach(r => { actualDayMap[r.day] = r; });
-    } catch (e) {
-      console.warn('Could not fetch daily sales totals:', e);
-    }
+    // Same calculation as the receipt each day opens
+    const monthStart = new Date(y, m - 1, 1, 0, 0, 0);
+    const monthEnd   = new Date(y, m, 0, 23, 59, 59);
+    const actualDayMap = await _arqueoMoneyBy(
+      ymd => (ymd.slice(0, 7) === ym ? ymd : null),
+      monthStart.toISOString(),
+      monthEnd.toISOString()
+    );
 
     // Group saved Z-reports by day
     const zGroups = {};
@@ -19436,9 +19537,11 @@ async function _arqueoComputeAndRender() {
       const key = `${y}-${mm}-${dd}`;
       const actual = actualDayMap[key];
       const reps   = zGroups[key] || [];
-      const total  = actual ? Number(actual.total) || 0 : reps.reduce((s,r) => s + (Number(r.total_sales_amount)||0), 0);
-      const cash   = actual ? Number(actual.cash)  || 0 : reps.reduce((s,r) => s + (Number(r.cash_sales)||0), 0);
-      const card   = actual ? Number(actual.card)  || 0 : reps.reduce((s,r) => s + (Number(r.card_sales)||0), 0);
+      // Live totals only (no fallback to stored Z-report sums): the receipt this row
+      // opens is computed live, so the row must be too.
+      const total  = actual ? Number(actual.total) || 0 : 0;
+      const cash   = actual ? Number(actual.cash)  || 0 : 0;
+      const card   = actual ? Number(actual.card)  || 0 : 0;
       rows.push({ key, label: `${dd}/${mm}/${y}`, count: reps.length, total, cash, card, reports: reps });
     }
 
@@ -19462,14 +19565,8 @@ async function _arqueoComputeAndRender() {
       } catch {}
     });
 
-    // Fetch actual monthly totals from sales table (authoritative source)
-    let actualMonthMap = {};
-    try {
-      const actualRows = await window.api.getMonthlySalesActualTotals();
-      (actualRows || []).forEach(r => { actualMonthMap[r.month] = r; });
-    } catch (e) {
-      console.warn('Could not fetch actual monthly sales totals:', e);
-    }
+    // Same calculation as the receipt each month opens
+    const actualMonthMap = await _arqueoMoneyBy(ymd => ymd.slice(0, 7));
 
     // Build rows: include months from Z-reports AND from actual sales
     const allKeys = new Set([
@@ -19482,13 +19579,10 @@ async function _arqueoComputeAndRender() {
       const [y, m] = key.split('-').map(Number);
       const reps   = (groups[key] || { reports: [] }).reports;
       const actual = actualMonthMap[key];
-      // Prefer actual sales totals over stored Z-report sums
-      const total  = actual ? Number(actual.total) || 0
-                            : reps.reduce((s, r) => s + (Number(r.total_sales_amount) || (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
-      const cash   = actual ? Number(actual.cash) || 0
-                            : reps.reduce((s, r) => s + Number(r.cash_sales||0), 0);
-      const card   = actual ? Number(actual.card) || 0
-                            : reps.reduce((s, r) => s + Number(r.card_sales||0), 0);
+      // Live totals only, same as the receipt this row opens
+      const total  = actual ? Number(actual.total) || 0 : 0;
+      const cash   = actual ? Number(actual.cash) || 0 : 0;
+      const card   = actual ? Number(actual.card) || 0 : 0;
       const label  = new Intl.DateTimeFormat('es-ES',{month:'long',year:'numeric'}).format(new Date(y,m-1,1)).toUpperCase();
       return { key, label, count: reps.length, total, cash, card, reports: reps };
     });
@@ -19510,8 +19604,8 @@ async function _arqueoComputeAndRender() {
       } catch {}
     });
 
-    // Roll up actual monthly sales totals per year (same authoritative source as MENSUAL)
-    const actualYearMap = await _arqueoActualTotalsBy(m => m.slice(0, 4));
+    // Same calculation as the receipt each year opens
+    const actualYearMap = await _arqueoMoneyBy(ymd => ymd.slice(0, 4));
 
     const yearKeys = Array.from(new Set([
       ...Object.keys(groups),
@@ -19521,13 +19615,10 @@ async function _arqueoComputeAndRender() {
     const rows = yearKeys.map(key => {
       const reps   = (groups[key] || { reports: [] }).reports;
       const actual = actualYearMap[key];
-      // Prefer actual sales totals over stored Z-report sums
-      const total = actual ? actual.total
-                           : reps.reduce((s, r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
-      const cash  = actual ? actual.cash
-                           : reps.reduce((s, r) => s + Number(r.cash_sales||0), 0);
-      const card  = actual ? actual.card
-                           : reps.reduce((s, r) => s + Number(r.card_sales||0), 0);
+      // Live totals only, same as the receipt this row opens
+      const total = actual ? actual.total : 0;
+      const cash  = actual ? actual.cash  : 0;
+      const card  = actual ? actual.card  : 0;
       return { key, label: key, count: reps.length, total, cash, card, reports: reps };
     });
 
@@ -19575,10 +19666,10 @@ async function _arqueoComputeAndRender() {
       } catch {}
     });
 
-    // Roll up actual monthly sales totals per quarter (same authoritative source as MENSUAL)
-    const actualQuarterMap = await _arqueoActualTotalsBy(m => {
-      const yr = Number(m.slice(0,4));
-      const mo = Number(m.slice(5,7));
+    // Same calculation as the receipt each quarter opens
+    const actualQuarterMap = await _arqueoMoneyBy(ymd => {
+      const yr = Number(ymd.slice(0,4));
+      const mo = Number(ymd.slice(5,7));
       if (!yr || !mo) return null;
       return `${yr}-Q${quarterOf(mo)}`;
     });
@@ -19597,13 +19688,10 @@ async function _arqueoComputeAndRender() {
         const key    = `${yr}-Q${q}`;
         const reps   = groups[key] || [];
         const actual = actualQuarterMap[key];
-        // Prefer actual sales totals over stored Z-report sums
-        const total = actual ? actual.total
-                             : reps.reduce((s,r) => s + Number(r.total_sales_amount ?? (Number(r.cash_sales||0)+Number(r.card_sales||0))), 0);
-        const cash  = actual ? actual.cash
-                             : reps.reduce((s,r) => s + Number(r.cash_sales||0), 0);
-        const card  = actual ? actual.card
-                             : reps.reduce((s,r) => s + Number(r.card_sales||0), 0);
+        // Live totals only, same as the receipt this row opens
+        const total = actual ? actual.total : 0;
+        const cash  = actual ? actual.cash  : 0;
+        const card  = actual ? actual.card  : 0;
         rows.push({ key, label:`${qNames[q]}  ${yr}`, count:reps.length, total, cash, card, year:yr, q, reports:reps });
       }
     }
@@ -19855,7 +19943,7 @@ function _arqueoRenderReceipt(data, isPending) {
   };
 
   // ── data ──────────────────────────────────────────────────────────────────
-  const storeName  = (systemSettings?.store_name    || 'SUPERMARKET POS').toUpperCase();
+  const storeName  = (systemSettings?.store_name    || 'BDCONNECT POS').toUpperCase();
   const storeAddr  = systemSettings?.store_address || '';
   const storeCif   = systemSettings?.store_cif     || systemSettings?.tax_id || '';
   const storeCity  = systemSettings?.store_city    || '';

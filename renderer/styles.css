@@ -1288,7 +1288,7 @@ body {
 /* Action Buttons Row (Drawer, Delete All, Undo, Note) */
 .action-btns-row {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 6px;
 }
 
@@ -1720,6 +1720,16 @@ body.keyboard-mode #paymentBtn {
   font-size: 15px;
   font-weight: 900;
   border-radius: 10px;
+}
+
+/* No CLEAR key: TICKET fills the right column's top two rows, PAYMENT the bottom two. */
+#checkoutView #ticketBtn {
+  grid-column: 4 !important;
+  grid-row: 1 / span 2 !important;
+}
+#checkoutView #paymentBtn {
+  grid-column: 4 !important;
+  grid-row: 3 / span 2 !important;
 }
 
 #checkoutView #ticketBtn {
@@ -5208,17 +5218,62 @@ button {
 }
 
 /* ============================================================
-   Checkout Menu Bar  (cmb-*)
-   One-click row at bottom of checkout-right to open any view.
+   Checkout Menu  (cmb-*)
+   A small ☰ icon floating in the bottom-right corner of the product
+   area; the page buttons open in a popup right above it.
    ============================================================ */
+.checkout-right { position: relative; }
+
+/* The dock itself is not positioned: the button and the popup are both placed
+   against .checkout-right, so the popup always spans the product area. */
+.cmb-dock { position: static; }
+
+/* Room under the last product row, so the ☰ button never covers a product */
+.quick-products-grid-wrapper { padding-bottom: 68px; }
+
+.cmb-toggle {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 500;
+  width: 52px;
+  min-height: 52px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.cmb-toggle svg { width: 22px; height: 22px; }
+.cmb-toggle .cmb-toggle-close,
+.cmb-toggle[aria-expanded="true"] .cmb-toggle-open { display: none; }
+.cmb-toggle[aria-expanded="true"] .cmb-toggle-close { display: block; }
+.cmb-toggle[aria-expanded="true"] {
+  color: #fff;
+  background: #1a6fa8;
+}
+
+.cmb-popup {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 72px; /* just above the 52px ☰ button */
+  z-index: 500;
+  background: #b8c8d8;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 -8px 24px rgba(15, 23, 42, 0.25);
+}
+.cmb-popup[hidden] { display: none; }
+
 .cmb-grid {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 2px;
-  padding: 2px 0 0;
-  flex: 0 0 auto;
+  padding: 2px;
   background: #b8c8d8;
 }
+.cmb-popup .cmb-btn { min-height: 76px; }
 
 .cmb-btn {
   border: none;
@@ -5426,8 +5481,8 @@ button {
 }
 
 /* Checkout "Edit": a panel docked over the cart (left side) with only
-   name, prices and sales VAT. */
-#productModal.price-only-mode #productForm > .form-group:not(:has(#productName)),
+   name, image, prices and sales VAT. */
+#productModal.price-only-mode #productForm > .form-group:not(:has(#productName)):not(:has(#productImage)),
 #productModal.price-only-mode #productForm > .form-row:not(:has(#productRegularPrice)):not(:has(#productSalesVat)),
 #productModal.price-only-mode #productForm .form-group:has(#productPurchaseVat),
 #productModal.price-only-mode #productPrintLabelBtn {

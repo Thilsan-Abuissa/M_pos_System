@@ -10,6 +10,9 @@ const iconv = require('iconv-lite');
 
 const execPromise = promisify(exec);
 
+// Data folder: Electron names userData after package.json "name" ("supermarket-pos"), not
+// build.productName. Keep "name" unchanged across renames, or every till opens an empty DB.
+
 // Shared printer text encoding helper.
 // Many ESC/POS printers in Spain expect CP858/CP850 variants for the Euro symbol.
 const POS_PRINT_ENCODING = (() => {
@@ -2176,6 +2179,7 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     };
 
     const LINE_WIDTH = inferLineWidth(printerName, receiptData);
+    const receiptStorePhone = String(settings?.store_phone || '').trim();
 
     // Special receipt: PARKING payment receipt
     if (receiptData && receiptData.type === 'loanPayment') {
@@ -2229,10 +2233,11 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
       }
 
       receipt += ESC + '!' + String.fromCharCode(0x20);
-      receipt += (receiptData.storeName || 'SUPERMARKET POS').toString().toUpperCase() + '\n';
+      receipt += (receiptData.storeName || 'BDCONNECT POS').toString().toUpperCase() + '\n';
       receipt += ESC + '!' + String.fromCharCode(0);
 
       if (receiptData.companyAddress) receipt += receiptData.companyAddress + '\n';
+      if (receiptStorePhone) receipt += 'Tel: ' + receiptStorePhone + '\n';
       if (receiptData.nieNumber) receipt += receiptData.nieNumber + '\n';
       receipt += '\n';
 
@@ -2428,6 +2433,10 @@ ipcMain.handle('printer:printReceipt', async (event, receiptData) => {
     // Store address
     if (receiptData.companyAddress) {
       receipt += receiptData.companyAddress + '\n';
+    }
+    // Store phone (System Settings; read here so every receipt type gets it)
+    if (receiptStorePhone) {
+      receipt += 'Tel: ' + receiptStorePhone + '\n';
     }
 
     receipt += '\n';
@@ -3330,6 +3339,10 @@ ipcMain.handle('zreport:getLoanPaymentsDetailedByDateTimeRange', async (event, s
 
 ipcMain.handle('zreport:getMonthlySalesActualTotals', async () => {
   return db.getMonthlySalesActualTotals();
+});
+
+ipcMain.handle('zreport:getMoneyRows', async (event, startDateTime, endDateTime) => {
+  return db.getZReportMoneyRows(startDateTime, endDateTime);
 });
 
 ipcMain.handle('zreport:getDailySalesActualTotals', async (event, yearMonth) => {

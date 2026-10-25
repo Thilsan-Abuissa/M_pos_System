@@ -88,6 +88,7 @@ contextBridge.exposeInMainWorld('api', {
   getLoanPaymentsDetailedByDateTimeRange: (startDateTime, endDateTime, cashierId) => ipcRenderer.invoke('zreport:getLoanPaymentsDetailedByDateTimeRange', startDateTime, endDateTime, cashierId),
   getMonthlySalesActualTotals: () => ipcRenderer.invoke('zreport:getMonthlySalesActualTotals'),
   getDailySalesActualTotals: (yearMonth) => ipcRenderer.invoke('zreport:getDailySalesActualTotals', yearMonth),
+  getZReportMoneyRows: (startDateTime, endDateTime) => ipcRenderer.invoke('zreport:getMoneyRows', startDateTime, endDateTime),
 
   // System Settings
   getSystemSettings: () => ipcRenderer.invoke('settings:get'),

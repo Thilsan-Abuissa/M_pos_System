@@ -548,7 +548,7 @@ class POSDatabase {
 
       CREATE TABLE IF NOT EXISTS system_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        store_name TEXT DEFAULT 'SUPERMARKET POS',
+        store_name TEXT DEFAULT 'BDCONNECT POS',
         store_logo TEXT,
         owner_name TEXT,
         nie_number TEXT,
@@ -580,10 +580,16 @@ class POSDatabase {
     if (settingsCount.count === 0) {
       this.db.prepare(`
         INSERT INTO system_settings (id, store_name, currency_symbol, currency_code, tax_rate)
-        VALUES (1, 'SUPERMARKET POS', '€', 'EUR', 0.21)
+        VALUES (1, 'BDCONNECT POS', '€', 'EUR', 0.21)
       `).run();
     }
     
+    // Rename: stores that never set their own name still carry the old default.
+    this.db.prepare(`
+      UPDATE system_settings SET store_name = 'BDCONNECT POS'
+      WHERE id = 1 AND UPPER(TRIM(COALESCE(store_name, ''))) IN ('SUPERMARKET POS', '')
+    `).run();
+
     // Update existing settings to Euro if still using USD
     const currentSettings = this.db.prepare('SELECT * FROM system_settings WHERE id = 1').get();
     if (currentSettings && currentSettings.currency_code === 'USD') {
@@ -646,6 +652,24 @@ class POSDatabase {
       if (!error.message.includes('duplicate column name')) {
         console.error('Error adding printer_plain_text column:', error);
       }
+    }
+    // Safe printing is the default: the receipt printers we ship (JP-80 type) stay in Chinese
+    // mode, where every '€'/accent swallows the next byte and receipt lines run together.
+    // Switched on ONCE per till (marker column); if someone turns it off later, it stays off.
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN printer_plain_text_defaulted INTEGER DEFAULT 0').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding printer_plain_text_defaulted column:', error);
+      }
+    }
+    try {
+      this.db.prepare(`
+        UPDATE system_settings SET printer_plain_text = 1, printer_plain_text_defaulted = 1
+        WHERE id = 1 AND COALESCE(printer_plain_text_defaulted, 0) = 0
+      `).run();
+    } catch (error) {
+      console.error('Error enabling safe printing by default:', error);
     }
 
     // Link return lines to the exact sale line, so partial returns can be tracked per line.
@@ -875,6 +899,14 @@ class POSDatabase {
       }
     }
 
+    try {
+      this.db.prepare('ALTER TABLE system_settings ADD COLUMN store_phone TEXT').run();
+    } catch (error) {
+      if (!error.message.includes('duplicate column name')) {
+        console.error('Error adding store_phone column:', error);
+      }
+    }
+
     // Add unit_type column to products table if it doesn't exist (weight or quantity)
     try {
       this.db.prepare('ALTER TABLE products ADD COLUMN unit_type TEXT DEFAULT "quantity"').run();
@@ -986,28 +1018,41 @@ class POSDatabase {
 
     // Developer PIN for accessing System Settings
     try {
-      this.db.prepare("ALTER TABLE system_settings ADD COLUMN developer_pin TEXT DEFAULT '1234'").run();
+      this.db.prepare("ALTER TABLE system_settings ADD COLUMN developer_pin TEXT DEFAULT '1995'").run();
     } catch (error) {
       if (!error.message.includes('duplicate column name')) {
         console.error('Error adding developer_pin column:', error);
       }
     }
+    // The default PIN changed 1234 -> 1995. Only tills still on the old default move;
+    // a PIN someone set themselves is kept.
+    try {
+      this.db.prepare(`
+        UPDATE system_settings SET developer_pin = '1995'
+        WHERE id = 1 AND (developer_pin IS NULL OR TRIM(developer_pin) IN ('', '1234'))
+      `).run();
+    } catch (error) {
+      console.error('Error updating default developer PIN:', error);
+    }
 
     // Don't create default users - let setup wizard handle it
     // System will check if any admin exists, if not show setup wizard
 
-    // Insert sample products if table is empty
-    const productCount = this.db.prepare('SELECT COUNT(*) as count FROM products').get();
-    let demoCleanupUsed = false;
+    // Sample products are no longer seeded on new installs (they showed up as unexplained
+    // Bakery/Dairy/... tabs in Checkout). Hide the ones older installs got: only rows whose
+    // barcode AND name still match a sample exactly, so renamed/real products are untouched.
+    // Archived (not deleted), so past sales/reports that used them keep working.
     try {
-      const st = this.db.prepare('SELECT demo_cleanup_used FROM system_settings WHERE id = 1').get();
-      demoCleanupUsed = Number(st?.demo_cleanup_used || 0) === 1;
-    } catch {
-      demoCleanupUsed = false;
-    }
-
-    if (productCount.count === 0 && !demoCleanupUsed) {
-      this.insertSampleProducts();
+      const samples = this.getSampleProducts();
+      const hideSample = this.db.prepare(`
+        UPDATE products SET is_archived = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE COALESCE(is_archived, 0) = 0 AND barcode = ? AND name = ?
+      `);
+      this.db.transaction(() => {
+        for (const p of samples) hideSample.run(p.barcode, p.name);
+      })();
+    } catch (error) {
+      console.error('Error hiding sample products:', error);
     }
 
     // Seed default VAT rates if empty
@@ -1135,8 +1180,8 @@ class POSDatabase {
     return `POS-${Date.now().toString(36)}-${rand}`;
   }
 
-  insertSampleProducts() {
-    const products = [
+  getSampleProducts() {
+    return [
       { barcode: '1234567890123', name: 'Milk 1L', category: 'Dairy', price: 3.99, cost: 2.50, stock: 50 },
       { barcode: '1234567890124', name: 'Bread Whole Wheat', category: 'Bakery', price: 2.49, cost: 1.20, stock: 30 },
       { barcode: '1234567890125', name: 'Eggs (12 pack)', category: 'Dairy', price: 4.99, cost: 3.00, stock: 40 },
@@ -1148,15 +1193,6 @@ class POSDatabase {
       { barcode: '1234567890131', name: 'Tomatoes (per kg)', category: 'Produce', price: 4.49, cost: 2.50, stock: 60 },
       { barcode: '1234567890132', name: 'Cheese Cheddar 200g', category: 'Dairy', price: 7.99, cost: 5.00, stock: 15 }
     ];
-
-    const stmt = this.db.prepare(`
-      INSERT INTO products (barcode, name, category, price, cost, stock)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-
-    for (const product of products) {
-      stmt.run(product.barcode, product.name, product.category, product.price, product.cost, product.stock);
-    }
   }
 
   // Product operations
@@ -2907,6 +2943,22 @@ ${EFFECTIVE_RETURNS_CTE},
     }
   }
 
+  // Just the fields the Z-report money calculation needs (no sale items), for every sale,
+  // refund and PARKING payment in the range. The Arqueo period lists bucket these by day
+  // and run the same calculation as the Z-report receipt, so a row always equals its receipt.
+  getZReportMoneyRows(startDateTime, endDateTime) {
+    const sales = this.db.prepare(`
+      SELECT id, sale_date, payment_method, total
+      FROM sales
+      WHERE datetime(sale_date) >= datetime(?) AND datetime(sale_date) <= datetime(?)
+    `).all(startDateTime, endDateTime);
+    return {
+      sales,
+      returns: this.getReturnsByDateTimeRange(startDateTime, endDateTime, null),
+      loanPayments: this.getLoanPaymentsByDateTimeRange(startDateTime, endDateTime, null)
+    };
+  }
+
   getDailySalesActualTotals(yearMonth) {
     try {
       return this.db.prepare(`
@@ -3052,6 +3104,7 @@ ${EFFECTIVE_RETURNS_CTE},
           owner_name = ?,
           nie_number = ?,
           company_address = ?,
+          store_phone = ?,
           currency_symbol = ?, 
           currency_code = ?,
           tax_rate = ?,
@@ -3068,6 +3121,7 @@ ${EFFECTIVE_RETURNS_CTE},
       settings.ownerName || null,
       settings.nieNumber || null,
       settings.companyAddress || null,
+      String(settings.storePhone || '').trim() || null,
       settings.currencySymbol,
       settings.currencyCode,
       settings.taxRate,

@@ -1,7 +1,7 @@
 {
   "name": "supermarket-pos",
-  "version": "80.6.48",
-  "description": "Cross-platform Supermarket POS System",
+  "version": "80.6.54",
+  "description": "BDCONNECT POS System",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -37,7 +37,7 @@
   },
   "build": {
     "appId": "com.supermarket.pos",
-    "productName": "Supermarket POS",
+    "productName": "BDCONNECT POS",
     "directories": {
       "output": "dist"
     },
@@ -64,7 +64,7 @@
           ]
         }
       ],
-      "artifactName": "supermarket_pos_v${version}_${arch}.${ext}",
+      "artifactName": "bdconnect_pos_v${version}_${arch}.${ext}",
       "requestedExecutionLevel": "asInvoker"
     },
     "files": [
@@ -92,10 +92,10 @@
       "deleteAppDataOnUninstall": false,
       "runAfterFinish": true,
       "allowElevation": true,
-      "artifactName": "supermarket_pos_v${version}_nsis_${arch}.${ext}"
+      "artifactName": "bdconnect_pos_v${version}_nsis_${arch}.${ext}"
     },
     "portable": {
-      "artifactName": "supermarket_pos_v${version}_portable_${arch}.${ext}"
+      "artifactName": "bdconnect_pos_v${version}_portable_${arch}.${ext}"
     }
   }
 }
